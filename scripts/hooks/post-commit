@@ -24,99 +24,99 @@
 # build dirty. Not under .devflow/: DevFlow reads its state files there.
 set -uo pipefail
 
-# Workspace-only hook. core.hooksPath is an absolute path into the main
+# Workspace-only checks. core.hooksPath is an absolute path into the main
 # checkout, so this also runs for commits in develop-based worktrees, which
 # have no .planning/ to check. Only a checkout carrying .workspace-divergence
-# is a workspace branch.
-[ -f "$(git rev-parse --show-toplevel 2>/dev/null)/.workspace-divergence" ] || exit 0
+# is a workspace branch; every checkout still chains to the hooks below.
+if [ -f "$(git rev-parse --show-toplevel 2>/dev/null)/.workspace-divergence" ]; then
+  # `git show` (rather than diff-tree) so a root commit still reports its files.
+  changed=$(git show --pretty=format: --name-only HEAD 2>/dev/null) || changed=""
+  # Plan summaries sit directly in a phase directory (`NN-MM-SUMMARY.md`, or a bare
+  # `SUMMARY.md` in old phases). A SUMMARY.md one level deeper, such as a plan
+  # review's `52-plan-review-4/SUMMARY.md`, is not a plan summary and must not warn.
+  summaries=$(printf '%s\n' "$changed" | grep -E '^\.planning/phases/[^/]+/[^/]*SUMMARY\.md$' || true)
 
-# `git show` (rather than diff-tree) so a root commit still reports its files.
-changed=$(git show --pretty=format: --name-only HEAD 2>/dev/null) || changed=""
-# Plan summaries sit directly in a phase directory (`NN-MM-SUMMARY.md`, or a bare
-# `SUMMARY.md` in old phases). A SUMMARY.md one level deeper, such as a plan
-# review's `52-plan-review-4/SUMMARY.md`, is not a plan summary and must not warn.
-summaries=$(printf '%s\n' "$changed" | grep -E '^\.planning/phases/[^/]+/[^/]*SUMMARY\.md$' || true)
+  if [ -n "$summaries" ]; then
+    mapfile -t summary_files <<< "$summaries"
+    root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
+    state="$root/.planning/STATE.md"
+    status_line=$(grep -m1 '^status:' "$state" 2>/dev/null || echo 'status: <unreadable>')
+    updated=$(grep -m1 '^last_updated:' "$state" 2>/dev/null || echo 'last_updated: <absent>')
 
-if [ -n "$summaries" ]; then
-  mapfile -t summary_files <<< "$summaries"
-  root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
-  state="$root/.planning/STATE.md"
-  status_line=$(grep -m1 '^status:' "$state" 2>/dev/null || echo 'status: <unreadable>')
-  updated=$(grep -m1 '^last_updated:' "$state" 2>/dev/null || echo 'last_updated: <absent>')
+    {
+      printf '\n\033[33m── STATE.md may now be stale ──\033[0m\n'
+      printf 'This commit landed:\n'
+      printf '  %s\n' "${summary_files[@]}"
+      printf 'STATE.md still says:\n  %s\n  %s\n' "$status_line" "$updated"
+    } >&2
 
-  {
-    printf '\n\033[33m── STATE.md may now be stale ──\033[0m\n'
-    printf 'This commit landed:\n'
-    printf '  %s\n' "${summary_files[@]}"
-    printf 'STATE.md still says:\n  %s\n  %s\n' "$status_line" "$updated"
-  } >&2
+    # Per-phase counts, so the warning says how far behind the prose is. Matches
+    # both naming conventions: old phases use a bare PLAN.md, not NN-PLAN.md.
+    # Deduped by phase — a wave-closing commit lands several summaries at once and
+    # would otherwise repeat the identical line per file.
+    for s in "${summary_files[@]}"; do dirname "$s"; done | sort -u | while read -r rel; do
+      dir="$root/$rel"
+      plans=$(find "$dir" -maxdepth 1 -name '*PLAN.md' 2>/dev/null | wc -l)
+      done_=$(find "$dir" -maxdepth 1 -name '*SUMMARY.md' 2>/dev/null | wc -l)
+      printf '  %s: %s/%s plans have summaries\n' "$(basename "$dir")" "$done_" "$plans" >&2
+    done
 
-  # Per-phase counts, so the warning says how far behind the prose is. Matches
-  # both naming conventions: old phases use a bare PLAN.md, not NN-PLAN.md.
-  # Deduped by phase — a wave-closing commit lands several summaries at once and
-  # would otherwise repeat the identical line per file.
-  for s in "${summary_files[@]}"; do dirname "$s"; done | sort -u | while read -r rel; do
-    dir="$root/$rel"
-    plans=$(find "$dir" -maxdepth 1 -name '*PLAN.md' 2>/dev/null | wc -l)
-    done_=$(find "$dir" -maxdepth 1 -name '*SUMMARY.md' 2>/dev/null | wc -l)
-    printf '  %s: %s/%s plans have summaries\n' "$(basename "$dir")" "$done_" "$plans" >&2
-  done
+    printf 'Derived counters:  gsd_run query state.update-progress\n' >&2
+    printf 'Authored prose (status:/stopped_at:) has to be written by hand.\n\n' >&2
 
-  printf 'Derived counters:  gsd_run query state.update-progress\n' >&2
-  printf 'Authored prose (status:/stopped_at:) has to be written by hand.\n\n' >&2
+    marker=$(git rev-parse --path-format=absolute --git-path devflow-stale-state.json)
+    {
+      printf '{\n  "stale_since_commit": "%s",\n' "$(git rev-parse --short HEAD 2>/dev/null)"
+      printf '  "summaries_landed": ['
+      printf '"%s",' "${summary_files[@]}" | sed 's/,$//'
+      printf '],\n  "state_status_at_detection": %s\n}\n' \
+        "$(printf '%s' "${status_line#status: }" | sed 's/^"//; s/"$//; s/.*/"&"/')"
+    } > "$marker" 2>/dev/null
+  fi
 
-  marker=$(git rev-parse --path-format=absolute --git-path devflow-stale-state.json)
-  {
-    printf '{\n  "stale_since_commit": "%s",\n' "$(git rev-parse --short HEAD 2>/dev/null)"
-    printf '  "summaries_landed": ['
-    printf '"%s",' "${summary_files[@]}" | sed 's/,$//'
-    printf '],\n  "state_status_at_detection": %s\n}\n' \
-      "$(printf '%s' "${status_line#status: }" | sed 's/^"//; s/"$//; s/.*/"&"/')"
-  } > "$marker" 2>/dev/null
-fi
+  # Warn when a "how this repo is set up" file changes without the portability
+  # checklist moving too.
+  #
+  # .planning/user/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
+  # replicated elsewhere; it goes stale the same silent way STATE.md does above
+  # — nothing else reads it, so drift is invisible until someone tries to
+  # actually follow it on a new machine. Unlike the SUMMARY.md signal above,
+  # there's no single canonical trigger file, so this matches the same
+  # categories the checklist itself documents: git policy, hooks, CI,
+  # devcontainer/toolchain pins, GSD config. CLAUDE.md asks the agent to update
+  # the checklist in the same commit as a matching change; this is the
+  # mechanical backstop for when that doesn't happen — warn only, never edit,
+  # same reasoning as the STATE.md check above (a hook silently editing a
+  # tracked file mid-commit is worse than the staleness it would fix).
+  setup_changed=$(printf '%s\n' "$changed" | grep -E \
+    '^(\.gitconfig|CONTRIBUTING\.md|rust-toolchain\.toml|\.planning/config\.json)$|^scripts/hooks/|^\.github/(workflows/|PULL_REQUEST_TEMPLATE\.md|ISSUE_TEMPLATE/)|^\.devcontainer/|^scripts/(check\.sh|check-in-container\.sh|assert-image-parity\.sh)$' \
+    || true)
+  # Single source of truth for the checklist location. If the file moves again, change
+  # this one value — and the existence guard below turns a wrong value into a loud
+  # failure rather than a check that can never pass (the state it was in from the
+  # move to .planning/user/ until 2026-09-02).
+  # `root` above is assigned only inside the SUMMARY.md branch, so it is unbound here
+  # whenever a commit carries no summary. Resolve our own copy (set -u is active).
+  checklist_root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
+  checklist_path='.planning/user/DEV-SETUP-CHECKLIST.md'
+  checklist_changed=$(printf '%s\n' "$changed" | grep -Fx "$checklist_path" || true)
 
-# Warn when a "how this repo is set up" file changes without the portability
-# checklist moving too.
-#
-# .planning/user/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
-# replicated elsewhere; it goes stale the same silent way STATE.md does above
-# — nothing else reads it, so drift is invisible until someone tries to
-# actually follow it on a new machine. Unlike the SUMMARY.md signal above,
-# there's no single canonical trigger file, so this matches the same
-# categories the checklist itself documents: git policy, hooks, CI,
-# devcontainer/toolchain pins, GSD config. CLAUDE.md asks the agent to update
-# the checklist in the same commit as a matching change; this is the
-# mechanical backstop for when that doesn't happen — warn only, never edit,
-# same reasoning as the STATE.md check above (a hook silently editing a
-# tracked file mid-commit is worse than the staleness it would fix).
-setup_changed=$(printf '%s\n' "$changed" | grep -E \
-  '^(\.gitconfig|CONTRIBUTING\.md|rust-toolchain\.toml|\.planning/config\.json)$|^scripts/hooks/|^\.github/(workflows/|PULL_REQUEST_TEMPLATE\.md|ISSUE_TEMPLATE/)|^\.devcontainer/|^scripts/(check\.sh|check-in-container\.sh|assert-image-parity\.sh)$' \
-  || true)
-# Single source of truth for the checklist location. If the file moves again, change
-# this one value — and the existence guard below turns a wrong value into a loud
-# failure rather than a check that can never pass (the state it was in from the
-# move to .planning/user/ until 2026-09-02).
-# `root` above is assigned only inside the SUMMARY.md branch, so it is unbound here
-# whenever a commit carries no summary. Resolve our own copy (set -u is active).
-checklist_root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
-checklist_path='.planning/user/DEV-SETUP-CHECKLIST.md'
-checklist_changed=$(printf '%s\n' "$changed" | grep -Fx "$checklist_path" || true)
-
-if [ -n "$setup_changed" ] && [ ! -f "$checklist_root/$checklist_path" ]; then
-  # Fail loudly: a missing checklist means this check cannot discriminate at all.
-  {
-    printf '\n\033[33m── post-commit: checklist not found at %s ──\033[0m\n' "$checklist_path"
-    printf 'The dev-setup staleness check cannot run. If the checklist moved, update\n'
-    printf 'checklist_path in scripts/hooks/post-commit and the path in CLAUDE.md.\n\n'
-  } >&2
-elif [ -n "$setup_changed" ] && [ -z "$checklist_changed" ]; then
-  mapfile -t setup_files <<< "$setup_changed"
-  {
-    printf '\n\033[33m── DEV-SETUP-CHECKLIST.md may now be stale ──\033[0m\n'
-    printf 'This commit touched setup file(s) but not the checklist:\n'
-    printf '  %s\n' "${setup_files[@]}"
-    printf 'Review %s and update it if this changes what a fresh replication needs.\n\n' "$checklist_path"
-  } >&2
+  if [ -n "$setup_changed" ] && [ ! -f "$checklist_root/$checklist_path" ]; then
+    # Fail loudly: a missing checklist means this check cannot discriminate at all.
+    {
+      printf '\n\033[33m── post-commit: checklist not found at %s ──\033[0m\n' "$checklist_path"
+      printf 'The dev-setup staleness check cannot run. If the checklist moved, update\n'
+      printf 'checklist_path in scripts/hooks/post-commit and the path in CLAUDE.md.\n\n'
+    } >&2
+  elif [ -n "$setup_changed" ] && [ -z "$checklist_changed" ]; then
+    mapfile -t setup_files <<< "$setup_changed"
+    {
+      printf '\n\033[33m── DEV-SETUP-CHECKLIST.md may now be stale ──\033[0m\n'
+      printf 'This commit touched setup file(s) but not the checklist:\n'
+      printf '  %s\n' "${setup_files[@]}"
+      printf 'Review %s and update it if this changes what a fresh replication needs.\n\n' "$checklist_path"
+    } >&2
+  fi
 fi
 
 # Chain to whatever post-commit was active before core.hooksPath displaced it,
