@@ -782,14 +782,32 @@ fn suites_using_common_set_path_only_through_hermetic_path() {
 
     // (3) service_e2e.rs is exempt because it is the host-only suite that
     // `scripts/check.sh service` runs against the real user manager: every
-    // test in it must be ignored, so no default run reaches that manager.
+    // test in it that talks to a unit must be ignored, so no default run reaches
+    // that manager. The pure `settle_unit_reads` tests read only closures, so they
+    // run everywhere (F11) and are the only unignored ones.
+    const PURE_SERVICE_TESTS: &[&str] = &[
+        "fn a_failed_read_before_inactive_is_reported_with_its_result()",
+        "fn an_inactive_read_after_deactivating_settles()",
+        "fn reads_that_never_settle_time_out_naming_the_last_read()",
+    ];
     let service = code_only(&read_source(&tests_dir.join("service_e2e.rs")));
+    for pure in PURE_SERVICE_TESTS {
+        assert!(
+            service.contains(pure),
+            "service_e2e.rs no longer holds the pure test {pure}: update PURE_SERVICE_TESTS"
+        );
+    }
     let tests = service.matches("#[test]").count();
     let ignored = service.matches("#[ignore").count();
-    assert!(tests > 0, "service_e2e.rs holds no #[test]");
+    assert!(
+        tests > PURE_SERVICE_TESTS.len(),
+        "service_e2e.rs holds no host #[test]"
+    );
     assert_eq!(
-        tests, ignored,
-        "service_e2e.rs has {tests} #[test] but {ignored} #[ignore]: every test there must be \
-         ignored so only scripts/check.sh service runs it"
+        tests - PURE_SERVICE_TESTS.len(),
+        ignored,
+        "service_e2e.rs has {tests} #[test], {} of them pure, but {ignored} #[ignore]: every \
+         test there that talks to a unit must be ignored so only scripts/check.sh service runs it",
+        PURE_SERVICE_TESTS.len()
     );
 }
