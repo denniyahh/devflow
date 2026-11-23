@@ -1071,7 +1071,7 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
     );
     assert!(
         shown_text.contains(&format!(
-            "once this waiting supervisor has ended, `devflow resume --phase {phase}`"
+            "once this waiting runner has ended, `devflow resume --phase {phase}`"
         )),
         "the resume command is worded as the way on once the waiter is gone: {shown_text}"
     );

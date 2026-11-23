@@ -77,7 +77,7 @@ enum Command {
         /// Code; at any other stage a rate limit waits at the stage's gate.
         ///
         /// Persisted in the run state (`state-NN.json`) before the first
-        /// supervisor spawns, and checked here as far as launch can tell: it
+        /// runner launches, and checked here as far as launch can tell: it
         /// must differ from `--agent`, its binary must be installed and its
         /// driver healthy, and in `--mode auto` it must be `claude` or
         /// `antigravity` (the unattended launch shape). The full preflight runs
@@ -148,7 +148,7 @@ enum Command {
         /// Re-arm the run's one-hop fallback for the Code stage (D-01,
         /// `51-CONTEXT.md`): sets it to this agent and clears a spent mark, so a
         /// run whose fallback was used can fail over once more. Accepted on a run
-        /// that is not live (stopped, or whose supervisor has ended);
+        /// that is not live (stopped, or whose runner has ended);
         /// refused over a live run like any resume.
         ///
         /// Checked as on `devflow start`: it must differ from the agent the run
@@ -368,7 +368,7 @@ enum GateCmd {
     },
     /// Answer or report aged, unattended gates across every registered root
     /// (23b) — bounds an abandoned run's lifetime without `kill(1)` and
-    /// without a supervisor. On-demand only: nothing schedules this for you.
+    /// without a live runner. On-demand only: nothing schedules this for you.
     Sweep {
         /// Age threshold in seconds — a gate older than this is reaped.
         /// Defaults to `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` (three days,
