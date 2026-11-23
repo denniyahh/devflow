@@ -5,7 +5,6 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::workflow::load_state;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -78,10 +77,7 @@ fn fake_bin_dir(scripts: &[(&str, &str)]) -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     for (name, script) in scripts {
         let path = dir.path().join(name);
-        fs::write(&path, script).unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
+        devflow_core::test_support::write_executable(&path, script);
     }
     let path = dir.path().to_path_buf();
     FakeBin { _dir: dir, path }
