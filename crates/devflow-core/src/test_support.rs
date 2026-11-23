@@ -1396,6 +1396,24 @@ mod tests {
         sources
     }
 
+    /// F16: a kept entry is one site, so an entry matching two lines is a finding naming
+    /// the entry and the count. Control: the same entry matching one line is none.
+    #[test]
+    fn permission_setters_flag_a_kept_entry_that_matches_two_lines() {
+        let line = format!("    std::fs::{PERMISSION_SETTER}&stub, perms).unwrap();");
+        let kept = [("planted.rs", "(&stub, perms)", "a kept site")];
+        let planted = |text: String| vec![("planted.rs".to_string(), text)];
+        assert_eq!(
+            permission_setters(&planted(format!("{line}\n{line}\n")), &kept),
+            vec!["kept entry matched 2 lines, not 1: planted.rs: (&stub, perms)".to_string()],
+        );
+        assert_eq!(
+            permission_setters(&planted(format!("{line}\n")), &kept),
+            Vec::<String>::new(),
+            "one matching line is the kept site"
+        );
+    }
+
     /// No source of either crate sets a mode directly outside the kept sites, so
     /// every test stub goes through `write_executable`. Controls: a planted raw
     /// writer counts, the same line as a comment does not, and a kept entry that
