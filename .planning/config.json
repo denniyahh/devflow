@@ -76,14 +76,7 @@
       "antigravity"
     ]
   },
-  "model_overrides": {
-    "gsd-executor": "inherit",
-    "gsd-code-reviewer": "inherit",
-    "gsd-debugger": "inherit",
-    "gsd-doc-classifier": "haiku",
-    "gsd-intel-updater": "haiku",
-    "gsd-mempalace-curator": "haiku"
-  },
+  "model_overrides": {},
   "mempalace": {
     "enabled": true,
     "capture_artifacts": true,
