@@ -1245,6 +1245,10 @@ fn start_dry_run_warns_when_gsd_derived_files_are_not_ignored() {
         to_add, GSD_IGNORE_LINES,
         "start did not warn about unignored GSD derived files: {stderr}"
     );
+    assert!(
+        !stderr.contains("untrack it:"),
+        "start told to untrack a GSD derived file git does not track: {stderr}"
+    );
 }
 
 /// Control for the test above: with those lines committed in `.gitignore`, the dry run
@@ -1267,6 +1271,37 @@ fn start_dry_run_is_silent_when_gsd_derived_files_are_ignored() {
     assert!(
         !stderr.contains(".gitignore"),
         "start warned about GSD derived files that are ignored: {stderr}"
+    );
+}
+
+/// #338 WR-02 (D-13): a GSD derived file the project committed is told to be untracked,
+/// since an ignore rule does not apply to a tracked file, and is not told to add a
+/// `.gitignore` line `.gitignore` already has.
+#[test]
+fn start_dry_run_tells_to_untrack_a_tracked_gsd_derived_file() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".gitignore"),
+        format!("{}\n", GSD_IGNORE_LINES.join("\n")),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".planning")).unwrap();
+    fs::write(root.join(".planning/state.json"), "{}").unwrap();
+    git(root, &["add", ".gitignore"]);
+    git(root, &["add", "-f", ".planning/state.json"]);
+    git(root, &["commit", "-q", "-m", "commit a GSD derived file"]);
+
+    let stderr = start_dry_run_stderr(root);
+
+    assert!(
+        stderr.contains("untrack it: git rm --cached .planning/state.json"),
+        "start did not tell to untrack a tracked GSD derived file: {stderr}"
+    );
+    assert!(
+        !stderr.contains(".gitignore"),
+        "start named a .gitignore line for a tracked file .gitignore already lists: {stderr}"
     );
 }
 
