@@ -4121,6 +4121,70 @@ mod tests {
         retry.expect("the retried resume --reviews launches");
     }
 
+    /// #338 WR-01: a timed-out `resume --reviews` whose runner ran, wrote the state and
+    /// died keeps that state and its reviews pass, so a plain `resume` reruns the
+    /// reviews Plan instead of reading a finished `--until plan` halt and advancing.
+    #[test]
+    fn a_timed_out_resume_with_reviews_whose_runner_changed_the_state_keeps_the_reviews_pass() {
+        const NAME: &str = "pipeline_launch::tests::a_timed_out_resume_with_reviews_whose_runner_changed_the_state_keeps_the_reviews_pass";
+        const RUNNER_SESSION: &str = "runner-session-5394";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5394);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        write_reviews_file(root, phase);
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::TimedOutLeaving(
+            Ok("inactive"),
+        ));
+        let runner_root = root.to_path_buf();
+        crate::service::double::run_during_launch(move || {
+            workflow::update_state(&runner_root, phase, |state| {
+                state.session_id = Some(RUNNER_SESSION.to_string());
+                Ok::<_, workflow::WorkflowError>(())
+            })
+            .expect("the stand-in runner writes the state");
+        });
+
+        let result = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        let error = result
+            .expect_err("a timed-out resume with no live runner fails")
+            .to_string();
+
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(
+            !crate::pipeline_gate::until_cap_fired(&state)
+                && state.reviews_pass
+                && state.stopped
+                && state
+                    .stop_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("resume launch failed")),
+            "a timed-out resume --reviews whose runner changed the state faked the --until plan halt: {state:?}"
+        );
+        assert!(
+            state.session_id.as_deref() == Some(RUNNER_SESSION),
+            "the failed resume overwrote what its runner wrote: {state:?}"
+        );
+        let unsaid = "the failed resume did not say it kept the changed state";
+        assert!(error.contains("so it was kept"), "{unsaid}: {error}");
+        assert!(error.contains("devflow status"), "{unsaid}: {error}");
+        assert!(
+            error.contains("devflow discard --phase 5394"),
+            "{unsaid}: {error}"
+        );
+    }
+
     /// D-04 (#250), the resume clause: `resume --reviews` on a run its `--until plan`
     /// cap halted reruns Plan as a reviews pass instead of advancing, and keeps the cap,
     /// so the reviews Plan halts again.
