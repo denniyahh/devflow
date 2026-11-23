@@ -3089,7 +3089,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     if let Some(block) = render_set_aside_answers(&Gates::quarantined(project_root)) {
         println!("\n{block}");
     }
-    print_open_branches(project_root);
+    print_open_branches(project_root, &rows);
     print_worktrees(project_root, current_worktree.as_deref());
     Ok(())
 }
@@ -4734,17 +4734,29 @@ fn describe_worktree_dir(name: &str) -> String {
     }
 }
 
-fn print_open_branches(project_root: &Path) {
+fn print_open_branches(project_root: &Path, rows: &[(PhaseId, workflow::Existing, RunStatus)]) {
+    let lines = open_branch_lines(project_root, rows);
+    if lines.is_empty() {
+        return;
+    }
+    println!("\nopen branches:");
+    for line in &lines {
+        println!("{line}");
+    }
+}
+
+/// `status`'s lines under "open branches:", one per feature branch.
+fn open_branch_lines(
+    project_root: &Path,
+    _rows: &[(PhaseId, workflow::Existing, RunStatus)],
+) -> Vec<String> {
     let git = GitFlow::for_project(project_root);
     let base = config::git_flow_for_project(project_root).develop;
     let branches = match git.list_feature_branches() {
         Ok(b) => b,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
-    if branches.is_empty() {
-        return;
-    }
-    println!("\nopen branches:");
+    let mut lines = Vec::new();
     for b in &branches {
         // Interpolated, not literal (45-01): the comparison this suffix
         // reports was computed against whatever trunk `list_feature_branches`
@@ -4755,8 +4767,9 @@ fn print_open_branches(project_root: &Path) {
         } else {
             String::new()
         };
-        println!("  {} — {} ahead{staleness}", b.name, b.ahead);
+        lines.push(format!("  {} — {} ahead{staleness}", b.name, b.ahead));
     }
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -7182,6 +7195,141 @@ mod tests {
             "an approval gate's banner must offer approve and reject: {banner}"
         );
         drop(waiter);
+    }
+
+    /// Runs `name` in a child whose `PATH` holds only git and whose
+    /// `DEVFLOW_BASE_BRANCH` is empty (read as unset), so a host value cannot
+    /// choose the project's base.
+    fn run_open_branches_child(name: &str) {
+        let path_dir = crate::test_support::agent_free_git_only_path_dir();
+        let unset = std::ffi::OsStr::new("");
+        let output = crate::test_support::run_hermetic_test_in_child(
+            name,
+            path_dir.path(),
+            &[("DEVFLOW_BASE_BRANCH", unset)],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+    }
+
+    /// A repo with one commit on `develop`, `workspace` one commit past it, and
+    /// phase 7's feature branch one commit past `workspace`; HEAD is left on
+    /// `develop`.
+    fn repo_with_a_branch_off_workspace(root: &Path) -> PhaseId {
+        crate::test_support::init_repo(root);
+        let git = |args: &[&str]| {
+            let output = devflow_core::git::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        let phase = PhaseId::new(7);
+        let feature = format!("feature/phase-{}", phase.padded());
+        git(&["checkout", "-q", "-b", "workspace"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "workspace"]);
+        git(&["checkout", "-q", "-b", &feature]);
+        git(&["commit", "-q", "--allow-empty", "-m", "phase work"]);
+        git(&["checkout", "-q", "develop"]);
+        phase
+    }
+
+    /// The status rows for `phase` with a saved run state recording `base`.
+    fn rows_for_a_run_based_on(
+        root: &Path,
+        phase: PhaseId,
+        base: &str,
+    ) -> Vec<(PhaseId, workflow::Existing, RunStatus)> {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        state.base_branch = Some(base.to_string());
+        workflow::save_state(&state).unwrap();
+        let existing = existing_state(root, phase);
+        let row = run_status(root, phase, &existing).expect("a saved state has a status row");
+        vec![(phase, existing, row)]
+    }
+
+    /// D-07 (#248), in a process of its own: a run's branch is compared against
+    /// the base that run recorded, and the line says so.
+    #[test]
+    fn open_branches_compare_a_run_branch_against_its_recorded_base() {
+        const NAME: &str =
+            "commands::tests::open_branches_compare_a_run_branch_against_its_recorded_base";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_open_branches_child(NAME);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = repo_with_a_branch_off_workspace(root);
+        let rows = rows_for_a_run_based_on(root, phase, "workspace");
+
+        let lines = open_branch_lines(root, &rows);
+        let feature = format!("feature/phase-{}", phase.padded());
+        assert!(
+            lines.iter().any(|line| line.contains(&feature)
+                && line.contains("1 ahead")
+                && line.contains("workspace")
+                && line.contains("the run's base")
+                && !line.contains("develop")),
+            "a run's branch was compared against the project base, not the run's: {lines:?}"
+        );
+    }
+
+    /// D-07 control, in a process of its own: a branch no run owns is compared
+    /// against the project's base, and the line says so.
+    #[test]
+    fn open_branches_compare_a_branch_with_no_run_against_the_config_base() {
+        const NAME: &str =
+            "commands::tests::open_branches_compare_a_branch_with_no_run_against_the_config_base";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_open_branches_child(NAME);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = repo_with_a_branch_off_workspace(root);
+
+        let lines = open_branch_lines(root, &[]);
+        let feature = format!("feature/phase-{}", phase.padded());
+        assert!(
+            lines.iter().any(|line| line.contains(&feature)
+                && line.contains("2 ahead")
+                && line.contains("develop")
+                && line.contains("the project's base")),
+            "a branch with no run was not compared against the project's base: {lines:?}"
+        );
+    }
+
+    /// D-07 (review item 15), in a process of its own: a run's recorded base that
+    /// no longer exists is reported as not compared, never as an even count.
+    #[test]
+    fn open_branches_report_a_deleted_recorded_base_as_not_compared() {
+        const NAME: &str =
+            "commands::tests::open_branches_report_a_deleted_recorded_base_as_not_compared";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_open_branches_child(NAME);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = repo_with_a_branch_off_workspace(root);
+        let rows = rows_for_a_run_based_on(root, phase, "workspace");
+        let deleted = devflow_core::git::git_command(root)
+            .args(["branch", "-q", "-D", "workspace"])
+            .status()
+            .unwrap();
+        assert!(deleted.success());
+
+        let lines = open_branch_lines(root, &rows);
+        let feature = format!("feature/phase-{}", phase.padded());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("could not be compared") && line.contains("workspace"))
+                && !lines
+                    .iter()
+                    .any(|line| line.contains(&feature) && line.contains("0 ahead, 0 behind")),
+            "a deleted run base read as an even comparison: {lines:?}"
+        );
     }
 
     /// D-10 (review r2 codex-7), in a process of its own: a runner held between its
