@@ -176,15 +176,6 @@ pub enum StageIntent {
         /// The operator's note for this relaunch of the stage, if any.
         relaunch_note: Option<String>,
     },
-    /// The Plan stage of a reviews pass (D-04): incorporates the phase's
-    /// NN-REVIEWS.md through `/gsd-plan-phase N --reviews`. Unlike
-    /// [`StageIntent::Plan`] it has no idempotency short-circuit, because the
-    /// phase's PLAN.md files exist by now and the pass must run anyway.
-    PlanReviews {
-        phase: PhaseId,
-        /// The operator's note for this relaunch of the stage, if any.
-        relaunch_note: Option<String>,
-    },
     Code {
         phase: PhaseId,
         fix: Option<FixType>,
@@ -198,6 +189,17 @@ pub enum StageIntent {
         reverify_report: Option<ReverifyReport>,
     },
     Validate {
+        phase: PhaseId,
+        /// The operator's note for this relaunch of the stage, if any.
+        relaunch_note: Option<String>,
+    },
+    /// The Plan stage of a reviews pass (D-04), the twin of
+    /// [`StageIntent::PlanGaps`]: incorporates the phase's NN-REVIEWS.md
+    /// through `/gsd-plan-phase N --reviews`. Unlike [`StageIntent::Plan`] it
+    /// has no idempotency short-circuit, because the phase's PLAN.md files
+    /// exist by now and the pass must run anyway. Declared last so the
+    /// earlier variants keep their discriminants.
+    PlanReviews {
         phase: PhaseId,
         /// The operator's note for this relaunch of the stage, if any.
         relaunch_note: Option<String>,
