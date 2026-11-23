@@ -1344,3 +1344,72 @@ fn other_phase_runner_lock_holder_entry() {
         .expect("hold phase 1's runner lock");
     std::thread::sleep(LAUNCHED_CHILD_LIFETIME);
 }
+
+/// The project root [`fast_ready_runner_entry`] takes phase 7's runner lock in.
+const FAST_READY_RUNNER_ROOT_ENV: &str = "FAST_READY_RUNNER_ROOT";
+
+/// The test binary the fast-runner readiness test's launched shell `exec`s.
+const FAST_READY_RUNNER_EXE_ENV: &str = "FAST_READY_RUNNER_EXE";
+
+/// #337: a runner that takes its lock, sends `READY=1` and exits at once, well inside
+/// one of the fake's polls, is a start, as systemd reads a `Type=notify` unit.
+#[test]
+fn the_fake_launcher_reads_a_runner_that_sent_ready_and_exited_at_once_as_started() {
+    let home = common::HermeticHome::new();
+    let project = project_with_devflow_dir();
+    let exe = std::env::current_exe().expect("this test binary");
+    let script = format!(
+        "exec \"${FAST_READY_RUNNER_EXE_ENV}\" --exact fast_ready_runner_entry --ignored --quiet"
+    );
+
+    let out = run_fake_launcher(
+        &home,
+        project.path(),
+        &script,
+        &[
+            (FAST_READY_RUNNER_EXE_ENV, exe.as_os_str()),
+            (FAST_READY_RUNNER_ROOT_ENV, project.path().as_os_str()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !stderr.contains(common::FAKE_START_FAILED),
+        "the fake launcher read a runner that sent READY=1 and exited at once as failed: status {}, stderr {stderr}",
+        out.status
+    );
+}
+
+/// Not a test of its own: the child the fast-runner readiness test launches. Does what
+/// `run_runner` does before its work, in the same order (take phase 7's runner lock,
+/// send `READY=1`), then exits at once. Without the variable it does nothing.
+#[test]
+#[ignore = "the fast runner a readiness test launches, not a test"]
+fn fast_ready_runner_entry() {
+    let Some(root) = std::env::var_os(FAST_READY_RUNNER_ROOT_ENV) else {
+        return;
+    };
+    let hold = liveness::claim_runner_lock(Path::new(&root), PhaseId::new(7))
+        .expect("hold phase 7's runner lock");
+    send_ready_to_notify_socket();
+    drop(hold);
+}
+
+/// Send `READY=1` to `NOTIFY_SOCKET` as `service::notify_ready` does: an `@` prefix is
+/// an abstract name, any other value a path; a no-op when the variable is unset.
+fn send_ready_to_notify_socket() {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let Some(target) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(target.as_os_str());
+    let addr = match bytes.strip_prefix(b"@") {
+        Some(name) => SocketAddr::from_abstract_name(name),
+        None => SocketAddr::from_pathname(Path::new(&target)),
+    }
+    .expect("a NOTIFY_SOCKET address");
+    UnixDatagram::unbound()
+        .expect("an unbound datagram socket")
+        .send_to_addr(b"READY=1", &addr)
+        .expect("send READY=1 to NOTIFY_SOCKET");
+}
