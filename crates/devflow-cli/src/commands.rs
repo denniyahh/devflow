@@ -2859,15 +2859,56 @@ fn format_age(started_at: &str) -> String {
 /// A unix-seconds instant as ISO-8601 local time with its UTC offset,
 /// `YYYY-MM-DDTHH:MM:SS+HH:MM`, for a local offset of `offset_secs`.
 fn format_local_iso8601(secs: i64, offset_secs: i64) -> String {
-    let _ = offset_secs;
-    secs.to_string()
+    const SECS_PER_DAY: i64 = 86_400;
+    let local = secs + offset_secs;
+    let (year, month, day) = civil_from_days(local.div_euclid(SECS_PER_DAY));
+    let time_of_day = local.rem_euclid(SECS_PER_DAY);
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let offset_mins = offset_secs.abs() / 60;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
+        time_of_day / 3600,
+        time_of_day % 3600 / 60,
+        time_of_day % 60,
+        offset_mins / 60,
+        offset_mins % 60,
+    )
+}
+
+/// The proleptic Gregorian (year, month, day) of `days` since 1970-01-01, by
+/// the era arithmetic of Howard Hinnant's `civil_from_days`.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    const DAYS_PER_ERA: i64 = 146_097;
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(DAYS_PER_ERA);
+    let day_of_era = shifted.rem_euclid(DAYS_PER_ERA);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// The local UTC offset in seconds at the unix-seconds instant `secs`; `None`
 /// when the C library cannot convert it.
 fn local_utc_offset_secs(secs: i64) -> Option<i64> {
-    let _ = secs;
-    None
+    let time = secs as libc::time_t;
+    // SAFETY: an all-zero `tm` is a valid value of this plain C struct; both
+    // pointers are to live locals for the whole call, and localtime_r is the
+    // reentrant form that writes only into `tm`.
+    let (converted, tm) = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let converted = !libc::localtime_r(&time, &mut tm).is_null();
+        (converted, tm)
+    };
+    converted.then_some(tm.tm_gmtoff)
 }
 
 /// `status`'s start line: the run's start as local ISO-8601 time, then its age.
