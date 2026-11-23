@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-09-PLAN.md
-last_updated: "2026-11-23T06:16:56.821Z"
+stopped_at: Completed 53.2-10-PLAN.md
+last_updated: "2026-11-23T06:31:05.886Z"
 last_activity: 2026-11-22
 last_activity_desc: Phase 53.2 execution started
-state_head: d8a2235671d028ed6640ea76658101694912af2d
+state_head: c76a8c75e9bde3bca554c2f61e5702d190c61b58
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 105
-  completed_plans: 97
+  completed_plans: 98
   percent: 13
 ---
 
@@ -179,7 +179,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
-Plan: 10 of 17
+Plan: 11 of 17
 Status: Ready to execute
 Last activity: 2026-11-22 — Phase 53.2 execution started
 
@@ -1071,6 +1071,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: 53.2-07: raw stub writer guard keeps 5 set_permissions sites with reasons (write_executable chmod, ETXTBSY control, gsd_reader held-writer launcher and 0o644 chmod, registry dir mode)
 - [Phase 53.2]: 53.2-08: no phase7_cli caller expects a helper timeout, so all seven wait helpers panic on the shared poll budget
 - [Phase 53.2]: 53.2-09: #310 left open per D-16; base and after loops both 0/40 target failures, so the post-release read waits are by construction
+- [Phase 53.2]: 53.2-10: StageIntent::PlanReviews is declared last on the enum so semver-checks reports only the planned variant addition, not discriminant shifts
 
 ## Roadmap Evolution
 
@@ -1279,11 +1280,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P07 | 6min | 2 tasks | 2 files |
 | Phase 53.2 P08 | 7 min | 3 tasks | 7 files |
 | Phase 53.2 P09 | 27min | 2 tasks | 1 files |
+| Phase 53.2 P10 | 13min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-23T06:16:54.932Z
-**Stopped at:** Completed 53.2-09-PLAN.md
+**Last session:** 2026-11-23T06:31:03.822Z
+**Stopped at:** Completed 53.2-10-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
