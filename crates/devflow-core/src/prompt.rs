@@ -644,9 +644,23 @@ pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> Strin
     }
 }
 
+/// The workflow-style [`idempotent_stage_prompt`]: the same PLAN.md
+/// short-circuit and the same [`no_plan_branch`], naming the discuss-phase
+/// and plan-phase workflow files instead of slash commands.
 fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> String {
     let artifact = "PLAN.md";
     let padded = phase.padded();
+    let branch = no_plan_branch(
+        &padded,
+        &format!(
+            "Read and follow the GSD workflow file at {workflow_root}/discuss-phase.md \
+            for phase {phase}.\n\n"
+        ),
+        &format!(
+            "read and follow the GSD workflow file at {workflow_root}/plan-phase.md \
+            for phase {phase}.\n\n"
+        ),
+    );
     format!(
         "First check whether this stage's deliverable already exists:\n\
         \n\
@@ -658,9 +672,7 @@ fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> Str
         \n\
         DEVFLOW_RESULT: {{\"status\": \"success\"}}\n\
         \n\
-        - If it does NOT exist: read and follow the GSD workflow file at \
-        {workflow_root}/plan-phase.md for phase {phase}.\n\
-        \n\
+        {branch}\
         {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
