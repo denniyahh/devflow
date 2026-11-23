@@ -33,8 +33,9 @@ use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::test_support::write_executable;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -113,10 +114,7 @@ fn fake_bin_dir() -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     for agent in [CAPTURE_AGENT, STREAM_AGENT] {
         let script = dir.path().join(agent);
-        fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        write_executable(&script, "#!/bin/sh\nsleep 60\n");
     }
     for program in ["git", "sh"] {
         symlink(format!("/usr/bin/{program}"), dir.path().join(program)).unwrap();
