@@ -707,6 +707,9 @@ and SUPV-03/04/05 moved to Validated (their footers had claimed it without writi
 `/gsd-new-milestone` v4.0.*
 
 ---
+*Last updated: 2026-11-23 after Phase 53.2 (wsx/UDE first-use and dogfood remediation, inserted) — 19/19 plans; verification passed 37/37 (3 overrides). With no CONTEXT.md the Plan stage runs discuss through `devflow_ask` before planning; `devflow start --reviews` and `resume --reviews` run a `--reviews` replan; `status` offers `gate answer` at a question gate, compares a run's branch with the base that run recorded and prints an ISO-8601 start time; `start` warns which `.gitignore` lines GSD's derived files need; `stop` holds the phase holder and `discard` refuses while it does (#341); `resume` after an `--until` halt enters the halted transition's target; test stubs are written through `write_executable` and the fake `systemd-run` reads a start from the runner's `READY=1`. Unreleased; two review warnings and four info findings stay open. Next: Phase 54 (Decision Triage).*
+
+---
 *Last updated: 2026-11-21 after Phase 53.1 (Phase 53 remediation, inserted) — 8/8 plans; verification passed 50/50. A Claude stream rate limit is classified as one, the rate-limit gate names its reset in UTC and how far off it is, `resume` after an `--until plan` halt starts Code, gates say how to answer decisions and post-run sign-offs, and a finished run has GSD mark the phase complete. Unreleased; three review warnings stay open. Next: Phase 54 (Decision Triage).*
 
 ---
