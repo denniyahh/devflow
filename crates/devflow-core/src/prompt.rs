@@ -176,6 +176,15 @@ pub enum StageIntent {
         /// The operator's note for this relaunch of the stage, if any.
         relaunch_note: Option<String>,
     },
+    /// The Plan stage of a reviews pass (D-04): incorporates the phase's
+    /// NN-REVIEWS.md through `/gsd-plan-phase N --reviews`. Unlike
+    /// [`StageIntent::Plan`] it has no idempotency short-circuit, because the
+    /// phase's PLAN.md files exist by now and the pass must run anyway.
+    PlanReviews {
+        phase: PhaseId,
+        /// The operator's note for this relaunch of the stage, if any.
+        relaunch_note: Option<String>,
+    },
     Code {
         phase: PhaseId,
         fix: Option<FixType>,
@@ -199,7 +208,9 @@ impl StageIntent {
     /// The stage this intent drives.
     pub fn stage(&self) -> Stage {
         match self {
-            StageIntent::Plan { .. } | StageIntent::PlanGaps { .. } => Stage::Plan,
+            StageIntent::Plan { .. }
+            | StageIntent::PlanGaps { .. }
+            | StageIntent::PlanReviews { .. } => Stage::Plan,
             StageIntent::Code { .. } => Stage::Code,
             StageIntent::Validate { .. } => Stage::Validate,
         }
@@ -237,6 +248,7 @@ impl StageIntent {
         match &mut self {
             StageIntent::Plan { relaunch_note, .. }
             | StageIntent::PlanGaps { relaunch_note, .. }
+            | StageIntent::PlanReviews { relaunch_note, .. }
             | StageIntent::Code { relaunch_note, .. }
             | StageIntent::Validate { relaunch_note, .. } => *relaunch_note = note,
         }
@@ -560,6 +572,10 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
             phase,
             relaunch_note,
         } => gaps_plan_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
+        StageIntent::PlanReviews {
+            phase,
+            relaunch_note,
+        } => gaps_plan_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
         StageIntent::Code {
             phase,
             fix: None,
@@ -605,6 +621,14 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
 pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> String {
     match intent {
         StageIntent::PlanGaps {
+            phase,
+            relaunch_note,
+        } => workflow_gaps_plan_prompt(
+            *phase,
+            workflow_root,
+            &note_blocks(None, relaunch_note.as_deref()),
+        ),
+        StageIntent::PlanReviews {
             phase,
             relaunch_note,
         } => workflow_gaps_plan_prompt(
@@ -1501,6 +1525,10 @@ mod tests {
                 phase,
                 relaunch_note: None,
             },
+            StageIntent::PlanReviews {
+                phase,
+                relaunch_note: None,
+            },
             StageIntent::Validate {
                 phase,
                 relaunch_note: None,
@@ -1579,7 +1607,7 @@ mod tests {
     #[test]
     fn every_stage_prompt_routes_questions_through_devflow_ask() {
         let prompts = every_rendered_prompt();
-        assert_eq!(prompts.len(), 6 * 8, "six drivers times eight intents");
+        assert_eq!(prompts.len(), 6 * 9, "six drivers times nine intents");
         let mut wrong = Vec::new();
         for (label, prompt) in &prompts {
             let completion = prompt
@@ -1797,10 +1825,16 @@ mod tests {
             .into_iter()
             .map(|stage| StageIntent::for_stage(stage, phase))
             // The gaps Plan pass (52-27) carries the relaunch note too.
-            .chain([StageIntent::PlanGaps {
-                phase,
-                relaunch_note: None,
-            }])
+            .chain([
+                StageIntent::PlanGaps {
+                    phase,
+                    relaunch_note: None,
+                },
+                StageIntent::PlanReviews {
+                    phase,
+                    relaunch_note: None,
+                },
+            ])
             .map(|intent| intent.with_relaunch_note(relaunch_note.map(str::to_string)))
             .collect()
     }
@@ -1941,6 +1975,37 @@ mod tests {
                 "the gaps Plan prompt must not run discuss: {prompt}"
             );
         }
+    }
+
+    /// D-04 (#250): the reviews Plan pass runs `plan-phase --reviews` with
+    /// the phase's plans already written, so its claude-style prompt has no
+    /// PLAN.md short-circuit and no discuss branch (Pitfall 4).
+    #[test]
+    fn reviews_plan_prompt_skips_the_plan_probe() {
+        let intent = StageIntent::PlanReviews {
+            phase: PhaseId::new(7),
+            relaunch_note: None,
+        };
+        let prompt = render_claude_style(&intent);
+        let runs_reviews = prompt.contains("/gsd-plan-phase 7 --reviews");
+        let no_probe = !prompt
+            .contains("First check whether this stage's deliverable already exists")
+            && PLAN_SHORT_CIRCUIT
+                .iter()
+                .all(|wording| !prompt.contains(wording));
+        assert!(
+            runs_reviews && no_probe && !prompt.contains("discuss-phase"),
+            "the reviews Plan prompt must run plan-phase --reviews with no plan probe: {prompt}"
+        );
+        assert_eq!(intent.stage(), Stage::Plan);
+        let noted = intent.with_relaunch_note(Some("n".to_string()));
+        assert!(
+            matches!(
+                &noted,
+                StageIntent::PlanReviews { relaunch_note: Some(note), .. } if note == "n"
+            ),
+            "the relaunch note lands on the reviews intent: {noted:?}"
+        );
     }
 
     #[test]
