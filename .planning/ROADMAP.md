@@ -397,7 +397,7 @@ Run conventions: discuss `--auto` in session, then `devflow start --phase 53.2 -
 --until plan`, external review (Tier B), close-out with `scripts/cut-pr-branch.sh`.
 **Requirements**: no REQ IDs; the issues above
 **Depends on:** Phase 53.1
-**Plans:** 7/17 plans executed
+**Plans:** 8/17 plans executed
 
 Plans:
 **Wave 1**
@@ -410,7 +410,7 @@ Plans:
 **Wave 2** *(blocked on Wave 1 completion)*
 - [x] 53.2-06-PLAN.md — #296 fake systemctl reads active; held-lock readiness (wave 2)
 - [x] 53.2-07-PLAN.md — #276 raw-writer guard scan; #277 bounded write-lock read (wave 2)
-- [ ] 53.2-08-PLAN.md — #301 one CI-aware poll budget; #279 wait for inactive (wave 2)
+- [x] 53.2-08-PLAN.md — #301 one CI-aware poll budget; #279 wait for inactive (wave 2)
 - [ ] 53.2-09-PLAN.md — #249 ISO-8601 start time; #310 reproduce then bounded reads (wave 2)
 - [ ] 53.2-10-PLAN.md — #250 StageIntent::PlanReviews and the planned semver break (wave 2)
 
@@ -675,7 +675,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
-| 53.2. wsx/UDE first-use and dogfood remediation | 7/17 | In Progress | - |
+| 53.2. wsx/UDE first-use and dogfood remediation | 8/17 | In Progress | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
