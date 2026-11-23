@@ -2505,12 +2505,11 @@ fn record_leftover_question(project_root: &Path, phase: PhaseId, stage: Stage) {
 /// caller's phase holder. `state` is the copy that wrote, which may already be behind the
 /// file; the committed copy is returned for the caller to launch.
 ///
-/// 999.251 (D-02): a run its own `--until` cap halted resumes at [`Stage::next`] of the
-/// halted stage, with the bookkeeping a normal advance makes
+/// 999.251 (D-02): a run its own `--until` cap halted resumes at the stage
+/// [`resume_advance`] names, with the bookkeeping a normal advance makes
 /// ([`crate::pipeline_gate::enter_stage`]) and a `transition` event, recorded before any
 /// handoff so `agent_handoff` names the stage launched. Every check before the first
-/// write judges that stage. The halt records no target, so a halt reached through a
-/// Plan->Validate transition also resumes at Code. Any other stop reruns its stage.
+/// write judges that stage. Any other stop reruns its stage.
 fn resume_loaded(
     project_root: &Path,
     phase: PhaseId,
@@ -2626,14 +2625,20 @@ fn resume_loaded(
     Ok(state)
 }
 
-/// The advance a resume makes: the halted stage and its [`Stage::next`] when the run's
-/// own `--until` cap stopped it ([`crate::pipeline_gate::until_cap_fired`]), else `None`.
-/// An `--until` halt never happens after Validate, so a fired cap always has a next.
+/// The advance a resume makes when the run's own `--until` cap stopped it
+/// ([`crate::pipeline_gate::until_cap_fired`]), else `None`: the halted stage and the
+/// stage the halted transition was moving to ([`State::until_halt_target`], #281), so a
+/// halt reached through Plan->Validate resumes at Validate. A state without a recorded
+/// target advances to [`Stage::next`]; an `--until` halt never happens after Validate,
+/// so a fired cap always has a next.
 fn resume_advance(state: &State) -> Option<(Stage, Stage)> {
     if !crate::pipeline_gate::until_cap_fired(state) {
         return None;
     }
-    state.stage.next().map(|to| (state.stage, to))
+    state
+        .until_halt_target
+        .or_else(|| state.stage.next())
+        .map(|to| (state.stage, to))
 }
 
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
