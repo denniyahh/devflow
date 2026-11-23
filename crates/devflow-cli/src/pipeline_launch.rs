@@ -3861,6 +3861,55 @@ mod tests {
         );
     }
 
+    /// #258 (operator decision 3): a resume whose launch timed out with its runner not
+    /// live keeps the `--until` halt the runner recorded during the launch, so the run
+    /// still reads as halted by its cap rather than as a failed resume.
+    #[test]
+    fn a_timed_out_resume_keeps_the_until_halt_its_runner_recorded() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_timed_out_resume_keeps_the_until_halt_its_runner_recorded";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5373);
+        save_stopped_in_plan(root, phase, AgentKind::Codex, "stopped via `devflow stop`");
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::TimedOutLeaving(
+            Ok("inactive"),
+        ));
+        let runner_root = root.to_path_buf();
+        crate::service::double::run_during_launch(move || {
+            workflow::update_state(&runner_root, phase, |state| {
+                state.stopped = true;
+                state.stop_reason = Some(crate::pipeline_gate::until_halt_reason(Stage::Plan));
+                Ok::<_, workflow::WorkflowError>(())
+            })
+            .expect("the stand-in runner records its --until halt");
+        });
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        assert!(
+            result.is_err(),
+            "a timed-out resume with no live runner fails"
+        );
+
+        let state = workflow::load_state(root, phase).unwrap();
+        let reason = state.stop_reason.clone();
+        assert!(
+            crate::pipeline_gate::until_cap_fired(&state),
+            "a resume whose launch timed out overwrote the --until halt its runner recorded: \
+             stop_reason {reason:?}"
+        );
+    }
+
     /// 999.251 with `--agent`: the handoff is judged and recorded at Code, the stage the
     /// resume launches, after the `transition` that moved the run there.
     #[test]
