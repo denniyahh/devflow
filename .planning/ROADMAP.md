@@ -443,6 +443,28 @@ preference; its record (corpus size, agreement with the operator's answers, cali
 **Plans**: TBD
 **UI hint**: no
 
+### Phase 54.1: Pause at the stage boundary (INSERTED)
+
+**Goal:** `devflow pause --phase N` stops a live run at the next stage boundary instead of mid-stage, so a planned
+break or reboot loses no in-flight work and `devflow resume` continues from the next stage without rerunning the
+paused one. A flag runs `/gsd-pause-work` non-interactively at the boundary before the stop (operator 2026-11-23:
+anyone who wants it interactive runs the command themselves). Optional, decided at discuss: resume automatically
+after a reboot through a one-shot user unit (dropped if a spike shows it fragile).
+**Requirements**: GitHub issue #342 (operator 2026-11-23)
+**Success Criteria** (what must be TRUE):
+
+  1. A pause issued mid-stage lets that stage finish, then the run stops with `stop_reason` paused; `resume` launches
+     the next stage, not the paused one, as the event log records. **Control:** `devflow stop` at the same point
+     still ends the stage mid-run.
+  2. A pause on a run waiting at a gate, or on a run that is not live, refuses or says what it did, in one line.
+  3. With the pause-work flag, a committed `.continue-here.md` exists at the boundary and no question was asked.
+     **Control:** without the flag, no handoff file is written.
+**Depends on:** Phase 54
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 54.1 to break down)
+
 ### Phase 55: Failover Generalized
 
 **Goal**: A quota denial at any stage — or rate-limit telemetry crossing a configured threshold before a denial —
@@ -646,6 +668,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
 | 53.2. wsx/UDE first-use and dogfood remediation | 0/0 | Not started | - |
+| 54.1. Pause at the stage boundary | 0/0 | Not started | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
