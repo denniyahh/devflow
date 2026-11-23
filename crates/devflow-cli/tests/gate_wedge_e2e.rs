@@ -19,9 +19,9 @@ use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::test_support::gate_answer_files;
+use devflow_core::test_support::{gate_answer_files, write_executable};
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -646,10 +646,7 @@ struct FakeBin {
 fn fake_bin_dir(agent_body: &str) -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     let codex = dir.path().join("codex");
-    fs::write(&codex, format!("#!/bin/sh\n{agent_body}\n")).unwrap();
-    let mut permissions = fs::metadata(&codex).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&codex, permissions).unwrap();
+    write_executable(&codex, &format!("#!/bin/sh\n{agent_body}\n"));
     for program in ["git", "sh"] {
         symlink(format!("/usr/bin/{program}"), dir.path().join(program)).unwrap();
     }

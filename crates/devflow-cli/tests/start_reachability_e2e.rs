@@ -13,8 +13,8 @@
 mod common;
 
 use common::HermeticPath;
+use devflow_core::test_support::write_executable;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -46,14 +46,10 @@ struct FakeBin {
 fn fake_bin_dir() -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     let claude = dir.path().join("claude");
-    fs::write(
+    write_executable(
         &claude,
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&claude).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&claude, perms).unwrap();
+    );
     let path = dir.path().to_path_buf();
     FakeBin { _dir: dir, path }
 }
