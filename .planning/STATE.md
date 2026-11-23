@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-08-PLAN.md
-last_updated: "2026-11-23T05:47:36.232Z"
+stopped_at: Completed 53.2-09-PLAN.md
+last_updated: "2026-11-23T06:16:56.821Z"
 last_activity: 2026-11-22
 last_activity_desc: Phase 53.2 execution started
-state_head: 8f17a62612d87fe20fccbd3537ead1a216513f2b
+state_head: d8a2235671d028ed6640ea76658101694912af2d
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 105
-  completed_plans: 96
+  completed_plans: 97
   percent: 13
 ---
 
@@ -179,7 +179,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
-Plan: 9 of 17
+Plan: 10 of 17
 Status: Ready to execute
 Last activity: 2026-11-22 — Phase 53.2 execution started
 
@@ -1070,6 +1070,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: 53.2-06: the cross-phase readiness control holds .runner-01 via the test binary re-run as an #[ignore] child (claim_runner_lock), not flock(1), so it does not depend on the pinned image
 - [Phase 53.2]: 53.2-07: raw stub writer guard keeps 5 set_permissions sites with reasons (write_executable chmod, ETXTBSY control, gsd_reader held-writer launcher and 0o644 chmod, registry dir mode)
 - [Phase 53.2]: 53.2-08: no phase7_cli caller expects a helper timeout, so all seven wait helpers panic on the shared poll budget
+- [Phase 53.2]: 53.2-09: #310 left open per D-16; base and after loops both 0/40 target failures, so the post-release read waits are by construction
 
 ## Roadmap Evolution
 
@@ -1277,11 +1278,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P06 | 13min | 2 tasks | 2 files |
 | Phase 53.2 P07 | 6min | 2 tasks | 2 files |
 | Phase 53.2 P08 | 7 min | 3 tasks | 7 files |
+| Phase 53.2 P09 | 27min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-11-23T05:47:34.217Z
-**Stopped at:** Completed 53.2-08-PLAN.md
+**Last session:** 2026-11-23T06:16:54.932Z
+**Stopped at:** Completed 53.2-09-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
