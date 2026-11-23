@@ -15181,21 +15181,24 @@ mod tests {
         drop(release);
         holder.join().unwrap();
         wait_for_released_write_lock(&root, phase);
-        assert_eq!(
-            write_lock_line(&workflow::write_lock_status(&root, phase).unwrap()),
-            None,
-            "control: released"
+        devflow_core::test_support::wait_until(
+            RELEASED_WRITE_LOCK_WAIT,
+            "control: released, so write_lock_status names no held lock",
+            || write_lock_line(&workflow::write_lock_status(&root, phase).unwrap()).is_none(),
         );
-        assert!(
-            !rendered_status(&state).contains("state write lock"),
-            "control"
+        devflow_core::test_support::wait_until(
+            RELEASED_WRITE_LOCK_WAIT,
+            "control: released, so status prints no state write lock",
+            || !rendered_status(&state).contains("state write lock"),
         );
-        let free = reconcile_phase(&facts_for(&root, &state));
-        assert!(
-            !free
-                .iter()
-                .any(|finding| finding.detail.contains("state write lock")),
-            "control: released"
+        devflow_core::test_support::wait_until(
+            RELEASED_WRITE_LOCK_WAIT,
+            "control: released, so doctor names no state write lock",
+            || {
+                !reconcile_phase(&facts_for(&root, &state))
+                    .iter()
+                    .any(|finding| finding.detail.contains("state write lock"))
+            },
         );
     }
 
