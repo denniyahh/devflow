@@ -162,6 +162,12 @@ enum Command {
         /// `devflow.toml` key; only `start` does.
         #[arg(long)]
         fallback_agent: Option<AgentKind>,
+        /// Rerun Plan as a reviews pass, `/gsd-plan-phase N --reviews`, on a run its
+        /// `--until plan` cap halted after Plan; the cap still holds, so the run halts
+        /// again after Plan. Refused in any other state and without the phase's
+        /// NN-REVIEWS.md.
+        #[arg(long)]
+        reviews: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -529,8 +535,15 @@ fn run() -> Result<(), CliError> {
             phase,
             agent,
             fallback_agent,
+            reviews,
             project,
-        } => resume_with_fallback(&project_root(project)?, phase, agent, fallback_agent),
+        } => resume_with_fallback(
+            &project_root(project)?,
+            phase,
+            agent,
+            fallback_agent,
+            reviews,
+        ),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {
