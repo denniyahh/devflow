@@ -787,7 +787,7 @@ mod tests {
         let python = format!(
             "import os, sys, time\nstatus = sys.argv[1]\ntry:\n    os.setpgid(0, 0)\nexcept OSError as error:\n    open(status, 'w', encoding='utf-8').write(str(error.errno))\n    raise\nopen(status, 'w', encoding='utf-8').write('0')\ntime.sleep({sleep_secs})\n"
         );
-        crate::test_support::write_executable(&stub, &script);
+        crate::test_support::write_executable(&stub, script);
         std::fs::write(&escape, python).expect("write setpgid escape helper");
         std::os::unix::fs::symlink("/usr/bin/python3", dir.path().join("python3"))
             .expect("link the required Python utility into the isolated PATH");
