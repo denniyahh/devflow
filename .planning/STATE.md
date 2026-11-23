@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-05-PLAN.md
-last_updated: "2026-11-23T05:17:02.851Z"
+stopped_at: Completed 53.2-06-PLAN.md
+last_updated: "2026-11-23T05:32:17.152Z"
 last_activity: 2026-11-22
 last_activity_desc: Phase 53.2 execution started
-state_head: 401b32be20b227364bf22e9f558dc7d38a28b7de
+state_head: ce873ceb7ec03ba7ad2ac1510db466a92eefd01d
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 105
-  completed_plans: 93
+  completed_plans: 94
   percent: 13
 ---
 
@@ -179,7 +179,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
-Plan: 6 of 17
+Plan: 7 of 17
 Status: Ready to execute
 Last activity: 2026-11-22 — Phase 53.2 execution started
 
@@ -1067,6 +1067,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: 53.2-03: every 0o755 site in the CLI's src stubs and shared e2e fakes writes text, so all converted to write_executable; none left for 53.2-07's allowlist
 - [Phase 53.2]: 53.2-04: every 0o755 site in the eleven CLI e2e files writes text, so none is left for 53.2-07's allowlist
 - [Phase 53.2]: 53.2-05: an open-branch base is resolve-checked only when it has branches to compare; a run whose recorded base equals the project's is labelled the run's base
+- [Phase 53.2]: 53.2-06: the cross-phase readiness control holds .runner-01 via the test binary re-run as an #[ignore] child (claim_runner_lock), not flock(1), so it does not depend on the pinned image
 
 ## Roadmap Evolution
 
@@ -1271,11 +1272,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P03 | 9 min | 2 tasks | 5 files |
 | Phase 53.2 P04 | 3 min | 3 tasks | 11 files |
 | Phase 53.2 P05 | 9min | 2 tasks | 2 files |
+| Phase 53.2 P06 | 13min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-23T05:17:00.956Z
-**Stopped at:** Completed 53.2-05-PLAN.md
+**Last session:** 2026-11-23T05:32:15.177Z
+**Stopped at:** Completed 53.2-06-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
