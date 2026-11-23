@@ -72,6 +72,10 @@ enum Command {
         /// before Code).
         #[arg(long)]
         until: Option<Stage>,
+        /// Run the Plan stage as a reviews pass: `/gsd-plan-phase N --reviews`,
+        /// incorporating the phase's REVIEWS.md; refused without that file.
+        #[arg(long)]
+        reviews: bool,
         /// A second agent that takes over the Code stage once if the agent is
         /// rate-limited there (D-01, `51-CONTEXT.md`). Failover happens only at
         /// Code; at any other stage a rate limit waits at the stage's gate.
@@ -473,6 +477,7 @@ fn run() -> Result<(), CliError> {
             no_worktree,
             dry_run,
             until,
+            reviews,
             fallback_agent,
             project,
         } => {
@@ -486,6 +491,7 @@ fn run() -> Result<(), CliError> {
                 worktree,
                 dry_run,
                 until,
+                reviews,
                 commands::FallbackSource::FlagOrConfig(fallback_agent),
             )
         }

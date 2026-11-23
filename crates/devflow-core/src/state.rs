@@ -402,6 +402,18 @@ pub struct State {
     /// field".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gap_closure_pass: bool,
+    /// Whether the run's Plan stage is a reviews pass (D-04, #250): Plan runs
+    /// `/gsd-plan-phase N --reviews`, replanning the phase from its
+    /// REVIEWS.md.
+    ///
+    /// Set by `devflow start --reviews`. Read by the Plan prompt on every
+    /// launch, a resume included, so a stopped reviews pass relaunches as one
+    /// with no resume flag. Cleared when the run enters another stage.
+    ///
+    /// `false` also means "the state was written by a binary predating this
+    /// field".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reviews_pass: bool,
 }
 
 /// Supported coding agents.
@@ -495,6 +507,7 @@ impl State {
             abort_requested: None,
             validate_pass_head: None,
             gap_closure_pass: false,
+            reviews_pass: false,
         }
     }
 }

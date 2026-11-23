@@ -329,6 +329,7 @@ pub(crate) fn start(
     worktree: bool,
     dry_run: bool,
     until: Option<Stage>,
+    _reviews: bool,
     fallback: FallbackSource,
 ) -> Result<(), CliError> {
     // 999.229: said first, before any other output, a refusal or the dry-run
@@ -8112,6 +8113,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
                 FallbackSource::FlagOrConfig(None),
             )
             .map_err(|err| err.to_string())
@@ -13988,6 +13990,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
@@ -14023,6 +14026,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             FallbackSource::FlagOrConfig(fallback),
         )
     }
@@ -15045,6 +15049,7 @@ mod tests {
             true,
             false,
             None,
+            false,
             FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
