@@ -1,8 +1,8 @@
 //! Host-only tests of the foreground runner as a systemd user unit (D-01, D-04a, D-07).
 //!
-//! Every test here is `#[ignore]` and runs only under `scripts/check.sh service`, which
-//! needs a running systemd user manager; the container suite has none. Each test's first
-//! assertion is that `systemctl --user show -p Version --value` succeeds, so a host with
+//! Every test here that talks to a unit is `#[ignore]` and runs only under `scripts/check.sh
+//! service`, which needs a running systemd user manager; the container suite has none. The
+//! pure tests of [`settle_unit_reads`] run everywhere. Each host test's first assertion is that `systemctl --user show -p Version --value` succeeds, so a host with
 //! no manager fails the test instead of skipping it.
 //!
 //! `systemctl` and `systemd-run` get the caller's real `XDG_RUNTIME_DIR` and
@@ -287,6 +287,92 @@ fn wait_inactive(unit: &str) -> Result<(), String> {
         }
         std::thread::sleep(UNIT_POLL);
     }
+}
+
+/// One read of a unit's `ActiveState`, `Result` and `ExecMainStatus`.
+#[derive(Clone, Debug)]
+struct UnitRead {
+    active: String,
+    result: String,
+    exec_main_status: String,
+}
+
+/// Poll `next` until a read is `inactive`, for at most `budget` (#279).
+fn settle_unit_reads(_budget: Duration, _next: impl FnMut() -> UnitRead) -> Result<(), String> {
+    Ok(())
+}
+
+/// A read of `active`, with the given `Result` and `ExecMainStatus`.
+fn unit_read(active: &str, result: &str, exec_main_status: &str) -> UnitRead {
+    UnitRead {
+        active: active.to_string(),
+        result: result.to_string(),
+        exec_main_status: exec_main_status.to_string(),
+    }
+}
+
+/// A `next` for [`settle_unit_reads`] that returns `reads` in order, then repeats the last.
+fn scripted(reads: Vec<UnitRead>) -> impl FnMut() -> UnitRead {
+    let mut reads = reads.into_iter();
+    let mut last = None;
+    move || {
+        if let Some(read) = reads.next() {
+            last = Some(read);
+        }
+        last.clone().expect("a scripted read")
+    }
+}
+
+#[test]
+fn a_failed_read_before_inactive_is_reported_with_its_result() {
+    let outcome = settle_unit_reads(
+        Duration::from_secs(5),
+        scripted(vec![
+            unit_read("deactivating", "success", "0"),
+            unit_read("failed", "exit-code", "1"),
+            unit_read("inactive", "success", "0"),
+        ]),
+    );
+    let reported = outcome.as_ref().err().is_some_and(|text| {
+        text.contains("failed")
+            && text.contains("Result=exit-code")
+            && text.contains("ExecMainStatus=1")
+    });
+    assert!(
+        reported,
+        "a failed read before inactive was not surfaced: {outcome:?}"
+    );
+}
+
+#[test]
+fn an_inactive_read_after_deactivating_settles() {
+    let outcome = settle_unit_reads(
+        Duration::from_secs(5),
+        scripted(vec![
+            unit_read("deactivating", "success", "0"),
+            unit_read("inactive", "success", "0"),
+        ]),
+    );
+    assert!(
+        outcome.is_ok(),
+        "deactivating then inactive did not settle: {outcome:?}"
+    );
+}
+
+#[test]
+fn reads_that_never_settle_time_out_naming_the_last_read() {
+    let outcome = settle_unit_reads(
+        Duration::from_millis(100),
+        scripted(vec![unit_read("deactivating", "success", "0")]),
+    );
+    let reported = outcome
+        .as_ref()
+        .err()
+        .is_some_and(|text| text.contains("100ms") && text.contains("ActiveState=deactivating"));
+    assert!(
+        reported,
+        "a read that never settled was not reported: {outcome:?}"
+    );
 }
 
 /// Every event line of `kind` in the project's event log.
