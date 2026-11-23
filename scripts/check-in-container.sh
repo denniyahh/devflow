@@ -12,6 +12,10 @@
 # place to bump it. Requires Docker (a real daemon). Rootless podman is NOT
 # supported here: it does not delegate the cpuset controller by default, so
 # --cpuset-cpus fails outright.
+#
+# DEVFLOW_E2E_POLL_BUDGET_SECS (phase7_cli's polling budget, #301) is passed
+# in: a host value is forwarded, otherwise 30, the CI length. CI itself is
+# not passed, because insta changes its snapshot-update default under CI.
 set -euo pipefail
 
 # Flatpak sandboxes (e.g. GitHub Desktop) bundle git under resources or rely on host tools
@@ -150,5 +154,6 @@ exec "${DOCKER[@]}" run --rm -t \
     -w /workspace \
     -e CARGO_TARGET_DIR=/ctarget \
     -e CARGO_TERM_COLOR=always \
+    -e DEVFLOW_E2E_POLL_BUDGET_SECS="${DEVFLOW_E2E_POLL_BUDGET_SECS:-30}" \
     "$IMAGE" \
     "${CPU_PIN[@]}" scripts/check.sh "$TARGET"
