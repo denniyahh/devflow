@@ -2134,17 +2134,14 @@ mod tests {
     /// running and its supervisor writes no state while the test reads it.
     /// Codex is a capture-shape agent, so the launch spends no delivery canary.
     fn waiting_codex_dir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let path_dir = agent_free_dir_with_agent_stub("codex");
         let path = path_dir.path().join("codex");
-        std::fs::write(
+        devflow_core::test_support::write_executable(
             &path,
             "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
              i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
              exit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
             .into_iter()
             .map(Path::new)
