@@ -158,42 +158,46 @@ if [ -n "$unit" ] && [ -n "$wd" ] && [ "$#" -gt 0 ]; then
     @RM@ -f "$dir/fail-next"
     exit 1
   fi
-  phase=""; after_phase=""
-  for arg in "$@"; do
-    if [ -n "$after_phase" ]; then phase=$arg; after_phase=""; fi
-    [ "$arg" = --phase ] && after_phase=1
-  done
-  case "$phase" in
-    *.*) padded="$(printf '%02d' "${phase%%.*}").${phase#*.}" ;;
-    *) padded=$(printf '%02d' "$phase") ;;
-  esac
-  lock="$wd/.devflow/.runner-$padded"
-  held() {
-    for fd in /proc/"$pid"/fd/*; do
-      [ -e "$fd" ] && [ "$fd" -ef "$lock" ] || continue
-      if ( while read -r key rest; do [ "$key" = lock: ] && exit 0; done <"/proc/$pid/fdinfo/${fd##*/}"; exit 1 ) 2>/dev/null; then
-        return 0
-      fi
+  note="$dir/$unit.notify-$$"
+  sock="$note.sock"
+  @RM@ -f "$note.listening" "$note.result" "$note.launched" "$sock"
+  echo_lines() {
+    for file in "$@"; do
+      [ -e "$file" ] || continue
+      while IFS= read -r line; do echo "$line" >&2; done <"$file"
     done
-    return 1
   }
-  cd "$wd" || exit 1
-  @SETSID@ "$@" </dev/null >"$dir/$unit.out" 2>&1 &
-  pid=$!
-  echo "$pid" >"$dir/$unit.pid"
+  FAKE_NOTIFY_SOCKET="$sock" FAKE_NOTIFY_FILES="$note" "@TESTEXE@" --exact common::fake_notify_listener_entry --ignored --quiet </dev/null >"$note.log" 2>&1 &
+  lpid=$!
   tries=0
-  while [ "$tries" -lt 600 ]; do
-    held && exit 0
+  while [ "$tries" -lt 600 ] && [ ! -e "$note.listening" ] && [ ! -e "$note.result" ]; do
     state=""
-    if [ -r "/proc/$pid/stat" ]; then read -r p comm state rest <"/proc/$pid/stat"; fi
-    if [ -z "$state" ] || [ "$state" = Z ]; then
-      echo "Job for $unit @FAILED@" >&2
-      exit 1
-    fi
+    { read -r p comm state rest <"/proc/$lpid/stat"; } 2>/dev/null
+    if [ -z "$state" ] || [ "$state" = Z ]; then break; fi
     tries=$((tries + 1))
     @SLEEP@ 0.05
   done
-  echo "Job for $unit failed because a timeout was exceeded." >&2
+  if [ ! -e "$note.listening" ]; then
+    kill "$lpid" 2>/dev/null
+    echo "fake systemd-run: the notify listener did not start" >&2
+    echo_lines "$note.result" "$note.log"
+    exit 1
+  fi
+  cd "$wd" || { kill "$lpid" 2>/dev/null; exit 1; }
+  NOTIFY_SOCKET="$sock" @SETSID@ "$@" </dev/null >"$dir/$unit.out" 2>&1 &
+  pid=$!
+  echo "$pid" >"$dir/$unit.pid"
+  echo "$pid" >"$note.launched"
+  wait "$lpid"
+  verdict=""
+  [ -e "$note.result" ] && read -r verdict <"$note.result"
+  case "$verdict" in
+    ready) exit 0 ;;
+    exited) echo "Job for $unit @FAILED@" >&2; exit 1 ;;
+    timeout) echo "Job for $unit failed because a timeout was exceeded." >&2; exit 1 ;;
+  esac
+  echo "fake systemd-run: notify listener: $verdict" >&2
+  echo_lines "$note.log"
   exit 1
 fi
 set -- $all
@@ -216,9 +220,124 @@ fn resolve_on_path(program: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{program} is not on this test process's PATH"))
 }
 
-/// [`FAKE_SYSTEMD_RUN_CALLS`] with its tool paths written in.
+/// [`FAKE_SYSTEMD_RUN_CALLS`] with its tool paths and this test binary written in.
 fn fake_systemd_run_calls() -> String {
-    with_tool_paths(FAKE_SYSTEMD_RUN_CALLS).replace("@FAILED@", FAKE_START_FAILED)
+    let exe = std::env::current_exe().expect("this test binary");
+    let exe = exe.to_str().expect("a UTF-8 test binary path");
+    assert!(
+        !exe.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '$' | '`' | '\\')),
+        "the test binary's path is written double-quoted into the fake: {exe}"
+    );
+    with_tool_paths(FAKE_SYSTEMD_RUN_CALLS)
+        .replace("@FAILED@", FAKE_START_FAILED)
+        .replace("@TESTEXE@", exe)
+}
+
+/// The variable naming the socket path [`fake_notify_listener_entry`] binds.
+pub const FAKE_NOTIFY_SOCKET_ENV: &str = "FAKE_NOTIFY_SOCKET";
+
+/// The variable naming the path prefix P of [`fake_notify_listener_entry`]'s files:
+/// it creates `P.listening`, reads the launched pid from `P.launched` and writes its
+/// verdict to `P.result`.
+pub const FAKE_NOTIFY_FILES_ENV: &str = "FAKE_NOTIFY_FILES";
+
+/// How long the notify listener waits for `READY=1` before it reports `timeout`.
+pub const FAKE_NOTIFY_READY_WAIT: Duration = Duration::from_secs(30);
+
+/// The notify listener's receive timeout, after which it checks the launched pid.
+pub const FAKE_NOTIFY_TICK: Duration = Duration::from_millis(50);
+
+/// Not a test of its own: the fake `systemd-run`'s notify listener, which it runs by
+/// re-running this test binary. Binds [`FAKE_NOTIFY_SOCKET_ENV`], creates
+/// `P.listening`, and writes `ready`, `exited`, `timeout` or `error: ...` to
+/// `P.result` (P from [`FAKE_NOTIFY_FILES_ENV`]). Without the variable it does nothing.
+#[test]
+#[ignore = "the fake systemd-run's notify listener, run by the fake, not a test"]
+fn fake_notify_listener_entry() {
+    let Some(files) = std::env::var_os(FAKE_NOTIFY_FILES_ENV) else {
+        return;
+    };
+    let verdict = match std::env::var_os(FAKE_NOTIFY_SOCKET_ENV) {
+        Some(socket) => listen_for_ready(&files, Path::new(&socket)),
+        None => format!("error: {FAKE_NOTIFY_SOCKET_ENV} is unset"),
+    };
+    fs::write(with_suffix(&files, ".result"), format!("{verdict}\n"))
+        .expect("write the notify listener's verdict");
+}
+
+/// `prefix` with `suffix` appended.
+fn with_suffix(prefix: &OsStr, suffix: &str) -> PathBuf {
+    let mut path = prefix.to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Whether a notify datagram has a line equal to `READY=1`.
+fn is_ready_datagram(datagram: &[u8]) -> bool {
+    datagram
+        .split(|byte| *byte == b'\n')
+        .any(|line| line == b"READY=1")
+}
+
+/// The pid in `P.launched`, once the fake has written all of it.
+fn launched_pid(path: &Path) -> Option<u32> {
+    let text = fs::read_to_string(path).ok()?;
+    text.strip_suffix('\n')?.trim().parse().ok()
+}
+
+/// Bind `socket`, mark `files` listening, and wait for `READY=1`: `ready` when it
+/// arrives, `exited` when the launched pid is gone first, `timeout` at
+/// [`FAKE_NOTIFY_READY_WAIT`].
+fn listen_for_ready(files: &OsStr, socket: &Path) -> String {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixDatagram;
+    let _ = fs::remove_file(socket);
+    let listener = match UnixDatagram::bind(socket) {
+        Ok(listener) => listener,
+        Err(err) => return format!("error: could not bind {}: {err}", socket.display()),
+    };
+    if let Err(err) = listener.set_read_timeout(Some(FAKE_NOTIFY_TICK)) {
+        return format!("error: {err}");
+    }
+    if let Err(err) = fs::write(with_suffix(files, ".listening"), "") {
+        return format!("error: could not mark the listener started: {err}");
+    }
+    let launched = with_suffix(files, ".launched");
+    let deadline = Instant::now() + FAKE_NOTIFY_READY_WAIT;
+    let mut pid = None;
+    let mut datagram = [0u8; 4096];
+    while Instant::now() < deadline {
+        match listener.recv(&mut datagram) {
+            Ok(len) if is_ready_datagram(&datagram[..len]) => return "ready".to_string(),
+            Ok(_) => {}
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                pid = pid.or_else(|| launched_pid(&launched));
+                if pid.is_some_and(|pid| !devflow_core::agent::agent_running(pid)) {
+                    return drained_verdict(&listener, &mut datagram);
+                }
+            }
+            Err(err) => return format!("error: {err}"),
+        }
+    }
+    "timeout".to_string()
+}
+
+/// After the launched pid is gone: `ready` if a `READY=1` it sent before it exited is
+/// still queued on `listener`, else `exited`.
+fn drained_verdict(listener: &std::os::unix::net::UnixDatagram, datagram: &mut [u8]) -> String {
+    if let Err(err) = listener.set_nonblocking(true) {
+        return format!("error: {err}");
+    }
+    loop {
+        match listener.recv(datagram) {
+            Ok(len) if is_ready_datagram(&datagram[..len]) => return "ready".to_string(),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return "exited".to_string();
+            }
+            Err(err) => return format!("error: {err}"),
+        }
+    }
 }
 
 /// `calls` with `@SETSID@`, `@SLEEP@` and `@RM@` replaced by their absolute paths.
