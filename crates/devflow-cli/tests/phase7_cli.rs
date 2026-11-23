@@ -115,21 +115,51 @@ fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: 
     output
 }
 
+/// The polling budget of this file's wait helpers off CI.
+const POLL_BUDGET_DEFAULT: Duration = Duration::from_secs(10);
+/// The polling budget under CI, where a loaded runner is slower (#301).
+const POLL_BUDGET_UNDER_CI: Duration = Duration::from_secs(30);
+
 /// The polling budget of this file's wait helpers, from the values of `CI`
-/// and `DEVFLOW_E2E_POLL_BUDGET_SECS` (#301).
-fn poll_budget_from(_ci: Option<&str>, _override_secs: Option<&str>) -> Duration {
-    Duration::from_secs(10)
+/// and `DEVFLOW_E2E_POLL_BUDGET_SECS` (#301). `CI` counts as set when it is
+/// non-empty and neither `0` nor `false`; the override, in whole seconds,
+/// beats it.
+///
+/// # Panics
+/// Naming the variable and value, when the override is not whole seconds or
+/// is `0` (a 0 s budget would time every wait out at once).
+fn poll_budget_from(ci: Option<&str>, override_secs: Option<&str>) -> Duration {
+    if let Some(value) = override_secs {
+        let secs: u64 = value.parse().unwrap_or_else(|_| {
+            panic!("DEVFLOW_E2E_POLL_BUDGET_SECS must be whole seconds, got {value:?}")
+        });
+        assert!(
+            secs > 0,
+            "DEVFLOW_E2E_POLL_BUDGET_SECS must be at least 1 second, got {value:?}"
+        );
+        return Duration::from_secs(secs);
+    }
+    let under_ci = ci.is_some_and(|value| {
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    });
+    if under_ci {
+        POLL_BUDGET_UNDER_CI
+    } else {
+        POLL_BUDGET_DEFAULT
+    }
 }
 
-/// Poll `predicate` until it holds, panicking once `budget` has passed.
-fn poll_until(_budget: Duration, what: &str, mut predicate: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if predicate() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for {what}");
+/// The polling budget of this file's wait helpers, read from the environment.
+fn poll_budget() -> Duration {
+    let ci = std::env::var("CI").ok();
+    let override_secs = std::env::var("DEVFLOW_E2E_POLL_BUDGET_SECS").ok();
+    poll_budget_from(ci.as_deref(), override_secs.as_deref())
+}
+
+/// Poll `predicate` until it holds, panicking with the budget and `what` once
+/// `budget` has passed.
+fn poll_until(budget: Duration, what: &str, predicate: impl FnMut() -> bool) {
+    devflow_core::test_support::wait_until(budget, what, predicate);
 }
 
 /// The panic text of `f`, which must panic.
@@ -191,13 +221,7 @@ fn a_poll_helper_that_times_out_names_its_budget() {
 }
 
 fn wait_for(path: &Path) {
-    for _ in 0..200 {
-        if path.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for {}", path.display());
+    poll_until(poll_budget(), &path.display().to_string(), || path.exists());
 }
 
 /// Wait until a monitor-written pid file exists AND holds a parseable pid,
@@ -206,15 +230,18 @@ fn wait_for(path: &Path) {
 /// the next monitor recreates it, so a read can land in the gap and hit
 /// NotFound even though the pipeline is healthy.
 fn wait_for_pid(path: &Path) -> u32 {
-    for _ in 0..200 {
-        if let Ok(contents) = fs::read_to_string(path)
-            && let Ok(pid) = contents.trim().parse::<u32>()
-        {
-            return pid;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for a pid in {}", path.display());
+    let mut pid = None;
+    poll_until(
+        poll_budget(),
+        &format!("a pid in {}", path.display()),
+        || {
+            pid = fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<u32>().ok());
+            pid.is_some()
+        },
+    );
+    pid.expect("poll_until returned, so a pid was read")
 }
 
 /// The launch line of an agent stub that records its own pid in `pid_path` and
@@ -230,40 +257,49 @@ fn recording_sleeper(pid_path: &Path) -> String {
 /// that call `cleanup` must first wait for the phase to actually finish,
 /// the same way a real operator would.
 fn wait_for_state_cleared(root: &Path, phase: PhaseId) {
-    for _ in 0..400 {
-        if devflow_core::workflow::load_state(root, phase).is_err() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase} state to clear (pipeline never finished)");
+    poll_until(
+        poll_budget(),
+        &format!("phase {phase} state to clear (pipeline never finished)"),
+        || devflow_core::workflow::load_state(root, phase).is_err(),
+    );
 }
 
 /// Wait until no process holds a phase's runner lock: the runner has exited.
 fn wait_for_runner_lock_free(root: &Path, phase: PhaseId) {
     let lock = devflow_core::liveness::runner_lock_path(root, phase);
-    for _ in 0..400 {
-        if devflow_core::liveness::probe(&lock).unwrap() != devflow_core::liveness::Held::Live {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase}'s runner to let go of its runner lock");
+    poll_until(
+        poll_budget(),
+        &format!("phase {phase}'s runner to let go of its runner lock"),
+        || devflow_core::liveness::probe(&lock).unwrap() != devflow_core::liveness::Held::Live,
+    );
 }
 
 /// Wait until a phase's persisted state has `stopped == true` (20c: a
 /// `--until`-halted phase). Polls rather than reading once, since the fake
 /// agent + monitor chain advances asynchronously.
 fn wait_for_stopped(root: &Path, phase: PhaseId) -> devflow_core::state::State {
-    for _ in 0..400 {
-        if let Ok(state) = devflow_core::workflow::load_state(root, phase)
-            && state.stopped
-        {
-            return state;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase} state to report stopped == true");
+    wait_for_state(
+        root,
+        phase,
+        &format!("phase {phase} state to report stopped == true"),
+        |state| state.stopped,
+    )
+}
+
+/// Poll a phase's persisted state until `accept` holds for it, returning that
+/// state; `what` names the awaited state in the timeout panic.
+fn wait_for_state(
+    root: &Path,
+    phase: PhaseId,
+    what: &str,
+    accept: impl Fn(&devflow_core::state::State) -> bool,
+) -> devflow_core::state::State {
+    let mut accepted = None;
+    poll_until(poll_budget(), what, || {
+        accepted = load_state(root, phase).ok().filter(|state| accept(state));
+        accepted.is_some()
+    });
+    accepted.expect("poll_until returned, so an accepted state was read")
 }
 
 fn seed_feature_branch(root: &Path, phase: PhaseId) {
@@ -1853,27 +1889,21 @@ fn codex_stub(launch: &str) -> String {
 /// either the never-silent gate fired (`gate_pending`) or the machine
 /// stopped (`--until` / completion). Returns that state.
 fn wait_for_settled(root: &Path, phase: PhaseId) -> devflow_core::state::State {
-    for _ in 0..400 {
-        if let Ok(state) = load_state(root, phase)
-            && (state.gate_pending || state.stopped)
-        {
-            return state;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase} to settle (gate or stop)");
+    wait_for_state(
+        root,
+        phase,
+        &format!("phase {phase} to settle (gate or stop)"),
+        |state| state.gate_pending || state.stopped,
+    )
 }
 
 fn wait_for_gate(root: &Path, phase: PhaseId) -> devflow_core::state::State {
-    for _ in 0..400 {
-        if let Ok(state) = load_state(root, phase)
-            && state.gate_pending
-        {
-            return state;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase} to report gate_pending");
+    wait_for_state(
+        root,
+        phase,
+        &format!("phase {phase} to report gate_pending"),
+        |state| state.gate_pending,
+    )
 }
 
 /// A codex run that exits 0 without emitting a DEVFLOW_RESULT marker must not

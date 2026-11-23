@@ -853,6 +853,7 @@ command. The coding agent never receives the variable.
 | `RUST_LOG` | `off` | Tracing verbosity (stderr). Unset or empty prints no tracing lines; set a level such as `info` or `debug` to see them |
 | `DEVFLOW_LOG_FORMAT` | plain | `json` for machine-readable log lines |
 | `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` | 90 | Test-only: bounds `gate_sweep_e2e.rs`'s patience with a spawned `devflow __runner` child so CI cannot hang indefinitely; not read by any production code path |
+| `DEVFLOW_E2E_POLL_BUDGET_SECS` | 10 (30 when CI is set) | Test-only: the polling budget of `phase7_cli.rs`'s wait helpers; a timeout names the budget used; not read by any production code path |
 
 ## `.devflow/` file inventory
 
