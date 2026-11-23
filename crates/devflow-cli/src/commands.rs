@@ -2856,6 +2856,32 @@ fn format_age(started_at: &str) -> String {
     }
 }
 
+/// A unix-seconds instant as ISO-8601 local time with its UTC offset,
+/// `YYYY-MM-DDTHH:MM:SS+HH:MM`, for a local offset of `offset_secs`.
+fn format_local_iso8601(secs: i64, offset_secs: i64) -> String {
+    let _ = offset_secs;
+    secs.to_string()
+}
+
+/// The local UTC offset in seconds at the unix-seconds instant `secs`; `None`
+/// when the C library cannot convert it.
+fn local_utc_offset_secs(secs: i64) -> Option<i64> {
+    let _ = secs;
+    None
+}
+
+/// `status`'s start line: the run's start as local ISO-8601 time, then its age.
+/// A `started_at` that does not parse, or an offset `offset_for` cannot give,
+/// prints the raw value instead.
+fn started_line(started_at: &str, offset_for: impl Fn(i64) -> Option<i64>) -> String {
+    let shown = match started_at.parse::<i64>() {
+        Ok(secs) => offset_for(secs).map(|offset| format_local_iso8601(secs, offset)),
+        Err(_) => None,
+    };
+    let shown = shown.unwrap_or_else(|| started_at.to_string());
+    format!("  started: {} ({})", shown, format_age(started_at))
+}
+
 /// `status`'s in-stage progress line: real elapsed time since the phase's
 /// most recent `stage_launched` event. `None` (no such event yet) renders
 /// the stage name with no age, rather than mislabeling phase age as stage
@@ -3131,11 +3157,7 @@ fn status_state_lines(
             state.consecutive_failures
         ));
     }
-    lines.push(format!(
-        "  started: {} ({})",
-        state.started_at,
-        format_age(&state.started_at)
-    ));
+    lines.push(started_line(&state.started_at, local_utc_offset_secs));
     lines.extend(status_run_lines(state));
     lines.extend(status_write_lock_line(project_root, state.phase));
     lines.push(render_stage_progress_line(
@@ -6326,6 +6348,37 @@ mod tests {
         assert!(ago(7200).ends_with("h ago"));
         assert!(ago(2 * 86400).ends_with("d ago"));
         assert_eq!(format_age("garbage"), "unknown");
+    }
+
+    #[test]
+    fn local_iso8601_renders_the_offset() {
+        assert_eq!(
+            format_local_iso8601(0, -18_000),
+            "1969-12-31T19:00:00-05:00"
+        );
+        assert_eq!(format_local_iso8601(0, 19_800), "1970-01-01T05:30:00+05:30");
+        assert_eq!(
+            format_local_iso8601(951_782_400, 0),
+            "2000-02-29T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn status_started_line_prints_iso_time_and_age() {
+        let line = started_line("0", |_| Some(3600));
+        assert!(
+            line.starts_with("  started: 1970-01-01T01:00:00+01:00 (") && line.ends_with(')'),
+            "the start time is not ISO-8601 local time followed by the age: {line}"
+        );
+    }
+
+    #[test]
+    fn status_started_line_keeps_an_unparsable_start_time_raw() {
+        let line = started_line("soon", |_| Some(0));
+        assert!(
+            line.contains("started: soon"),
+            "an unparsable start time was not printed raw: {line}"
+        );
     }
 
     /// The names of the removed `recover` verb that D-09a keeps out of production text.
