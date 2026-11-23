@@ -2020,6 +2020,28 @@ mod tests {
         );
     }
 
+    /// D-04 (#250): the workflow-style reviews Plan prompt (codex, pi) names
+    /// plan-phase.md in its `--reviews` mode, and carries no slash command,
+    /// PLAN.md short-circuit or discuss branch.
+    #[test]
+    fn workflow_reviews_plan_prompt_runs_plan_phase_in_reviews_mode() {
+        let intent = StageIntent::PlanReviews {
+            phase: PhaseId::new(7),
+            relaunch_note: None,
+        };
+        let prompt = render_workflow_style(&intent, "/workflows");
+        let runs_reviews = prompt.contains("/workflows/plan-phase.md for phase 7 --reviews");
+        let carries_nothing_else = !prompt.contains("/gsd-")
+            && !prompt.contains("discuss-phase")
+            && PLAN_SHORT_CIRCUIT
+                .iter()
+                .all(|wording| !prompt.contains(wording));
+        assert!(
+            runs_reviews && carries_nothing_else,
+            "the workflow-style reviews prompt is wrong: {prompt}"
+        );
+    }
+
     #[test]
     fn fix_prompt_carries_the_note_byte_identical() {
         for fix in [FixType::GapsOnly, FixType::FullExecute] {
