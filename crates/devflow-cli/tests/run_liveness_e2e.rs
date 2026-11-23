@@ -1233,3 +1233,114 @@ fn start_racing_discard_never_leaves_a_run_without_its_worktree() {
         text(&out)
     );
 }
+
+/// How long the child a readiness test launches through the fake `systemd-run` lives.
+const LAUNCHED_CHILD_LIFETIME: Duration = Duration::from_secs(2);
+
+/// The project root [`other_phase_runner_lock_holder_entry`] takes phase 1's runner
+/// lock in.
+const OTHER_PHASE_HOLDER_ROOT_ENV: &str = "OTHER_PHASE_RUNNER_LOCK_HOLDER_ROOT";
+
+/// The test binary the cross-phase readiness test's launched shell `exec`s.
+const OTHER_PHASE_HOLDER_EXE_ENV: &str = "OTHER_PHASE_RUNNER_LOCK_HOLDER_EXE";
+
+/// The fake `systemd-run`, run directly, launching `/bin/sh -c script` in `project` as
+/// the runner of phase 7 (`__runner --phase 7`), with `env` set on its command.
+fn run_fake_launcher(
+    home: &common::HermeticHome,
+    project: &Path,
+    script: &str,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> Output {
+    let mut command = std::process::Command::new(home.service_bin().join("systemd-run"));
+    command
+        .arg("--unit=readiness-probe.service")
+        .arg(format!("--working-directory={}", project.display()))
+        .args(["--", "/bin/sh", "-c", script, "__runner", "--phase", "7"])
+        .stdin(Stdio::null());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().expect("run the fake systemd-run")
+}
+
+/// A project dir with an empty `.devflow/`.
+fn project_with_devflow_dir() -> tempfile::TempDir {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join(".devflow")).unwrap();
+    project
+}
+
+/// The fake launcher's stderr holds no error from a `/proc` read that raced a
+/// descriptor closing.
+fn assert_no_proc_read_error(out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("No such file") && !stderr.contains("cannot open"),
+        "the fake launcher's readiness probe leaked a /proc read error: {stderr}"
+    );
+}
+
+/// D-14 (#296): a `.runner-07` record that names the launched pid while no lock is held
+/// is not readiness; the fake reports the start failed once the child exits.
+#[test]
+fn the_fake_launcher_does_not_take_an_unheld_runner_record_as_ready() {
+    let home = common::HermeticHome::new();
+    let project = project_with_devflow_dir();
+    let script = format!(
+        "echo \"$$ unheld\" >.devflow/.runner-07; exec sleep {}",
+        LAUNCHED_CHILD_LIFETIME.as_secs()
+    );
+
+    let out = run_fake_launcher(&home, project.path(), &script, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains(common::FAKE_START_FAILED),
+        "the fake launcher took an unheld runner record as ready: status {}, stderr {stderr}",
+        out.status
+    );
+    assert_no_proc_read_error(&out);
+}
+
+/// D-14 (#296): a lock the launched pid holds on another phase's `.runner-01` is not
+/// readiness for phase 7; the fake reports the start failed once the child exits.
+#[test]
+fn the_fake_launcher_does_not_take_another_phases_held_runner_lock_as_ready() {
+    let home = common::HermeticHome::new();
+    let project = project_with_devflow_dir();
+    let exe = std::env::current_exe().expect("this test binary");
+    let script = format!(
+        "exec \"${OTHER_PHASE_HOLDER_EXE_ENV}\" --exact other_phase_runner_lock_holder_entry --ignored --quiet"
+    );
+
+    let out = run_fake_launcher(
+        &home,
+        project.path(),
+        &script,
+        &[
+            (OTHER_PHASE_HOLDER_EXE_ENV, exe.as_os_str()),
+            (OTHER_PHASE_HOLDER_ROOT_ENV, project.path().as_os_str()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains(common::FAKE_START_FAILED),
+        "the fake launcher took another phase's runner lock as ready: status {}, stderr {stderr}",
+        out.status
+    );
+    assert_no_proc_read_error(&out);
+}
+
+/// Not a test of its own: the child the cross-phase readiness test launches. Holds
+/// phase 1's runner lock through `claim_runner_lock`, as a runner does, for
+/// [`LAUNCHED_CHILD_LIFETIME`]. Without the variable it does nothing.
+#[test]
+#[ignore = "the phase-1 runner-lock holder a readiness test launches, not a test"]
+fn other_phase_runner_lock_holder_entry() {
+    let Some(root) = std::env::var_os(OTHER_PHASE_HOLDER_ROOT_ENV) else {
+        return;
+    };
+    let _hold = liveness::claim_runner_lock(Path::new(&root), PhaseId::new(1))
+        .expect("hold phase 1's runner lock");
+    std::thread::sleep(LAUNCHED_CHILD_LIFETIME);
+}
