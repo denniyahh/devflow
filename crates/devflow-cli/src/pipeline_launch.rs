@@ -2242,13 +2242,17 @@ pub(crate) fn resume_with_fallback(
 
 /// The commit in [`resume`] cleared `stopped` so a reload mid-launch reads the run
 /// active; a launch that failed outright makes that a lie (44-CORE finding 2a), so the run
-/// is marked stopped again, naming what failed. Best effort: the launch error is what the
-/// caller needs either way.
+/// is marked stopped again, naming what failed. A state on disk that already reads
+/// `stopped` was stopped by its runner after that commit (a timed-out launch whose runner
+/// ran, recorded its own stop and exited, #258), so its stop reason is the runner's and is
+/// kept. Best effort: the launch error is what the caller needs either way.
 fn re_mark_stopped_after_failed_launch(state: &mut State, phase: PhaseId, why: &str) -> CliError {
     let err = CliError::Message(format!("resume: phase {phase} was not launched: {why}"));
     let _ = commit(state, |s| {
-        s.stopped = true;
-        s.stop_reason = Some(format!("resume launch failed: {err}"));
+        if !s.stopped {
+            s.stopped = true;
+            s.stop_reason = Some(format!("resume launch failed: {err}"));
+        }
     });
     err
 }
