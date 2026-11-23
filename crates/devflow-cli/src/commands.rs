@@ -477,8 +477,9 @@ pub(crate) fn start(
     }
 }
 
-/// #285: files GSD writes on every step, as (a path `git check-ignore` probes, the
-/// `.gitignore` line that ignores it). `.gsd/` is probed through a file GSD writes there.
+/// #285: files GSD writes on every step, as (a path `git check-ignore --no-index` and
+/// `git ls-files --error-unmatch` probe, the `.gitignore` line that ignores it). `.gsd/`
+/// is probed through a file GSD writes there.
 const GSD_DERIVED_PATHS: &[(&str, &str)] = &[
     (".planning/state.json", ".planning/state.json"),
     (".planning/milestone.lock", ".planning/milestone.lock"),
@@ -486,9 +487,12 @@ const GSD_DERIVED_PATHS: &[(&str, &str)] = &[
 ];
 
 /// #285 (D-13): the warning naming the `.gitignore` lines to add for each of
-/// [`GSD_DERIVED_PATHS`] git does not ignore at `project_root`, or `None` when all are
-/// ignored or `project_root` is not a git work tree (start refuses such a root itself).
-/// A check git could not answer is named with its error, never read as not ignored.
+/// [`GSD_DERIVED_PATHS`] no ignore rule covers at `project_root` (`check-ignore
+/// --no-index`, so a tracked file is judged by the rules alone), and, under its own
+/// header, `git rm --cached` for each one git tracks (#338 WR-02), since an ignore rule
+/// does not apply to a tracked file. `None` when all are ignored and untracked or
+/// `project_root` is not a git work tree (start refuses such a root itself). A check git
+/// could not answer is named with its error, never read as a no.
 fn gsd_derived_paths_warning(project_root: &Path) -> Option<String> {
     let inside = git_command(project_root)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -499,9 +503,10 @@ fn gsd_derived_paths_warning(project_root: &Path) -> Option<String> {
     }
     let mut to_add = Vec::new();
     let mut unchecked = Vec::new();
+    let mut untrack = Vec::new();
     for (probe, line) in GSD_DERIVED_PATHS {
         match git_command(project_root)
-            .args(["check-ignore", "-q", probe])
+            .args(["check-ignore", "-q", "--no-index", probe])
             .output()
         {
             Ok(out) if out.status.success() => {}
@@ -513,21 +518,52 @@ fn gsd_derived_paths_warning(project_root: &Path) -> Option<String> {
             )),
             Err(err) => unchecked.push(format!("could not check {probe}: {err}")),
         }
+        match git_command(project_root)
+            .args(["ls-files", "--error-unmatch", "--", probe])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                untrack.push(format!("untrack it: git rm --cached {probe}"));
+            }
+            Ok(out) if out.status.code() == Some(1) => {}
+            Ok(out) => unchecked.push(format!(
+                "could not check whether git tracks {probe}: {} ({})",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                out.status
+            )),
+            Err(err) => {
+                unchecked.push(format!("could not check whether git tracks {probe}: {err}"));
+            }
+        }
     }
-    if to_add.is_empty() && unchecked.is_empty() {
+    if to_add.is_empty() && unchecked.is_empty() && untrack.is_empty() {
         return None;
     }
-    let mut warning = String::from(
-        "warning: GSD writes derived files that git does not ignore here; add these lines to \
-         .gitignore:",
-    );
-    for line in to_add {
-        warning.push_str(&format!("\n  {line}"));
+    let mut blocks = Vec::new();
+    if !to_add.is_empty() || !unchecked.is_empty() {
+        let mut warning = String::from(
+            "warning: GSD writes derived files that git does not ignore here; add these lines \
+             to .gitignore:",
+        );
+        for line in to_add {
+            warning.push_str(&format!("\n  {line}"));
+        }
+        for line in unchecked {
+            warning.push_str(&format!("\n{line}"));
+        }
+        blocks.push(warning);
     }
-    for line in unchecked {
-        warning.push_str(&format!("\n{line}"));
+    if !untrack.is_empty() {
+        let mut warning = String::from(
+            "warning: git tracks GSD derived files here, and an ignore rule does not apply to \
+             a tracked file:",
+        );
+        for advice in untrack {
+            warning.push_str(&format!("\n  {advice}"));
+        }
+        blocks.push(warning);
     }
-    Some(warning)
+    Some(blocks.join("\n"))
 }
 
 /// WR-11's rule: a run that never launched leaves no state behind, so `devflow status`
