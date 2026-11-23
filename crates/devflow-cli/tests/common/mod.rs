@@ -23,9 +23,10 @@ pub mod ask_client;
 use devflow_core::agents::driver_for;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::state::AgentKind;
+use devflow_core::test_support::write_executable;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -269,9 +270,7 @@ fn write_agent_guard(dir: &Path) {
             "#!/bin/sh\necho \"{FAKE_TOOL_PREFIX}{program}{NO_STUB_TEXT}\" >&2\nexit {NO_STUB_EXIT}\n"
         );
         let path = dir.join(program);
-        fs::write(&path, script).expect("write an agent-guard fake");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-            .expect("make an agent-guard fake executable");
+        write_executable(&path, &script);
     }
 }
 
@@ -287,9 +286,7 @@ fn write_fake_service_tool(dir: &Path, tool: &str, calls: &str) {
         "#!/bin/sh\ndir='{dir_text}'\n{calls}echo \"{FAKE_TOOL_PREFIX}{tool}: unhandled: $*\" >&2\nexit 1\n"
     );
     let path = dir.join(tool);
-    fs::write(&path, script).expect("write a fake service tool");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("make a fake service tool executable");
+    write_executable(&path, &script);
 }
 
 /// The compiled `devflow` binary under test. The only place in `tests/` that
@@ -533,10 +530,7 @@ pub fn fake_bin_dir(agent_body: &str) -> FakeBin {
 pub fn fake_bin_dir_for(program: &str, agent_body: &str) -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     let agent = dir.path().join(program);
-    fs::write(&agent, format!("#!/bin/sh\n{agent_body}\n")).unwrap();
-    let mut permissions = fs::metadata(&agent).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&agent, permissions).unwrap();
+    write_executable(&agent, &format!("#!/bin/sh\n{agent_body}\n"));
     for linked in ["git", "sh"] {
         symlink(format!("/usr/bin/{linked}"), dir.path().join(linked)).unwrap();
     }
