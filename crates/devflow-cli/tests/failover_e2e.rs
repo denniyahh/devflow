@@ -27,9 +27,9 @@ use common::HermeticPath;
 use devflow_core::canary::CanaryOutcome;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::test_support::write_executable;
 use serde_json::Value;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -196,13 +196,6 @@ fn git_out(root: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_string()
-}
-
-fn write_executable(path: &Path, contents: &str) {
-    fs::write(path, contents).unwrap();
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).unwrap();
 }
 
 /// A repository on `develop` with a roadmap entry for `phase` and the
