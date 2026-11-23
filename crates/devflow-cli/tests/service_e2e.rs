@@ -15,6 +15,7 @@ mod common;
 
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
+use devflow_core::test_support::write_executable;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -645,7 +646,21 @@ fn start_with_a_runner_path_that_no_longer_exists_fails_naming_the_unit_and_the_
     let guard = UnitGuard::named(fixture.unit());
     let scratch = tempfile::tempdir().unwrap();
     let copy = scratch.path().join("devflow");
-    fs::copy(common::devflow_bin(), &copy).expect("copy the devflow binary");
+    // A child copies the binary so this process never holds a write descriptor
+    // on a file it then executes (#276's ETXTBSY window, as for the stubs).
+    let cp = "/bin/cp";
+    assert!(Path::new(cp).is_file(), "a real {cp}");
+    let copied = Command::new(cp)
+        .arg(common::devflow_bin())
+        .arg(&copy)
+        .output()
+        .unwrap_or_else(|error| panic!("copy the devflow binary: {cp} did not start: {error}"));
+    assert!(
+        copied.status.success(),
+        "copy the devflow binary: {cp} ended with {}: {}",
+        copied.status,
+        String::from_utf8_lossy(&copied.stderr)
+    );
     let wrapper = scratch.path().join("wrapper");
     fs::create_dir(&wrapper).unwrap();
     let real_systemctl = ["/usr/bin/systemctl", "/bin/systemctl"]
@@ -653,16 +668,13 @@ fn start_with_a_runner_path_that_no_longer_exists_fails_naming_the_unit_and_the_
         .find(|path| Path::new(path).is_file())
         .expect("a real systemctl");
     let script = wrapper.join("systemctl");
-    fs::write(
+    write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\n/usr/bin/rm -f '{}'\nexec {real_systemctl} \"$@\"\n",
             copy.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let out = fixture.start(
         common::host_service_devflow_from(&fixture.home, &copy),

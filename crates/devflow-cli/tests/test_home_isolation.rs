@@ -27,9 +27,9 @@ mod common;
 
 use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
+use devflow_core::test_support::write_executable;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -332,9 +332,7 @@ fn dir_of_programs(names: &[&str], body: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create a program dir");
     for name in names {
         let path = dir.path().join(name);
-        fs::write(&path, body).expect("write a planted program");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-            .expect("make a planted program executable");
+        write_executable(&path, body);
     }
     dir
 }

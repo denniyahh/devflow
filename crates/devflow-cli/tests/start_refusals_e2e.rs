@@ -7,8 +7,8 @@ mod common;
 
 use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
+use devflow_core::test_support::write_executable;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -101,8 +101,7 @@ struct FakeBin {
 fn fake_codex() -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("codex");
-    fs::write(&path, SUCCESS_AGENT).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&path, SUCCESS_AGENT);
     let path = dir.path().to_path_buf();
     FakeBin { _dir: dir, path }
 }
@@ -833,8 +832,7 @@ fn fake_agents(programs: &[&str]) -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     for program in programs {
         let path = dir.path().join(program);
-        fs::write(&path, SUCCESS_AGENT).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&path, SUCCESS_AGENT);
     }
     let path = dir.path().to_path_buf();
     FakeBin { _dir: dir, path }
