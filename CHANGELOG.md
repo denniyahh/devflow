@@ -1,5 +1,51 @@
 # Changelog
 
+## 4.0.0-alpha.2 — 2026-11-23
+
+The second pre-release of the v4.0 line, collecting Phases 53 through 53.2. An agent running under DevFlow now asks
+DevFlow its questions through an MCP tool instead of a human at its terminal, the Plan stage can run discuss and a
+reviews replan itself, and the defects found by DevFlow's first use on other projects and by its own dogfood runs are
+fixed.
+
+### Added
+
+- Phase 53, the question channel: DevFlow serves an MCP tool, `devflow_ask`, over stdio. A call carries a question,
+  typed options and context and blocks until the operator answers the gate it opens (`devflow gate answer --option`
+  or `--text`); the answer returns to the agent in the same session. Stage prompts route decision checkpoints,
+  `blocking-human` gates and GSD discuss questions through it, for claude, codex and pi, and every question and
+  answer is recorded in the run history
+- Phase 53.1: a finished run calls GSD's `phase.complete` and commits GSD's writes
+- Phase 53.2: the Plan stage runs `/gsd-discuss-phase` first when the phase has no CONTEXT.md; `start --reviews` and
+  `resume --reviews` replan from an exact `NN-REVIEWS.md` on the base
+
+### Changed
+
+- Phase 53.1: the rate-limit gate shows the reset as a UTC time and a distance, and a far reset leads with stopping
+  and `resume --agent`; a stream `error_rate_limit` result is classified as rate-limited
+- Phase 53.2: `status` compares a run against its recorded base, offers `gate answer` for a question gate and prints
+  the start time readably; `start` warns when GSD's derived files are not ignored
+
+### Fixed
+
+- Phase 53.1: resume after an `--until` halt starts the next stage; the stale-state marker no longer dirties a phase
+  branch; cleanup of a stopped run no longer contradicts itself
+- Phase 53.2: resume after an `--until plan` halt reached through Plan→Validate resumes Validate; a timed-out launch
+  keeps a run whose state changed; `stop` holds the phase holder, so a concurrent `resume` cannot make it report
+  crashed; flaky test fakes and stubs (`write_executable`, the fake systemd-run's `READY=1` read)
+
+### Removed
+
+`devflow-core` is a published library; `cargo semver-checks` against 4.0.0-alpha.1 reports 8 major items, removed
+outright with no deprecated stubs (accept-break, Phases 53 and 53.2):
+
+- the checkpoint relaunch machinery that `devflow_ask` replaces: `state::ApprovedCheckpoint`,
+  `state::CheckpointApproval`, `State::{checkpoint_approval, checkpoint_resumes}`, `mode::MAX_CHECKPOINT_RESUMES`,
+  `prompt::checkpoint_auto_decide_prompt`, `prompt::GATE_RESOLUTION_RULE`,
+  `verify::phase_has_blocking_human_checkpoint`, `agent_result::blocking_human_checkpoint_reported`,
+  `agent_result::checkpoint_reported_in_capture` and `ClaudeDriver::exec_resume_command` (53)
+- `GateKind::CheckpointDeclaration`, replaced by the new `GateKind::Question` (53)
+- new variants on exhaustive enums: `GateKind::Question` (53) and `StageIntent::PlanReviews` (53.2)
+
 ## 4.0.0-alpha.1 — 2026-11-18
 
 A pre-release of the v4.0 line, collecting Phases 51 through 52.2. A run is now Plan → Code → Validate and ends as
