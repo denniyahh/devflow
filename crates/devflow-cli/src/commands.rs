@@ -4338,12 +4338,16 @@ fn sweep_one_gate(
 }
 
 /// D-05: end the phase's run by stopping its user unit, then report how it ended from
-/// the state. `stop` takes no holder and writes nothing but the unit's stop.
+/// the state. `stop` writes nothing but the unit's stop.
 ///
 /// With the runner lock free it reads the phase holder first, without taking it: a held
 /// holder means `start`, `resume`, `discard` or `cleanup` holds the phase (D-07), so
 /// `stop` stops nothing, names the holder's pid and exits non-zero (review pi-10, pi-5).
-/// With no live run it is a no-op that exits 0. Otherwise it runs
+/// With no live run it is a no-op that takes nothing, writes nothing and exits 0.
+/// Otherwise it claims the phase holder (D-12, #297), refusing as above while another
+/// verb holds it, and keeps it from just before the unit stop to the end of the reload,
+/// so a `resume` cannot rewrite the state in between. It claims without passing through
+/// the state write lock, so a runner wedged on that lock can still be stopped. It runs
 /// `systemctl --user stop` on the unit, which returns once the unit is down
 /// (`TimeoutStopSec`, then SIGKILL), and prints [`stop_outcome`]'s line.
 pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
@@ -4352,6 +4356,8 @@ pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> 
 }
 
 /// [`stop`]'s work (D-05): the line it prints when it exits 0, or its refusal or failure.
+/// It holds the phase holder from just before the unit stop to the end of the reload
+/// (D-12), and takes nothing when there is no live run.
 pub(crate) fn stop_report(project_root: &Path, phase: PhaseId) -> Result<String, CliError> {
     let runner = runner_liveness(project_root, phase).map_err(|why| {
         CliError::Message(format!("stop: phase {phase}: {why}; nothing was stopped"))
@@ -4366,12 +4372,7 @@ pub(crate) fn stop_report(project_root: &Path, phase: PhaseId) -> Result<String,
                     holder.display()
                 )));
             }
-            Ok(Some((pid, _))) => {
-                return Err(CliError::Message(format!(
-                    "another DevFlow verb holds phase {phase} (pid {pid}) and is in progress; \
-                     run devflow stop --phase {phase} again once it returns"
-                )));
-            }
+            Ok(Some((pid, _))) => return Err(stop_refused_while_held(phase, &pid.to_string())),
             Ok(None) => {}
         }
         if runner == RunnerLiveness::NotLive {
@@ -4385,6 +4386,18 @@ pub(crate) fn stop_report(project_root: &Path, phase: PhaseId) -> Result<String,
             "stop: phase {phase}'s unit name could not be derived ({err}); nothing was stopped"
         ))
     })?;
+    // D-12: claimed directly, not through `claim_foreground_holder`, whose state write
+    // lock barrier would keep a runner wedged on that lock from being stopped.
+    let phase_hold = liveness::claim_phase_holder(project_root, phase).map_err(|err| match err {
+        liveness::HolderError::Held { holder } => {
+            let pid = holder.map_or_else(|| "unknown".to_string(), |(pid, _)| pid.to_string());
+            stop_refused_while_held(phase, &pid)
+        }
+        liveness::HolderError::Io(err) => CliError::Message(format!(
+            "stop: phase {phase}: could not claim its holder file {} ({err}); nothing was stopped",
+            liveness::phase_holder_path(project_root, phase).display()
+        )),
+    })?;
     crate::service::stop_unit(&unit)
         .map_err(|why| CliError::Message(format!("stop: unit {unit} was not stopped: {why}")))?;
     #[cfg(test)]
@@ -4394,11 +4407,20 @@ pub(crate) fn stop_report(project_root: &Path, phase: PhaseId) -> Result<String,
         }
     }
     let (line, clean) = stop_outcome(phase, workflow::load_state(project_root, phase));
+    drop(phase_hold);
     if clean {
         Ok(line)
     } else {
         Err(CliError::Message(line))
     }
+}
+
+/// `stop`'s refusal while another verb holds `phase` (D-07): it names the holder's `pid`.
+fn stop_refused_while_held(phase: PhaseId, pid: &str) -> CliError {
+    CliError::Message(format!(
+        "another DevFlow verb holds phase {phase} (pid {pid}) and is in progress; run devflow \
+         stop --phase {phase} again once it returns"
+    ))
 }
 
 #[cfg(test)]
