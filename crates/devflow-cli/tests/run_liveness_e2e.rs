@@ -1413,3 +1413,50 @@ fn send_ready_to_notify_socket() {
         .send_to_addr(b"READY=1", &addr)
         .expect("send READY=1 to NOTIFY_SOCKET");
 }
+
+/// The process state [`common::PROC_STATE_FN`] prints for a `/proc/PID/stat` holding
+/// `stat_line`.
+fn proc_state_of(stat_line: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let stat = dir.path().join("stat");
+    fs::write(&stat, stat_line).unwrap();
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{}\nproc_state \"$1\"", common::PROC_STATE_FN))
+        .arg("sh")
+        .arg(&stat)
+        .output()
+        .expect("run /bin/sh");
+    assert!(out.status.success(), "proc_state failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+}
+
+/// F10: the fakes read the state field after the command name, which may hold spaces.
+/// Control: a name with none, in state Z.
+#[test]
+fn the_fakes_read_the_proc_state_after_a_command_name_with_spaces() {
+    assert_eq!(
+        proc_state_of("4242 (a b) S 1 2 3\n"),
+        "S",
+        "a command name with a space shifted the state field"
+    );
+    assert_eq!(proc_state_of("4242 (ab) Z 1\n"), "Z");
+}
+
+/// F24: the fakes write the test binary's path as one shell word whatever it holds; a
+/// path with a space and a single quote reaches `printf` unchanged.
+#[test]
+fn the_fakes_quote_a_path_with_a_space_and_a_quote() {
+    let path = "/x/a b/it's";
+    let quoted = common::sh_quote(path);
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("printf %s {quoted}"))
+        .output()
+        .expect("run /bin/sh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        path,
+        "quoted as {quoted}"
+    );
+}

@@ -59,9 +59,9 @@ pub const FAKE_TOOL_PREFIX: &str = "fake ";
 /// recorded in `U.pid`: SIGKILL at once with a `U.kill` marker, else SIGTERM, a bounded
 /// wait, then SIGKILL, as the manager does at `TimeoutStopSec`. With no recorded pid it
 /// exits 0.
-const FAKE_SYSTEMCTL_CALLS: &str = r#"alive() {
-  s=""
-  if [ -r "/proc/$1/stat" ]; then read -r a b s rest <"/proc/$1/stat"; fi
+const FAKE_SYSTEMCTL_CALLS: &str = r#"@PROC_STATE_FN@
+alive() {
+  s=$(proc_state "/proc/$1/stat")
   [ -n "$s" ] && [ "$s" != Z ]
 }
 if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4 $5" = "--user show -p Version --value" ]; then
@@ -147,7 +147,8 @@ pub const FAKE_FAIL_NEXT: &str = "fail-next";
 /// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@`, `@RM@` and `@TESTEXE@` (this test binary)
 /// are absolute paths written in when the fake is written, because the devflow child's
 /// `PATH` can be stub-only.
-const FAKE_SYSTEMD_RUN_CALLS: &str = r#"all="$*"
+const FAKE_SYSTEMD_RUN_CALLS: &str = r#"@PROC_STATE_FN@
+all="$*"
 unit=""; wd=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -178,12 +179,11 @@ if [ -n "$unit" ] && [ -n "$wd" ] && [ "$#" -gt 0 ]; then
       while IFS= read -r line; do echo "$line" >&2; done <"$file"
     done
   }
-  FAKE_NOTIFY_SOCKET="$sock" FAKE_NOTIFY_FILES="$note" "@TESTEXE@" --exact common::fake_notify_listener_entry --ignored --quiet </dev/null >"$note.log" 2>&1 &
+  FAKE_NOTIFY_SOCKET="$sock" FAKE_NOTIFY_FILES="$note" @TESTEXE@ --exact common::fake_notify_listener_entry --ignored --quiet </dev/null >"$note.log" 2>&1 &
   lpid=$!
   tries=0
   while [ "$tries" -lt 600 ] && [ ! -e "$note.listening" ] && [ ! -e "$note.result" ]; do
-    state=""
-    { read -r p comm state rest <"/proc/$lpid/stat"; } 2>/dev/null
+    state=$(proc_state "/proc/$lpid/stat")
     if [ -z "$state" ] || [ "$state" = Z ]; then break; fi
     tries=$((tries + 1))
     @SLEEP@ 0.05
@@ -231,17 +231,31 @@ fn resolve_on_path(program: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{program} is not on this test process's PATH"))
 }
 
+/// The POSIX sh function both fakes read a `/proc/PID/stat` state with: `proc_state FILE`
+/// prints the process state field, or nothing when FILE cannot be read (callers read
+/// that as gone).
+pub const PROC_STATE_FN: &str = r#"proc_state() {
+  s=""
+  { read -r p comm s rest <"$1"; } 2>/dev/null
+  echo "$s"
+}"#;
+
+/// `path` as one shell word for the fake scripts.
+pub fn sh_quote(path: &str) -> String {
+    assert!(
+        !path.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '$' | '`' | '\\')),
+        "the test binary's path is written double-quoted into the fake: {path}"
+    );
+    format!("\"{path}\"")
+}
+
 /// [`FAKE_SYSTEMD_RUN_CALLS`] with its tool paths and this test binary written in.
 fn fake_systemd_run_calls() -> String {
     let exe = std::env::current_exe().expect("this test binary");
     let exe = exe.to_str().expect("a UTF-8 test binary path");
-    assert!(
-        !exe.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '$' | '`' | '\\')),
-        "the test binary's path is written double-quoted into the fake: {exe}"
-    );
     with_tool_paths(FAKE_SYSTEMD_RUN_CALLS)
         .replace("@FAILED@", FAKE_START_FAILED)
-        .replace("@TESTEXE@", exe)
+        .replace("@TESTEXE@", &sh_quote(exe))
 }
 
 /// The variable naming the socket path [`fake_notify_listener_entry`] binds.
@@ -363,6 +377,7 @@ fn with_tool_paths(calls: &str) -> String {
         text
     };
     calls
+        .replace("@PROC_STATE_FN@", PROC_STATE_FN)
         .replace("@SETSID@", &path_of("setsid"))
         .replace("@SLEEP@", &path_of("sleep"))
         .replace("@RM@", &path_of("rm"))
