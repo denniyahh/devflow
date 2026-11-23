@@ -899,7 +899,8 @@ impl Drop for AutoChainGuard {
 
 /// The stop reason an advance records when it stops at a safe point
 /// (50-13, R-2).
-pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
+pub(crate) const ADVANCE_STOP_REASON: &str =
+    "stopped during advance: the runner was ended by its unit stop";
 
 /// What an advance reads on this thread (50-13): its stop token, for the advance's
 /// safe points. One runner per phase holds the runner lock for the whole run (D-07),
@@ -1039,7 +1040,7 @@ pub(crate) fn stop_requested_at_safe_point() -> bool {
 /// `advance_stopped` event naming the point.
 pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {
     let reason = ADVANCE_STOP_REASON;
-    let source = "supervisor";
+    let source = "runner";
     commit(state, |s| {
         s.stopped = true;
         s.stop_reason = Some(reason.to_string());

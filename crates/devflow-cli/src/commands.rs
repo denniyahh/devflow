@@ -3860,7 +3860,7 @@ fn answer_route_lines(
         Err(error) if reads_state && kind != GateAnswerKind::Abort => {
             return vec![format!(
                 "route: not known — the run's state could not be loaded ({error}), so DevFlow \
-                 cannot tell which route this answer runs; the supervisor decides when it picks \
+                 cannot tell which route this answer runs; the runner decides when it picks \
                  this answer up"
             )];
         }
@@ -3932,7 +3932,7 @@ fn answer_route_lines(
                             "no"
                         }
                     ),
-                    "the supervisor reads GSD's verification status again when it picks this \
+                    "the runner reads GSD's verification status again when it picks this \
                      answer up, and routes on that read"
                         .to_string(),
                 ],
@@ -11071,7 +11071,7 @@ mod tests {
         use devflow_core::canary::CanaryOutcome;
         use devflow_core::gates::GateKind;
         use devflow_core::gsd_reader::GsdStatus;
-        const PICKUP: &str = "the supervisor reads GSD's verification status again when it \
+        const PICKUP: &str = "the runner reads GSD's verification status again when it \
                               picks this answer up";
         let approve = |root: &Path, phase: PhaseId, stage: Stage| {
             gate_respond_report(
