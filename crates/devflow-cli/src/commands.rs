@@ -4387,12 +4387,31 @@ pub(crate) fn stop_report(project_root: &Path, phase: PhaseId) -> Result<String,
     })?;
     crate::service::stop_unit(&unit)
         .map_err(|why| CliError::Message(format!("stop: unit {unit} was not stopped: {why}")))?;
+    #[cfg(test)]
+    {
+        if let Some(effect) = STOP_BEFORE_RELOAD.with_borrow_mut(Option::take) {
+            effect();
+        }
+    }
     let (line, clean) = stop_outcome(phase, workflow::load_state(project_root, phase));
     if clean {
         Ok(line)
     } else {
         Err(CliError::Message(line))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STOP_BEFORE_RELOAD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `effect` once, in the next [`stop_report`] on this thread, right before it reloads
+/// the state [`stop_outcome`] reads.
+#[cfg(test)]
+fn set_stop_before_reload(effect: impl FnOnce() + 'static) {
+    STOP_BEFORE_RELOAD.with_borrow_mut(|slot| *slot = Some(Box::new(effect)));
 }
 
 /// What `stop` prints once the unit is down, and whether it exits 0 (D-05), from the
@@ -15385,6 +15404,114 @@ mod tests {
         });
         wait_holding.recv().unwrap();
         (holder, release)
+    }
+
+    /// Plant a stopped Codex Supervise state for `phase` under `root` and claim its
+    /// runner lock in this process, so the runner reads Live; the hold stands in for the
+    /// unit's runner, so a test drops it where the unit stop ends that runner.
+    fn live_stopped_run(root: &Path, phase: PhaseId) -> liveness::Hold {
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.into());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        state.stopped = true;
+        state.stop_reason = Some("operator stop".to_string());
+        workflow::save_state(&state).unwrap();
+        liveness::claim_runner_lock(root, phase).expect("hold the runner lock")
+    }
+
+    /// D-12 (#297): stop holds the phase holder from before its unit stop through the
+    /// reload its outcome reads, so a resume cannot rewrite the state in between. A
+    /// holder dropped between the unit stop and the reload fails the second observation.
+    #[test]
+    fn stop_holds_the_phase_holder_across_the_unit_stop_and_reload() {
+        use std::{cell::RefCell, rc::Rc};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5321);
+        let runner = live_stopped_run(&root, phase);
+        let holder = liveness::phase_holder_path(&root, phase);
+        let during_stop = Rc::new(RefCell::new(None));
+        let at_reload = Rc::new(RefCell::new(None));
+        {
+            let (seen, holder) = (Rc::clone(&during_stop), holder.clone());
+            crate::service::double::run_during_stop(move || {
+                *seen.borrow_mut() = liveness::live_holder(&holder).unwrap();
+                drop(runner);
+            });
+        }
+        {
+            let (seen, holder) = (Rc::clone(&at_reload), holder.clone());
+            set_stop_before_reload(move || {
+                *seen.borrow_mut() = liveness::live_holder(&holder).unwrap();
+            });
+        }
+        let result = stop_report(&root, phase);
+        assert!(result.is_ok(), "stop of a live run failed: {result:?}");
+        let mine = |seen: Option<(u32, Option<u64>)>| {
+            seen.is_some_and(|(pid, _)| pid == std::process::id())
+        };
+        let seen = *during_stop.borrow();
+        assert!(
+            mine(seen),
+            "stop did not hold the phase holder during the unit stop: {seen:?}"
+        );
+        let seen = *at_reload.borrow();
+        assert!(
+            mine(seen),
+            "stop did not hold the phase holder at the reload: {seen:?}"
+        );
+    }
+
+    /// D-12: stop claims the phase holder without passing through the state write lock,
+    /// so a runner wedged on that lock can still be stopped.
+    #[test]
+    fn stop_of_a_live_run_does_not_wait_on_a_held_state_write_lock() {
+        use std::{cell::Cell, rc::Rc};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5322);
+        let runner = live_stopped_run(&root, phase);
+        let (lock_holder, release) = hold_state_write_lock(&root, phase);
+        let reached = Rc::new(Cell::new(false));
+        {
+            let reached = Rc::clone(&reached);
+            crate::service::double::run_during_stop(move || {
+                reached.set(true);
+                drop(release);
+                drop(runner);
+            });
+        }
+        let result = stop_report(&root, phase);
+        // An effect the stop never ran still owns the release: replacing it drops it.
+        crate::service::double::run_during_stop(|| {});
+        lock_holder.join().unwrap();
+        assert!(
+            result.is_ok() && reached.get(),
+            "stop waited on the state write lock before stopping the unit: {result:?}"
+        );
+    }
+
+    /// D-12 control (OPERATIONS.md stop row): stop on a root with no run takes no holder
+    /// and creates nothing.
+    #[test]
+    fn stop_on_a_root_with_no_run_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5323);
+        let result = stop_report(dir.path(), phase);
+        assert!(
+            result
+                .as_ref()
+                .is_ok_and(|line| line.contains("has no live run; nothing to stop")),
+            "stop on a root with no run did not say there is nothing to stop: {result:?}"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "stop on a root with no run created {entries:?}"
+        );
     }
 
     /// How long a released state write lock may keep reading held before the test
