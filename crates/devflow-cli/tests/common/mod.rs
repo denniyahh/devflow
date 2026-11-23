@@ -1,8 +1,12 @@
 //! Helpers shared by the `devflow` CLI integration tests (999.141, D-07).
 //!
 //! Each test target includes this file with `mod common;`. It holds helpers
-//! only and no `#[test]`: every target that declares `mod common;` compiles
-//! it, so a test here would be added to each of those targets' counts.
+//! and one `#[test]`: every target that declares `mod common;` compiles it,
+//! so a test here is added to each of those targets' counts. The one is
+//! [`fake_notify_listener_entry`], an `#[ignore]` no-op without its variable,
+//! which adds one ignored test to each count. The fake `systemd-run` re-runs
+//! the test binary as it to read a notify datagram, which `/bin/sh` cannot
+//! do, and every target that writes the fake has its own binary.
 //!
 //! The rule it exists for: an e2e child that runs the `devflow` binary gets a
 //! tempdir `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME` and `DEVFLOW_CACHE_DIR`
@@ -23,9 +27,10 @@ pub mod ask_client;
 use devflow_core::agents::driver_for;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::state::AgentKind;
+use devflow_core::test_support::write_executable;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -46,13 +51,20 @@ pub const FAKE_TOOL_PREFIX: &str = "fake ";
 /// (`version.fail` in its own dir: exit 1 with the error `systemctl` prints when it
 /// cannot reach a user manager), `--user show -p ActiveState --value U` (`U.fail` in its own dir: exit 1
 /// with a bus error; `U.deactivating`: deactivating; `U.activating`: activating;
-/// `U.failed`: failed; otherwise inactive), `--user reset-failed U` (appends
+/// `U.failed`: failed; otherwise active while the pid the fake `systemd-run` recorded in
+/// `U.pid` is alive and not a zombie, else inactive; each answer is also appended, one
+/// per line, to `U.active-reads`), `--user reset-failed U` (appends
 /// `reset-failed U` to [`FAKE_CALL_LOG`] and removes `U.failed`) and `--user stop U`. The stop writes
 /// `U.stop-called`, removes `U.activating`, and ends the pid the fake `systemd-run`
 /// recorded in `U.pid`: SIGKILL at once with a `U.kill` marker, else SIGTERM, a bounded
 /// wait, then SIGKILL, as the manager does at `TimeoutStopSec`. With no recorded pid it
 /// exits 0.
-const FAKE_SYSTEMCTL_CALLS: &str = r#"if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4 $5" = "--user show -p Version --value" ]; then
+const FAKE_SYSTEMCTL_CALLS: &str = r#"@PROC_STATE_FN@
+alive() {
+  s=$(proc_state "/proc/$1/stat")
+  [ -n "$s" ] && [ "$s" != Z ]
+}
+if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4 $5" = "--user show -p Version --value" ]; then
   if [ -e "$dir/version.fail" ]; then
     echo "Failed to connect to bus: No medium found" >&2; exit 1
   fi
@@ -62,10 +74,18 @@ if [ "$#" -eq 6 ] && [ "$1 $2 $3 $4 $5" = "--user show -p ActiveState --value" ]
   if [ -e "$dir/$6.fail" ]; then
     echo "Failed to get properties: Transport endpoint is not connected" >&2; exit 1
   fi
-  if [ -e "$dir/$6.deactivating" ]; then echo deactivating
-  elif [ -e "$dir/$6.activating" ]; then echo activating
-  elif [ -e "$dir/$6.failed" ]; then echo failed
-  else echo inactive; fi
+  if [ -e "$dir/$6.deactivating" ]; then state=deactivating
+  elif [ -e "$dir/$6.activating" ]; then state=activating
+  elif [ -e "$dir/$6.failed" ]; then state=failed
+  else
+    state=inactive
+    if [ -e "$dir/$6.pid" ]; then
+      read -r pid rest <"$dir/$6.pid"
+      alive "$pid" && state=active
+    fi
+  fi
+  echo "$state" >>"$dir/$6.active-reads"
+  echo "$state"
   exit 0
 fi
 if [ "$#" -eq 3 ] && [ "$1 $2" = "--user reset-failed" ]; then
@@ -78,27 +98,22 @@ if [ "$#" -eq 3 ] && [ "$1 $2" = "--user stop" ]; then
   @RM@ -f "$dir/$3.activating"
   [ -e "$dir/$3.pid" ] || exit 0
   read -r pid rest <"$dir/$3.pid"
-  alive() {
-    s=""
-    if [ -r "/proc/$pid/stat" ]; then read -r a b s rest <"/proc/$pid/stat"; fi
-    [ -n "$s" ] && [ "$s" != Z ]
-  }
   if [ -e "$dir/$3.kill" ]; then
     kill -KILL "$pid" 2>/dev/null
   else
     kill -TERM "$pid" 2>/dev/null
     tries=0
-    while [ "$tries" -lt 200 ] && alive; do tries=$((tries + 1)); @SLEEP@ 0.05; done
-    alive && kill -KILL "$pid" 2>/dev/null
+    while [ "$tries" -lt 200 ] && alive "$pid"; do tries=$((tries + 1)); @SLEEP@ 0.05; done
+    alive "$pid" && kill -KILL "$pid" 2>/dev/null
   fi
   tries=0
-  while [ "$tries" -lt 100 ] && alive; do tries=$((tries + 1)); @SLEEP@ 0.05; done
+  while [ "$tries" -lt 100 ] && alive "$pid"; do tries=$((tries + 1)); @SLEEP@ 0.05; done
   exit 0
 fi
 "#;
 
 /// What the fake `systemd-run` prints on stderr when the runner it started exits
-/// before it holds its runner lock: the text `systemd-run` prints for a `Type=notify`
+/// before it sends `READY=1`: the text `systemd-run` prints for a `Type=notify`
 /// unit whose main process exits before `READY=1`.
 pub const FAKE_START_FAILED: &str = "failed because the control process exited with error code.";
 
@@ -115,14 +130,28 @@ pub const FAKE_FAIL_NEXT: &str = "fail-next";
 /// --working-directory=D ... -- PROGRAM ARGS`): it changes to D, starts the command
 /// in its own session with stdin from `/dev/null` and stdout and stderr to `U.out` in
 /// its own dir, so the caller's output capture reaches EOF when this script exits, and
-/// records the command's pid as `U.pid`. It exits 0 once a `D/.devflow/.runner-*`
-/// record's first field is that pid, and exits 1 with systemd's text when the command
-/// dies first. A `fail-next` marker makes the launch print the marker's text and
+/// records the command's pid as `U.pid`. Readiness is the command's `READY=1`, as for a
+/// `Type=notify` unit: before the launch the fake starts [`fake_notify_listener_entry`]
+/// (this test binary re-run) with the per-launch files `U.notify-<fake pid>.*` in its own
+/// dir, and a socket `n` in a short per-launch `mktemp -d` directory under `/tmp`
+/// (`sun_path` is 107 bytes), removed when the fake exits. The listener binds `n` and
+/// creates `.listening`; the fake then sets `NOTIFY_SOCKET` to `n` on the command and
+/// writes the command's pid to `.launched`;
+/// the listener writes its verdict to `.result`, its own output going to `.log`. On
+/// `ready` the fake exits 0; on `exited` (the command is gone with no `READY=1` queued)
+/// it prints `Job for U` and [`FAKE_START_FAILED`] and exits 1; on `timeout` (no
+/// `READY=1` within [`FAKE_NOTIFY_READY_WAIT`]) it prints systemd's timeout text and
+/// exits 1; a listener that does not start or reports an error makes it print
+/// `fake systemd-run: ` with what it found and exit 1. It takes no lock and reads no
+/// descriptor of the command. A `fail-next` marker makes the launch print the marker's text and
 /// exit 1 instead. A `U.failed` marker (the fake `systemctl` reads the unit `failed`)
 /// makes it refuse as systemd refuses a unit still loaded: it prints that text and
-/// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@` and `@RM@` are absolute paths written in
-/// when the fake is written, because the devflow child's `PATH` can be stub-only.
-const FAKE_SYSTEMD_RUN_CALLS: &str = r#"all="$*"
+/// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@`, `@RM@`, `@MKTEMP@` and `@TESTEXE@`
+/// (this test binary, single-quoted by [`sh_quote`]) are absolute paths written in when the
+/// fake is written, because the devflow child's `PATH` can be stub-only; both fakes read
+/// `/proc/PID/stat` through [`PROC_STATE_FN`].
+const FAKE_SYSTEMD_RUN_CALLS: &str = r#"@PROC_STATE_FN@
+all="$*"
 unit=""; wd=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -144,29 +173,47 @@ if [ -n "$unit" ] && [ -n "$wd" ] && [ "$#" -gt 0 ]; then
     @RM@ -f "$dir/fail-next"
     exit 1
   fi
-  cd "$wd" || exit 1
-  @SETSID@ "$@" </dev/null >"$dir/$unit.out" 2>&1 &
-  pid=$!
-  echo "$pid" >"$dir/$unit.pid"
-  tries=0
-  while [ "$tries" -lt 600 ]; do
-    for lock in "$wd"/.devflow/.runner-*; do
-      if [ -f "$lock" ]; then
-        first=""
-        read -r first rest <"$lock"
-        if [ "$first" = "$pid" ]; then exit 0; fi
-      fi
+  note="$dir/$unit.notify-$$"
+  sockdir=$(@MKTEMP@ -d /tmp/dfn.XXXXXX) || { echo "fake systemd-run: mktemp -d failed" >&2; exit 1; }
+  trap '@RM@ -rf "$sockdir"' EXIT
+  sock="$sockdir/n"
+  @RM@ -f "$note.listening" "$note.result" "$note.launched"
+  echo_lines() {
+    for file in "$@"; do
+      [ -e "$file" ] || continue
+      while IFS= read -r line; do echo "$line" >&2; done <"$file"
     done
-    state=""
-    if [ -r "/proc/$pid/stat" ]; then read -r p comm state rest <"/proc/$pid/stat"; fi
-    if [ -z "$state" ] || [ "$state" = Z ]; then
-      echo "Job for $unit @FAILED@" >&2
-      exit 1
-    fi
+  }
+  FAKE_NOTIFY_SOCKET="$sock" FAKE_NOTIFY_FILES="$note" @TESTEXE@ --exact common::fake_notify_listener_entry --ignored --quiet </dev/null >"$note.log" 2>&1 &
+  lpid=$!
+  tries=0
+  while [ "$tries" -lt 600 ] && [ ! -e "$note.listening" ] && [ ! -e "$note.result" ]; do
+    state=$(proc_state "/proc/$lpid/stat")
+    if [ -z "$state" ] || [ "$state" = Z ]; then break; fi
     tries=$((tries + 1))
     @SLEEP@ 0.05
   done
-  echo "Job for $unit failed because a timeout was exceeded." >&2
+  if [ ! -e "$note.listening" ]; then
+    kill "$lpid" 2>/dev/null
+    echo "fake systemd-run: the notify listener did not start" >&2
+    echo_lines "$note.result" "$note.log"
+    exit 1
+  fi
+  cd "$wd" || { kill "$lpid" 2>/dev/null; exit 1; }
+  NOTIFY_SOCKET="$sock" @SETSID@ "$@" </dev/null >"$dir/$unit.out" 2>&1 &
+  pid=$!
+  echo "$pid" >"$dir/$unit.pid"
+  echo "$pid" >"$note.launched"
+  wait "$lpid"
+  verdict=""
+  [ -e "$note.result" ] && read -r verdict <"$note.result"
+  case "$verdict" in
+    ready) exit 0 ;;
+    exited) echo "Job for $unit @FAILED@" >&2; exit 1 ;;
+    timeout) echo "Job for $unit failed because a timeout was exceeded." >&2; exit 1 ;;
+  esac
+  echo "fake systemd-run: notify listener: $verdict" >&2
+  echo_lines "$note.log"
   exit 1
 fi
 set -- $all
@@ -189,12 +236,145 @@ fn resolve_on_path(program: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{program} is not on this test process's PATH"))
 }
 
-/// [`FAKE_SYSTEMD_RUN_CALLS`] with its tool paths written in.
-fn fake_systemd_run_calls() -> String {
-    with_tool_paths(FAKE_SYSTEMD_RUN_CALLS).replace("@FAILED@", FAKE_START_FAILED)
+/// The POSIX sh function both fakes read a `/proc/PID/stat` state with: `proc_state FILE`
+/// prints the process state field, or nothing when FILE cannot be read (callers read
+/// that as gone).
+/// The command name between the parentheses may hold spaces, so the state is the first
+/// field after the line's last `) ` (F10).
+pub const PROC_STATE_FN: &str = r#"proc_state() {
+  line=""
+  { IFS= read -r line <"$1"; } 2>/dev/null
+  rest=${line##*") "}
+  if [ "$rest" = "$line" ]; then echo ""; return; fi
+  echo "${rest%% *}"
+}"#;
+
+/// `path` as one shell word for the fake scripts: POSIX single quotes, each `'` written
+/// as `'\''` (F24), so no path needs refusing.
+pub fn sh_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', r"'\''"))
 }
 
-/// `calls` with `@SETSID@`, `@SLEEP@` and `@RM@` replaced by their absolute paths.
+/// [`FAKE_SYSTEMD_RUN_CALLS`] with its tool paths and this test binary written in.
+fn fake_systemd_run_calls() -> String {
+    let exe = std::env::current_exe().expect("this test binary");
+    let exe = exe.to_str().expect("a UTF-8 test binary path");
+    with_tool_paths(FAKE_SYSTEMD_RUN_CALLS)
+        .replace("@FAILED@", FAKE_START_FAILED)
+        .replace("@TESTEXE@", &sh_quote(exe))
+}
+
+/// The variable naming the socket path [`fake_notify_listener_entry`] binds.
+pub const FAKE_NOTIFY_SOCKET_ENV: &str = "FAKE_NOTIFY_SOCKET";
+
+/// The variable naming the path prefix P of [`fake_notify_listener_entry`]'s files:
+/// it creates `P.listening`, reads the launched pid from `P.launched` and writes its
+/// verdict to `P.result`.
+pub const FAKE_NOTIFY_FILES_ENV: &str = "FAKE_NOTIFY_FILES";
+
+/// How long the notify listener waits for `READY=1` before it reports `timeout`.
+pub const FAKE_NOTIFY_READY_WAIT: Duration = Duration::from_secs(30);
+
+/// The notify listener's receive timeout, after which it checks the launched pid.
+pub const FAKE_NOTIFY_TICK: Duration = Duration::from_millis(50);
+
+/// Not a test of its own: the fake `systemd-run`'s notify listener, which it runs by
+/// re-running this test binary. Binds [`FAKE_NOTIFY_SOCKET_ENV`], creates
+/// `P.listening`, and writes `ready`, `exited`, `timeout` or `error: ...` to
+/// `P.result` (P from [`FAKE_NOTIFY_FILES_ENV`]). Without the variable it does nothing.
+#[test]
+#[ignore = "the fake systemd-run's notify listener, run by the fake, not a test"]
+fn fake_notify_listener_entry() {
+    let Some(files) = std::env::var_os(FAKE_NOTIFY_FILES_ENV) else {
+        return;
+    };
+    let verdict = match std::env::var_os(FAKE_NOTIFY_SOCKET_ENV) {
+        Some(socket) => listen_for_ready(&files, Path::new(&socket)),
+        None => format!("error: {FAKE_NOTIFY_SOCKET_ENV} is unset"),
+    };
+    fs::write(with_suffix(&files, ".result"), format!("{verdict}\n"))
+        .expect("write the notify listener's verdict");
+}
+
+/// `prefix` with `suffix` appended.
+fn with_suffix(prefix: &OsStr, suffix: &str) -> PathBuf {
+    let mut path = prefix.to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Whether a notify datagram has a line equal to `READY=1`.
+pub fn is_ready_datagram(datagram: &[u8]) -> bool {
+    datagram
+        .split(|byte| *byte == b'\n')
+        .any(|line| line == b"READY=1")
+}
+
+/// The pid in `P.launched`, once the fake has written all of it.
+fn launched_pid(path: &Path) -> Option<u32> {
+    let text = fs::read_to_string(path).ok()?;
+    text.strip_suffix('\n')?.trim().parse().ok()
+}
+
+/// Bind `socket`, mark `files` listening, and wait for `READY=1`: `ready` when it
+/// arrives, `exited` when the launched pid is gone first, `timeout` at
+/// [`FAKE_NOTIFY_READY_WAIT`].
+fn listen_for_ready(files: &OsStr, socket: &Path) -> String {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixDatagram;
+    let _ = fs::remove_file(socket);
+    let listener = match UnixDatagram::bind(socket) {
+        Ok(listener) => listener,
+        Err(err) => return format!("error: could not bind {}: {err}", socket.display()),
+    };
+    if let Err(err) = listener.set_read_timeout(Some(FAKE_NOTIFY_TICK)) {
+        return format!("error: {err}");
+    }
+    if let Err(err) = fs::write(with_suffix(files, ".listening"), "") {
+        return format!("error: could not mark the listener started: {err}");
+    }
+    let launched = with_suffix(files, ".launched");
+    let deadline = Instant::now() + FAKE_NOTIFY_READY_WAIT;
+    let mut pid = None;
+    let mut datagram = [0u8; 4096];
+    while Instant::now() < deadline {
+        match listener.recv(&mut datagram) {
+            Ok(len) if is_ready_datagram(&datagram[..len]) => return "ready".to_string(),
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                pid = pid.or_else(|| launched_pid(&launched));
+                if pid.is_some_and(|pid| !devflow_core::agent::agent_running(pid)) {
+                    return drained_verdict(&listener, &mut datagram);
+                }
+            }
+            Err(err) => return format!("error: {err}"),
+        }
+    }
+    "timeout".to_string()
+}
+
+/// After the launched pid is gone: `ready` if a `READY=1` it sent before it exited is
+/// still queued on `listener`, else `exited`.
+pub fn drained_verdict(listener: &std::os::unix::net::UnixDatagram, datagram: &mut [u8]) -> String {
+    if let Err(err) = listener.set_nonblocking(true) {
+        return format!("error: {err}");
+    }
+    loop {
+        match listener.recv(datagram) {
+            Ok(len) if is_ready_datagram(&datagram[..len]) => return "ready".to_string(),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return "exited".to_string();
+            }
+            Err(err) => return format!("error: {err}"),
+        }
+    }
+}
+
+/// `calls` with [`PROC_STATE_FN`] at `@PROC_STATE_FN@`, and `@SETSID@`, `@SLEEP@`, `@RM@`
+/// and `@MKTEMP@` replaced by their absolute paths.
 fn with_tool_paths(calls: &str) -> String {
     let path_of = |program: &str| {
         let path = resolve_on_path(program);
@@ -206,9 +386,11 @@ fn with_tool_paths(calls: &str) -> String {
         text
     };
     calls
+        .replace("@PROC_STATE_FN@", PROC_STATE_FN)
         .replace("@SETSID@", &path_of("setsid"))
         .replace("@SLEEP@", &path_of("sleep"))
         .replace("@RM@", &path_of("rm"))
+        .replace("@MKTEMP@", &path_of("mktemp"))
 }
 
 /// What every [`HermeticHome::agent_guard`] fake prints, after `fake <name>`,
@@ -269,9 +451,7 @@ fn write_agent_guard(dir: &Path) {
             "#!/bin/sh\necho \"{FAKE_TOOL_PREFIX}{program}{NO_STUB_TEXT}\" >&2\nexit {NO_STUB_EXIT}\n"
         );
         let path = dir.join(program);
-        fs::write(&path, script).expect("write an agent-guard fake");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-            .expect("make an agent-guard fake executable");
+        write_executable(&path, &script);
     }
 }
 
@@ -287,9 +467,7 @@ fn write_fake_service_tool(dir: &Path, tool: &str, calls: &str) {
         "#!/bin/sh\ndir='{dir_text}'\n{calls}echo \"{FAKE_TOOL_PREFIX}{tool}: unhandled: $*\" >&2\nexit 1\n"
     );
     let path = dir.join(tool);
-    fs::write(&path, script).expect("write a fake service tool");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("make a fake service tool executable");
+    write_executable(&path, &script);
 }
 
 /// The compiled `devflow` binary under test. The only place in `tests/` that
@@ -345,7 +523,9 @@ impl HermeticHome {
     /// `<unit>.fail` or `<unit>.deactivating` here sets what the fake
     /// `systemctl` reports for that unit's `ActiveState`; [`FAKE_FAIL_NEXT`]
     /// fails the next launch; `linger.no` makes lingering read off. The fake
-    /// `systemd-run` writes `<unit>.pid` and `<unit>.out` here.
+    /// `systemd-run` writes `<unit>.pid` and `<unit>.out` here, and per launch its
+    /// notify-listener files `<unit>.notify-<pid>.sock`, `.listening`, `.launched`,
+    /// `.result` and `.log`.
     pub fn service_bin(&self) -> PathBuf {
         self.home().join("service-bin")
     }
@@ -533,10 +713,7 @@ pub fn fake_bin_dir(agent_body: &str) -> FakeBin {
 pub fn fake_bin_dir_for(program: &str, agent_body: &str) -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     let agent = dir.path().join(program);
-    fs::write(&agent, format!("#!/bin/sh\n{agent_body}\n")).unwrap();
-    let mut permissions = fs::metadata(&agent).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&agent, permissions).unwrap();
+    write_executable(&agent, &format!("#!/bin/sh\n{agent_body}\n"));
     for linked in ["git", "sh"] {
         symlink(format!("/usr/bin/{linked}"), dir.path().join(linked)).unwrap();
     }
@@ -582,7 +759,8 @@ pub fn waiting_capture_agent_bin(logs: &Path) -> FakeBin {
 }
 
 /// The fake `codex` behind [`capture_agent_bin`]: answer `--version`, log
-/// argv and stdin under `logs`, then run the shell lines `tail`.
+/// argv and stdin under `logs`, then run the shell lines `tail`, with `@LOGS@` in it
+/// replaced by `logs`.
 pub fn capture_agent_bin_then(logs: &Path, tail: &str) -> FakeBin {
     let logs = logs.to_str().expect("a UTF-8 logs path");
     assert!(
@@ -595,7 +773,8 @@ pub fn capture_agent_bin_then(logs: &Path, tail: &str) -> FakeBin {
             "if [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.0.0-fake\"; exit 0; fi\n\
              for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >> '{logs}/{AGENT_ARGV_LOG}'\n\
              cat >> '{logs}/{AGENT_STDIN_LOG}'\n\
-             {tail}"
+             {tail}",
+            tail = tail.replace("@LOGS@", logs)
         ),
     )
 }

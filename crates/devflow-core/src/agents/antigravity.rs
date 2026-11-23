@@ -177,13 +177,7 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"DEVF
             argv_file.display(),
             turn_file.display(),
         );
-        std::fs::write(bin_dir.join("agy"), stub).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin_dir.join("agy"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
+        crate::test_support::write_executable(&bin_dir.join("agy"), &stub);
 
         let (program, args) = AntigravityDriver.build_command(PhaseId::new(0), "x", &[]);
         let out = std::process::Command::new(program)

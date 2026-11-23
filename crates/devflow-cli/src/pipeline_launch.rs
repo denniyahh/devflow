@@ -56,6 +56,12 @@ use tracing::{info, warn};
 /// attached to the intent the default builder returns. In a gap-closure pass
 /// ([`State::gap_closure_pass`], GATE-03) Plan renders the gaps Plan intent
 /// and Code the gaps-only pass, so a stop and resume keeps the pass's commands.
+/// In a reviews pass ([`State::reviews_pass`], D-04) Plan renders the reviews
+/// Plan intent, ahead of the gaps arm; the two never hold together, because the
+/// reviews flag is spent when the run leaves Plan and only Validate sets the
+/// gaps marker. `resume --reviews` sets the flag only at an `--until plan` halt,
+/// which always comes before the run's first Validate: only `start` sets the cap,
+/// and `transition` halts the first Plan exit under it.
 ///
 /// The only place a default stage prompt is rendered:
 /// [`launch_stage_inner`] (whose prompt the agent receives) and
@@ -63,6 +69,13 @@ use tracing::{info, warn};
 /// `every_no_override_launch_renders_through_default_stage_prompt` pins.
 pub(crate) fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
     let intent = match state.stage {
+        // D-04 (#250): a reviews pass's Plan runs `--reviews`, at its first launch and
+        // at every relaunch, a resume included. Checked first, though it cannot hold
+        // with the gaps marker: it is spent on leaving Plan, and only Validate sets that.
+        Stage::Plan if state.reviews_pass => prompt::StageIntent::PlanReviews {
+            phase: state.phase,
+            relaunch_note: state.relaunch_note.clone(),
+        },
         // GATE-03 (review C6): a gap-closure pass's Plan runs `--gaps`, at its
         // first launch and at every relaunch, a resume included.
         Stage::Plan if state.gap_closure_pass => prompt::StageIntent::PlanGaps {
@@ -899,7 +912,8 @@ impl Drop for AutoChainGuard {
 
 /// The stop reason an advance records when it stops at a safe point
 /// (50-13, R-2).
-pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
+pub(crate) const ADVANCE_STOP_REASON: &str =
+    "stopped during advance: the runner was ended by its unit stop";
 
 /// What an advance reads on this thread (50-13): its stop token, for the advance's
 /// safe points. One runner per phase holds the runner lock for the whole run (D-07),
@@ -1039,7 +1053,7 @@ pub(crate) fn stop_requested_at_safe_point() -> bool {
 /// `advance_stopped` event naming the point.
 pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {
     let reason = ADVANCE_STOP_REASON;
-    let source = "supervisor";
+    let source = "runner";
     commit(state, |s| {
         s.stopped = true;
         s.stop_reason = Some(reason.to_string());
@@ -2120,7 +2134,7 @@ pub(crate) fn resume(
     phase: PhaseId,
     agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
-    resume_with_fallback(project_root, phase, agent, None)
+    resume_with_fallback(project_root, phase, agent, None, false)
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
@@ -2161,11 +2175,17 @@ pub(crate) fn resume(
 /// D-06: a rerun asks again. Before it relaunches, `resume` closes the phase's gates and
 /// reports each answer it set aside and each claimed answer it found unapplied
 /// ([`close_gates_for_resume`]). It never applies a pending answer to the rerun's gate.
+///
+/// D-04 (#250): `reviews` (`resume --reviews`) reruns a Plan its `--until plan` cap
+/// halted as a reviews pass, `/gsd-plan-phase N --reviews`, with the cap kept, instead
+/// of advancing; see [`resume_loaded`]. It combines with `--agent` and
+/// `--fallback-agent` as a plain resume does.
 pub(crate) fn resume_with_fallback(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
+    reviews: bool,
 ) -> Result<(), CliError> {
     // 999.229: said first, so it prints even when the resume then refuses.
     if let Some(warning) = devflow_core::config::external_verify_env_warning_now() {
@@ -2195,8 +2215,18 @@ pub(crate) fn resume_with_fallback(
     launch_test_hold("holder_claimed");
     // 999.251: a resume past a fired `--until` cap archives the halted stage's capture
     // under that stage, not the one it advances to.
-    let archived_stage = resume_advance(&reserved.state).map(|(from, _)| from);
-    let mut state = resume_loaded(project_root, phase, reserved.state, agent, fallback_agent)?;
+    let archived_stage = resume_advance(&reserved.state, reviews).map(|(from, _)| from);
+    let mut state = resume_loaded(
+        project_root,
+        phase,
+        reserved.state,
+        agent,
+        fallback_agent,
+        reviews,
+    )?;
+    // #338 WR-01, F05: the state resume committed (`commit` replaced `state` with it), as
+    // start keeps `written`; not reloaded, so a runner's write cannot pass for resume's.
+    let written = serde_json::to_value(&state).ok();
     // The runner checks the agent binary again at each launch; checked here too, so a
     // resume that cannot run its agent fails now, re-marked stopped below, rather than
     // in a unit nobody watches.
@@ -2216,9 +2246,13 @@ pub(crate) fn resume_with_fallback(
             crate::commands::print_runner_launched(phase, &headline, &unit);
             Ok(())
         }
-        Err(crate::service::LaunchError::Failed(why)) => {
-            Err(re_mark_stopped_after_failed_launch(&mut state, phase, &why))
-        }
+        Err(crate::service::LaunchError::Failed(why)) => Err(re_mark_stopped_after_failed_launch(
+            &mut state,
+            phase,
+            &why,
+            reviews,
+            written.as_ref(),
+        )),
         // 999.244: systemd-run was killed at its bound, so the manager may have accepted
         // the unit; the runner is read once under the holder, which it never takes.
         Err(crate::service::LaunchError::Unknown { unit, why }) => {
@@ -2230,7 +2264,13 @@ pub(crate) fn resume_with_fallback(
                     Ok(())
                 }
                 crate::commands::TimedOutLaunch::NotLive => {
-                    Err(re_mark_stopped_after_failed_launch(&mut state, phase, &why))
+                    Err(re_mark_stopped_after_failed_launch(
+                        &mut state,
+                        phase,
+                        &why,
+                        reviews,
+                        written.as_ref(),
+                    ))
                 }
                 crate::commands::TimedOutLaunch::Unknown(reading) => Err(CliError::Message(
                     crate::commands::unconfirmed_launch_message("resume", phase, &why, &reading),
@@ -2242,14 +2282,59 @@ pub(crate) fn resume_with_fallback(
 
 /// The commit in [`resume`] cleared `stopped` so a reload mid-launch reads the run
 /// active; a launch that failed outright makes that a lie (44-CORE finding 2a), so the run
-/// is marked stopped again, naming what failed. Best effort: the launch error is what the
-/// caller needs either way.
-fn re_mark_stopped_after_failed_launch(state: &mut State, phase: PhaseId, why: &str) -> CliError {
+/// is marked stopped again, naming what failed. A state on disk that already reads
+/// `stopped` was stopped by its runner after that commit (a timed-out launch whose runner
+/// ran, recorded its own stop and exited, #258), so its stop reason is the runner's and is
+/// kept, and the error names that stop (F05). Best effort: the launch error is what the caller needs either way.
+///
+/// A failed `resume --reviews` launch (`reviews`, D-04, review item 8) puts the
+/// `--until plan` halt back, the halt's stop reason and no reviews pass, so
+/// [`crate::pipeline_gate::until_cap_fired`] holds again and both a retried
+/// `resume --reviews` and a plain `resume` are accepted. That halt is restored only over
+/// the state resume committed (`written`, #338 WR-01, D-11's snapshot rule): a state that
+/// changed since (a runner that ran, wrote and died) is kept, stopped with the launch
+/// failure and its reviews pass, so a plain `resume` reruns the reviews Plan, and the
+/// error names `devflow status` and `devflow discard`. The runner's own recorded stop is
+/// kept first, as above.
+fn re_mark_stopped_after_failed_launch(
+    state: &mut State,
+    phase: PhaseId,
+    why: &str,
+    reviews: bool,
+    written: Option<&serde_json::Value>,
+) -> CliError {
     let err = CliError::Message(format!("resume: phase {phase} was not launched: {why}"));
+    let mut kept = false;
+    let mut runner_stop: Option<String> = None;
     let _ = commit(state, |s| {
+        if s.stopped {
+            runner_stop = Some(s.stop_reason.clone().unwrap_or_else(|| "no reason".into()));
+            return;
+        }
+        let untouched = written.is_some() && written == serde_json::to_value(&*s).ok().as_ref();
         s.stopped = true;
-        s.stop_reason = Some(format!("resume launch failed: {err}"));
+        if reviews && untouched {
+            s.stop_reason = Some(crate::pipeline_gate::until_halt_reason(Stage::Plan));
+            s.reviews_pass = false;
+        } else {
+            s.stop_reason = Some(format!("resume launch failed: {err}"));
+            kept = !untouched;
+        }
     });
+    if let Some(reason) = runner_stop {
+        return CliError::Message(format!(
+            "resume: phase {phase}'s unit launched, and its runner recorded its own stop \
+             ({reason}) before resume could confirm the launch ({why}): run 'devflow status' \
+             to inspect it, and 'devflow resume --phase {phase}' to resume it"
+        ));
+    }
+    if kept {
+        return CliError::Message(format!(
+            "resume: phase {phase} was not confirmed launched ({why}), and its run state \
+             changed after resume wrote it, so it was kept: run `devflow status` to inspect \
+             it, and `devflow discard --phase {phase}` to remove it"
+        ));
+    }
     err
 }
 
@@ -2500,24 +2585,40 @@ fn record_leftover_question(project_root: &Path, phase: PhaseId, stage: Stage) {
 /// caller's phase holder. `state` is the copy that wrote, which may already be behind the
 /// file; the committed copy is returned for the caller to launch.
 ///
-/// 999.251 (D-02): a run its own `--until` cap halted resumes at [`Stage::next`] of the
-/// halted stage, with the bookkeeping a normal advance makes
+/// 999.251 (D-02): a run its own `--until` cap halted resumes at the stage
+/// [`resume_advance`] names, with the bookkeeping a normal advance makes
 /// ([`crate::pipeline_gate::enter_stage`]) and a `transition` event, recorded before any
 /// handoff so `agent_handoff` names the stage launched. Every check before the first
-/// write judges that stage. The halt records no target, so a halt reached through a
-/// Plan->Validate transition also resumes at Code. Any other stop reruns its stage.
+/// write judges that stage. Any other stop reruns its stage.
+///
+/// `reviews` (`resume --reviews`, D-04) reruns the halted Plan instead of advancing:
+/// the final commit sets [`State::reviews_pass`] and keeps the `--until plan` cap, so
+/// the reviews Plan halts again and a plain `resume` then advances.
 fn resume_loaded(
     project_root: &Path,
     phase: PhaseId,
     mut state: State,
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
+    reviews: bool,
 ) -> Result<State, CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
+    // D-04, restrictive verbs: `--reviews` is judged before any write, the state first,
+    // so a wrong-state refusal never depends on the review file.
+    if reviews {
+        if let Some(refusal) = reviews_resume_refusal(&state) {
+            return Err(CliError::Message(refusal));
+        }
+        let launch_root = state
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| project_root.to_path_buf());
+        require_reviews_file_in_checkout(&launch_root, phase)?;
+    }
     // 999.251 (D-02): a run its own `--until` cap halted resumes at the next stage;
     // any other stop reruns the stage it stopped in.
     let saved_stage = state.stage;
-    let advance = resume_advance(&state);
+    let advance = resume_advance(&state, reviews);
     // Every check before the first write judges the stage this resume launches, on a
     // copy that is never written (`commit` applies its closure to the file's copy).
     let mut judged = state.clone();
@@ -2600,11 +2701,17 @@ fn resume_loaded(
     }
     commit(&mut state, |s| {
         if s.stopped {
-            if crate::pipeline_gate::until_cap_fired(s) {
+            // D-04: a reviews resume reruns the halted Plan, so it does not pass the
+            // `--until plan` boundary and keeps the cap; `until_halt_target` stays as the
+            // halt wrote it, read only after a fired cap, whose halt rewrites it.
+            if crate::pipeline_gate::until_cap_fired(s) && !reviews {
                 s.stop_until = None;
             }
             s.stopped = false;
             s.stop_reason = None;
+        }
+        if reviews {
+            s.reviews_pass = true;
         }
         s.gate_pending = false;
         // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
@@ -2615,20 +2722,86 @@ fn resume_loaded(
             s.fallback_consumed = false;
         }
     })?;
+    if reviews {
+        println!(
+            "resume: Plan reruns as a reviews pass (/gsd-plan-phase {phase} --reviews); the \
+             --until plan cap still holds, so the run halts again after Plan"
+        );
+    }
     if let Some(fallback) = fallback_agent {
         print_fallback_notice(fallback, state.agent);
     }
     Ok(state)
 }
 
-/// The advance a resume makes: the halted stage and its [`Stage::next`] when the run's
-/// own `--until` cap stopped it ([`crate::pipeline_gate::until_cap_fired`]), else `None`.
-/// An `--until` halt never happens after Validate, so a fired cap always has a next.
-fn resume_advance(state: &State) -> Option<(Stage, Stage)> {
-    if !crate::pipeline_gate::until_cap_fired(state) {
+/// The advance a resume makes when the run's own `--until` cap stopped it
+/// ([`crate::pipeline_gate::until_cap_fired`]), else `None`: the halted stage and the
+/// stage the halted transition was moving to ([`State::until_halt_target`], #281), so a
+/// halt reached through Plan->Validate resumes at Validate. A state without a recorded
+/// target advances to [`Stage::next`]; an `--until` halt never happens after Validate,
+/// so a fired cap always has a next.
+///
+/// A reviews resume (`resume --reviews`, D-04) never advances: it reruns the halted
+/// Plan as a reviews pass, so it is `None` too.
+fn resume_advance(state: &State, reviews: bool) -> Option<(Stage, Stage)> {
+    if reviews || !crate::pipeline_gate::until_cap_fired(state) {
         return None;
     }
-    state.stage.next().map(|to| (state.stage, to))
+    state
+        .until_halt_target
+        .or_else(|| state.stage.next())
+        .map(|to| (state.stage, to))
+}
+
+/// The refusal of a `resume --reviews` (D-04) on a run that is not halted after Plan by
+/// its own `--until plan` cap, else `None`. Restrictive verbs: the flag does one job,
+/// rerunning that halted Plan as a reviews pass, and names the plain resume otherwise.
+fn reviews_resume_refusal(state: &State) -> Option<String> {
+    if crate::pipeline_gate::until_cap_fired(state) && state.stage == Stage::Plan {
+        return None;
+    }
+    let phase = state.phase;
+    let stage = state.stage;
+    let fact = if state.stopped {
+        let reason = state.stop_reason.as_deref().unwrap_or("no reason recorded");
+        format!("stopped in {stage}: {reason}")
+    } else {
+        format!("is in {stage} and not stopped")
+    };
+    Some(format!(
+        "resume: --reviews reruns Plan as a reviews pass only on a run its --until plan cap \
+         halted after Plan; phase {phase} {fact}; run devflow resume --phase {phase} without \
+         --reviews"
+    ))
+}
+
+/// D-04: refuse a `resume --reviews` whose run checkout, `launch_root` (the tree the
+/// reviews Plan reads), has no `{padded}-REVIEWS.md` in the phase's directory on disk.
+/// Unlike `start`, which reads the base it forks from, the run's tree already exists.
+/// Two phase directories refuse naming both, as `start --reviews` does on the base (F02),
+/// and a phase directory the reader could not judge refuses with its error.
+fn require_reviews_file_in_checkout(launch_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    use devflow_core::gsd_reader::ReaderFailure;
+    let padded = phase.padded();
+    let location = format!("in the run's checkout {}", launch_root.display());
+    let not_there = || {
+        crate::commands::reviews_file_refusal(crate::commands::LaunchVerb::Resume, phase, &location)
+    };
+    match devflow_core::gsd_reader::phase_dir(launch_root, phase) {
+        Ok(dir) if dir.join(format!("{padded}-REVIEWS.md")).is_file() => Ok(()),
+        Ok(_) | Err(ReaderFailure::PhaseDirNotFound { .. }) => Err(not_there()),
+        Err(ReaderFailure::AmbiguousPhaseDir { matches }) => {
+            Err(crate::commands::ambiguous_phase_dirs_refusal(
+                crate::commands::LaunchVerb::Resume,
+                phase,
+                &location,
+                matches.iter().map(|dir| dir.display().to_string()),
+            ))
+        }
+        Err(error) => Err(CliError::Message(format!(
+            "resume: --reviews could not find phase {phase}'s directory {location}: {error}"
+        ))),
+    }
 }
 
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
@@ -3861,6 +4034,470 @@ mod tests {
         );
     }
 
+    /// Write `{padded}-REVIEWS.md` into a phase directory of `root`'s checkout.
+    fn write_reviews_file(root: &Path, phase: PhaseId) {
+        let padded = phase.padded();
+        let dir = root.join(format!(".planning/phases/{padded}-x"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{padded}-REVIEWS.md")), "# reviews\n").unwrap();
+    }
+
+    /// A Plan or Code state of `phase` stopped with `stop_until = Some(stage)` and `reason`.
+    fn stopped_state(phase: PhaseId, stage: Stage, reason: &str) -> State {
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, PathBuf::new());
+        state.stage = stage;
+        state.stop_until = Some(stage);
+        state.stopped = true;
+        state.stop_reason = Some(reason.to_string());
+        state
+    }
+
+    /// Restrictive verbs: an operator stop during the capped Plan is not a halt after
+    /// Plan, so `resume --reviews` refuses it, naming why and the plain resume.
+    #[test]
+    fn reviews_resume_refuses_an_operator_stop_in_plan() {
+        let phase = PhaseId::new(5276);
+        let state = stopped_state(phase, Stage::Plan, "stopped via `devflow stop`");
+        let refusal = reviews_resume_refusal(&state);
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|text| text.contains("halted after Plan")
+                    && text.contains(&format!("devflow resume --phase {phase}"))),
+            "resume --reviews accepted a Plan the operator stopped: {refusal:?}"
+        );
+    }
+
+    /// Restrictive verbs: an `--until code` halt is a fired cap, but after Code, so
+    /// `resume --reviews` refuses it.
+    #[test]
+    fn reviews_resume_refuses_an_until_code_halt() {
+        let state = stopped_state(
+            PhaseId::new(5277),
+            Stage::Code,
+            &crate::pipeline_gate::until_halt_reason(Stage::Code),
+        );
+        let refusal = reviews_resume_refusal(&state);
+        assert!(
+            refusal.is_some(),
+            "resume --reviews accepted a halt after Code: {refusal:?}"
+        );
+    }
+
+    /// D-04: `resume --reviews` on an `--until plan` halt whose checkout has no
+    /// REVIEWS.md is refused, naming the expected path, and writes no state.
+    #[test]
+    fn resume_with_reviews_without_a_reviews_file_is_refused() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_reviews_without_a_reviews_file_is_refused";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5275);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        let padded = phase.padded();
+        std::fs::create_dir_all(root.join(format!(".planning/phases/{padded}-x"))).unwrap();
+        let state_file = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let result = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        let err = result.err().map(|err| err.to_string()).unwrap_or_default();
+        assert!(
+            err.contains(&format!(".planning/phases/{padded}-*/{padded}-REVIEWS.md"))
+                && err.contains(&root.display().to_string()),
+            "resume --reviews without a REVIEWS.md was not refused naming the path: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "a refused resume --reviews changed the state: {err}"
+        );
+    }
+
+    /// D-04 (F02): `resume --reviews` in a run checkout with two `NN-*` phase directories
+    /// is refused naming both, not as a missing REVIEWS.md, and writes no state.
+    #[test]
+    fn resume_with_reviews_and_two_phase_directories_is_refused_naming_both() {
+        const NAME: &str = "pipeline_launch::tests::resume_with_reviews_and_two_phase_directories_is_refused_naming_both";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5396);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        let padded = phase.padded();
+        for slug in ["a", "b"] {
+            let phase_dir = root.join(format!(".planning/phases/{padded}-{slug}"));
+            std::fs::create_dir_all(&phase_dir).unwrap();
+            std::fs::write(
+                phase_dir.join(format!("{padded}-REVIEWS.md")),
+                "# reviews\n",
+            )
+            .unwrap();
+        }
+        let state_file = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let result = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        let err = result.err().map(|err| err.to_string()).unwrap_or_default();
+        assert!(
+            err.contains(&format!("{padded}-a")) && err.contains(&format!("{padded}-b")),
+            "resume --reviews with two phase directories did not name both: {err}"
+        );
+        assert!(
+            !err.contains("it is not there"),
+            "two phase directories read as a missing REVIEWS.md: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "a refused resume --reviews changed the state: {err}"
+        );
+    }
+
+    /// Review item 8: a `resume --reviews` whose launch fails puts the `--until plan`
+    /// halt back, so the run stays retryable by `resume --reviews` and a plain `resume`.
+    #[test]
+    fn a_failed_resume_with_reviews_launch_stays_retryable() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_failed_resume_with_reviews_launch_stays_retryable";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5278);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        write_reviews_file(root, phase);
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::Failed);
+        let error = resume_with_fallback(root, phase, None, None, true)
+            .expect_err("a failed launch fails")
+            .to_string();
+        assert!(
+            error.contains("systemd-run could not start unit"),
+            "{error}"
+        );
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(
+            crate::pipeline_gate::until_cap_fired(&state)
+                && !state.reviews_pass
+                && reviews_resume_refusal(&state).is_none(),
+            "a failed resume --reviews launch left the run unretryable: {state:?}"
+        );
+
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::Started);
+        let retry = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        retry.expect("the retried resume --reviews launches");
+    }
+
+    /// #338 WR-01: a timed-out `resume --reviews` whose runner ran, wrote the state and
+    /// died keeps that state and its reviews pass, so a plain `resume` reruns the
+    /// reviews Plan instead of reading a finished `--until plan` halt and advancing.
+    #[test]
+    fn a_timed_out_resume_with_reviews_whose_runner_changed_the_state_keeps_the_reviews_pass() {
+        const NAME: &str = "pipeline_launch::tests::a_timed_out_resume_with_reviews_whose_runner_changed_the_state_keeps_the_reviews_pass";
+        const RUNNER_SESSION: &str = "runner-session-5394";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5394);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        write_reviews_file(root, phase);
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::TimedOutLeaving(
+            Ok("inactive"),
+        ));
+        let runner_root = root.to_path_buf();
+        crate::service::double::run_during_launch(move || {
+            workflow::update_state(&runner_root, phase, |state| {
+                state.session_id = Some(RUNNER_SESSION.to_string());
+                Ok::<_, workflow::WorkflowError>(())
+            })
+            .expect("the stand-in runner writes the state");
+        });
+
+        let result = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        let error = result
+            .expect_err("a timed-out resume with no live runner fails")
+            .to_string();
+
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(
+            !crate::pipeline_gate::until_cap_fired(&state)
+                && state.reviews_pass
+                && state.stopped
+                && state
+                    .stop_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("resume launch failed")),
+            "a timed-out resume --reviews whose runner changed the state faked the --until plan halt: {state:?}"
+        );
+        assert!(
+            state.session_id.as_deref() == Some(RUNNER_SESSION),
+            "the failed resume overwrote what its runner wrote: {state:?}"
+        );
+        let unsaid = "the failed resume did not say it kept the changed state";
+        assert!(error.contains("so it was kept"), "{unsaid}: {error}");
+        assert!(error.contains("devflow status"), "{unsaid}: {error}");
+        assert!(
+            error.contains("devflow discard --phase 5394"),
+            "{unsaid}: {error}"
+        );
+    }
+
+    /// D-11 (F05): a timed-out resume whose runner ran, recorded its own stop and exited
+    /// keeps that stop, and the error names it rather than saying the run was not launched.
+    #[test]
+    fn a_timed_out_resume_whose_runner_recorded_its_stop_names_that_stop() {
+        const NAME: &str = "pipeline_launch::tests::a_timed_out_resume_whose_runner_recorded_its_stop_names_that_stop";
+        const RUNNER_STOP: &str = "runner stop reason";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5395);
+        save_stopped_in_plan(root, phase, AgentKind::Codex, "stopped via `devflow stop`");
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::TimedOutLeaving(
+            Ok("inactive"),
+        ));
+        let runner_root = root.to_path_buf();
+        crate::service::double::run_during_launch(move || {
+            workflow::update_state(&runner_root, phase, |state| {
+                state.stopped = true;
+                state.stop_reason = Some(RUNNER_STOP.to_string());
+                Ok::<_, workflow::WorkflowError>(())
+            })
+            .expect("the stand-in runner records its own stop");
+        });
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        let error = result
+            .expect_err("a timed-out resume with no live runner fails")
+            .to_string();
+        let state = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(RUNNER_STOP),
+            "the failed resume overwrote the stop its runner recorded"
+        );
+        assert!(
+            error.contains(RUNNER_STOP) && !error.contains("was not launched"),
+            "the error did not name the runner's own stop: {error}"
+        );
+    }
+
+    /// D-04 (#250), the resume clause: `resume --reviews` on a run its `--until plan`
+    /// cap halted reruns Plan as a reviews pass instead of advancing, and keeps the cap,
+    /// so the reviews Plan halts again.
+    #[test]
+    fn resume_with_reviews_after_an_until_plan_halt_reruns_plan_as_a_reviews_pass() {
+        const NAME: &str = "pipeline_launch::tests::resume_with_reviews_after_an_until_plan_halt_reruns_plan_as_a_reviews_pass";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5274);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        write_reviews_file(root, phase);
+        let saved = workflow::load_state(root, phase).unwrap();
+
+        let result = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let mut probed = reloaded.clone();
+        LAUNCH_PROBE.set(Some(Vec::new()));
+        let first = runner_first_step(&mut probed);
+        let probe = LAUNCH_PROBE.take().expect("the probe was set");
+        assert_eq!(
+            probe,
+            vec![(Stage::Plan, AgentKind::Codex)],
+            "resume --reviews after an --until plan halt launched {probe:?}, not a reviews Plan"
+        );
+        match first {
+            Ok(Some(launch)) => assert_eq!(launch.state.stage, Stage::Plan),
+            Ok(None) => panic!("the runner's first step resolved no Plan launch"),
+            Err(err) => panic!("the runner's first step refused the Plan launch: {err}"),
+        }
+        assert!(
+            reloaded.reviews_pass,
+            "resume --reviews set no reviews pass"
+        );
+        assert_eq!(
+            reloaded.stop_until,
+            Some(Stage::Plan),
+            "the cap was dropped"
+        );
+        assert_eq!(reloaded.until_halt_target, saved.until_halt_target);
+        assert!(!reloaded.stopped, "the resumed run still reads stopped");
+        let prompt =
+            default_stage_prompt(&reloaded, agents::driver_for(AgentKind::Claude).as_ref());
+        assert!(
+            prompt.contains(&format!("/gsd-plan-phase {phase} --reviews")),
+            "the resumed Plan does not render the reviews pass: {prompt}"
+        );
+    }
+
+    /// #281 (D-09): a Plan gate answered "validate again" under `--until plan` moves
+    /// Plan->Validate, which the cap halts; the resume launches the Validate that move
+    /// asked for, not Code, and spends the recorded target.
+    #[test]
+    fn resume_after_an_until_plan_halt_reached_through_validate_again_launches_validate() {
+        const NAME: &str = "pipeline_launch::tests::resume_after_an_until_plan_halt_reached_through_validate_again_launches_validate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5380);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        workflow::save_state(&state).unwrap();
+        std::fs::write(agent_result::stdout_path(root, phase), "plan output\n").unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "0\n").unwrap();
+        // The move `Step::ValidateAgain` makes at a Plan gate.
+        let halted = crate::pipeline_gate::transition(root, &mut state, Stage::Validate);
+        assert!(
+            matches!(halted, Ok(None)),
+            "the cap halted the move to Validate"
+        );
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let (launched, probe) = first_step_after_resume(root, phase);
+        assert_eq!(
+            probe,
+            vec![(Stage::Validate, AgentKind::Codex)],
+            "resume after a validate-again --until halt launched {probe:?}, not Validate"
+        );
+        assert_eq!(launched.stage, Stage::Validate);
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().until_halt_target,
+            None,
+            "the resume spent the halt target"
+        );
+    }
+
+    /// #258 (operator decision 3): a resume whose launch timed out with its runner not
+    /// live keeps the `--until` halt the runner recorded during the launch, so the run
+    /// still reads as halted by its cap rather than as a failed resume.
+    #[test]
+    fn a_timed_out_resume_keeps_the_until_halt_its_runner_recorded() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_timed_out_resume_keeps_the_until_halt_its_runner_recorded";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5373);
+        save_stopped_in_plan(root, phase, AgentKind::Codex, "stopped via `devflow stop`");
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::TimedOutLeaving(
+            Ok("inactive"),
+        ));
+        let runner_root = root.to_path_buf();
+        crate::service::double::run_during_launch(move || {
+            workflow::update_state(&runner_root, phase, |state| {
+                state.stopped = true;
+                state.stop_reason = Some(crate::pipeline_gate::until_halt_reason(Stage::Plan));
+                Ok::<_, workflow::WorkflowError>(())
+            })
+            .expect("the stand-in runner records its --until halt");
+        });
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        assert!(
+            result.is_err(),
+            "a timed-out resume with no live runner fails"
+        );
+
+        let state = workflow::load_state(root, phase).unwrap();
+        let reason = state.stop_reason.clone();
+        assert!(
+            crate::pipeline_gate::until_cap_fired(&state),
+            "a resume whose launch timed out overwrote the --until halt its runner recorded: \
+             stop_reason {reason:?}"
+        );
+    }
+
     /// 999.251 with `--agent`: the handoff is judged and recorded at Code, the stage the
     /// resume launches, after the `transition` that moved the run there.
     #[test]
@@ -5063,7 +5700,7 @@ mod tests {
         let phase = PhaseId::new(5144);
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5110,7 +5747,7 @@ mod tests {
         let paused = workflow::load_state(root, phase).unwrap();
         assert!(!paused.stopped, "the run is not stopped");
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5180,7 +5817,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None);
+        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None, false);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let err = result
             .expect_err("handing the run to its own unused fallback is refused")
@@ -5224,7 +5861,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude), false);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let err = result
             .expect_err("a fallback equal to the run's agent is refused")
@@ -6684,6 +7321,29 @@ mod tests {
             .collect()
     }
 
+    /// D-10 (#324): an advance stop's reason and its `advance_stopped` event name the
+    /// runner, not the supervisor Phase 52.2 removed.
+    #[test]
+    fn an_advance_stop_names_the_runner_not_the_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5324);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.into());
+        workflow::save_state(&state).unwrap();
+        record_advance_stop(&mut state, 2).unwrap();
+        let reason = workflow::load_state(root, phase).unwrap().stop_reason;
+        let source = events_named(root, "advance_stopped")
+            .last()
+            .map(|event| event["source"].clone());
+        assert!(
+            reason.as_deref() == Some(ADVANCE_STOP_REASON)
+                && ADVANCE_STOP_REASON.contains("runner")
+                && !ADVANCE_STOP_REASON.contains("supervisor")
+                && source.as_ref().and_then(serde_json::Value::as_str) == Some("runner"),
+            "the advance stop still names the supervisor: {reason:?} / {source:?}"
+        );
+    }
+
     // ---- 51-01: rate-limit failover at Code (SUPV-02) ----
 
     /// The capture-shape rate-limit envelope a rate-limited stub prints. Its
@@ -6897,18 +7557,15 @@ mod tests {
     /// relaunched onto either stays running, so its supervisor makes no further
     /// state write while the test reads the state.
     fn waiting_agents_dir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let path_dir = agent_free_dir_with_agent_stub("claude");
         for program in ["claude", "codex"] {
             let path = path_dir.path().join(program);
-            std::fs::write(
+            devflow_core::test_support::write_executable(
                 &path,
                 "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
                  i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
                  exit 0\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
         }
         let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
             .into_iter()
@@ -7294,22 +7951,19 @@ mod tests {
     /// stubs they replace. The marker is created after the write completes, so a
     /// reader that sees it reads the whole argv.
     fn argv_recording_agents_dir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let path_dir = waiting_agents_dir();
         for program in ["claude", "codex"] {
             let path = path_dir.path().join(program);
-            std::fs::write(
+            devflow_core::test_support::write_executable(
                 &path,
-                format!(
+                &format!(
                     "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
                      for arg in \"$@\"; do printf '%s\\0' \"$arg\"; done > {program}-argv.bin\n\
                      : > {program}-argv.done\n\
                      i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
                      exit 0\n"
                 ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
         }
         path_dir
     }
@@ -7978,6 +8632,36 @@ mod tests {
         assert!(!reloaded.gap_closure_pass, "control: no marker appears");
     }
 
+    /// D-04 (#250): a reviews pass's Plan state, saved and reloaded as a resume reloads
+    /// it, renders the reviews pass with no resume flag: by codex through plan-phase.md's
+    /// reviews mode, by claude as `/gsd-plan-phase N --reviews`, neither with the plain
+    /// Plan prompt's PLAN.md short-circuit.
+    #[test]
+    fn a_reviews_pass_plan_renders_reviews_after_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5273);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.reviews_pass = true;
+        state.stopped = true;
+        workflow::save_state(&state).unwrap();
+        let reloaded = workflow::load_state(root, phase).unwrap();
+
+        let codex = default_stage_prompt(&reloaded, agents::driver_for(AgentKind::Codex).as_ref());
+        let claude =
+            default_stage_prompt(&reloaded, agents::driver_for(AgentKind::Claude).as_ref());
+        for (prompt, needle) in [
+            (&codex, format!("plan-phase.md for phase {phase} --reviews")),
+            (&claude, format!("/gsd-plan-phase {phase} --reviews")),
+        ] {
+            assert!(
+                prompt.contains(&needle) && !prompt.contains("already exists"),
+                "a resumed reviews pass did not render --reviews: {prompt}"
+            );
+        }
+    }
+
     /// Review C6 (GATE-03): a gaps Code pass whose `code_fix` was cleared (as
     /// an `--until code` halt leaves it; a stop keeps `code_fix`), resumed with
     /// the gap-closure marker still set, relaunches the gaps-only execute and
@@ -8576,7 +9260,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = resume_loaded(root, phase, state, None, None);
+        let result = resume_loaded(root, phase, state, None, None, false);
         result.unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
@@ -9585,14 +10269,12 @@ mod tests {
     /// long. `true` in the parent,
     /// whose work is done.
     fn parent_of_a_past_reset_claude_child(name: &str) -> bool {
-        use std::os::unix::fs::PermissionsExt;
         if devflow_core::test_support::in_child_test(name) {
             return false;
         }
         let path_dir = agent_free_dir_with_agent_stub("claude");
         let stub = path_dir.path().join("claude");
-        std::fs::write(&stub, past_reset_claude_script()).unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        devflow_core::test_support::write_executable(&stub, &past_reset_claude_script());
         let output = crate::test_support::run_hermetic_test_in_child(
             name,
             path_dir.path(),

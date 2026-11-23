@@ -10,20 +10,16 @@
 mod common;
 
 use common::HermeticPath;
-use std::os::unix::fs::PermissionsExt;
+use devflow_core::test_support::write_executable;
 use std::path::Path;
 
 fn write_stub_agy(root: &Path) -> std::path::PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(
-        bin.join("agy"),
+    write_executable(
+        &bin.join("agy"),
         "#!/bin/sh\necho 'antigravity-cli 9.9.9-test'\n",
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(bin.join("agy")).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(bin.join("agy"), perms).unwrap();
+    );
     bin
 }
 

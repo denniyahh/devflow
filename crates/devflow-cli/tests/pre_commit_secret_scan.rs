@@ -6,7 +6,7 @@
 //! has none). Global and system git config are nulled, so the hook's chain to
 //! a machine-wide hook never runs and cannot mask the repo's own scan.
 
-use std::os::unix::fs::PermissionsExt as _;
+use devflow_core::test_support::write_executable;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -27,15 +27,12 @@ fn fake_gitleaks(dir: &Path, exit_code: i32) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("create fake bin dir");
     let script = bin.join("gitleaks");
-    std::fs::write(
+    write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/args.log\"\nexit {exit_code}\n"
         ),
-    )
-    .expect("write fake gitleaks");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod fake gitleaks");
+    );
     bin
 }
 

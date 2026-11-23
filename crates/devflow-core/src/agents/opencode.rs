@@ -708,14 +708,7 @@ mod tests {
             body = body,
             exit_code = exit_code,
         );
-        std::fs::write(&stub, script).expect("write opencode stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
-        }
+        crate::test_support::write_executable(&stub, &script);
         dir
     }
 
@@ -729,14 +722,7 @@ mod tests {
         let script = format!(
             "#!/bin/sh\nsleep {sleep_secs} &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nwait \"$child\"\n"
         );
-        std::fs::write(&stub, script).expect("write hanging opencode stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
-        }
+        crate::test_support::write_executable(&stub, &script);
         #[cfg(unix)]
         std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
             .expect("link the required sleep utility into the isolated PATH");
@@ -749,14 +735,7 @@ mod tests {
         let script = format!(
             "#!/bin/sh\nsleep {sleep_secs} &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nexit 0\n"
         );
-        std::fs::write(&stub, script).expect("write parent-exit stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
-        }
+        crate::test_support::write_executable(&stub, &script);
         #[cfg(unix)]
         std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
             .expect("link the required sleep utility into the isolated PATH");
@@ -770,11 +749,7 @@ mod tests {
         let script = format!(
             "#!/bin/sh\nsleep {sleep_secs} </dev/null >/dev/null 2>&1 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nexit 0\n"
         );
-        std::fs::write(&stub, script).expect("write silent-child stub");
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
+        crate::test_support::write_executable(&stub, &script);
         std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
             .expect("link the required sleep utility into the isolated PATH");
         dir
@@ -791,14 +766,7 @@ mod tests {
         let script = format!(
             "#!/bin/sh\nsetsid sleep {sleep_secs} &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nwait \"$child\"\nprintf '%s\\n' \"$?\" > \"$0.setsid-status\"\nexit 0\n"
         );
-        std::fs::write(&stub, script).expect("write setsid escape stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
-        }
+        crate::test_support::write_executable(&stub, &script);
         std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
             .expect("link the required sleep utility into the isolated PATH");
         std::os::unix::fs::symlink("/usr/bin/setsid", dir.path().join("setsid"))
@@ -819,15 +787,8 @@ mod tests {
         let python = format!(
             "import os, sys, time\nstatus = sys.argv[1]\ntry:\n    os.setpgid(0, 0)\nexcept OSError as error:\n    open(status, 'w', encoding='utf-8').write(str(error.errno))\n    raise\nopen(status, 'w', encoding='utf-8').write('0')\ntime.sleep({sleep_secs})\n"
         );
-        std::fs::write(&stub, script).expect("write setpgid escape stub");
+        crate::test_support::write_executable(&stub, script);
         std::fs::write(&escape, python).expect("write setpgid escape helper");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
-        }
         std::os::unix::fs::symlink("/usr/bin/python3", dir.path().join("python3"))
             .expect("link the required Python utility into the isolated PATH");
         dir
@@ -1443,13 +1404,25 @@ mod tests {
             "the guarded probe must deny setpgid rather than merely timing out after it succeeds"
         );
         let pid = hanging_stub_child_pid(&stub_dir);
-        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
+        // One reading decides: the poll hands back the observation that ended
+        // it, so a second, later read cannot contradict the one that stopped
+        // the wait. The /proc snapshots at that reading and at the assertion,
+        // with the elapsed time, separate a recycled pid (another `starttime`),
+        // a zombie and a process the kill never reached.
+        let wait_started = std::time::Instant::now();
+        let reaped_by = wait_started + std::time::Duration::from_secs(2);
+        let (still_running, at_decisive_reading) = loop {
+            let running = crate::agent::agent_running(pid);
+            if !running || std::time::Instant::now() >= reaped_by {
+                break (running, probe_proc_snapshot(pid));
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        };
+        let elapsed = wait_started.elapsed();
         assert!(
-            !crate::agent::agent_running(pid),
-            "the attempted group-escape process must be reaped: pid {pid}"
+            !still_running,
+            "the attempted group-escape process must be reaped: pid {pid} still running after {elapsed:?}; /proc at the decisive reading: {at_decisive_reading}; /proc at the assertion: {}",
+            probe_proc_snapshot(pid)
         );
     }
 

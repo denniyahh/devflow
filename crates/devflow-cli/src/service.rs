@@ -490,6 +490,36 @@ pub(crate) mod double {
         DOUBLE.with_borrow(|double| double.launch_end)
     }
 
+    thread_local! {
+        static DURING_LAUNCH: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Run `effect` once, in the next cfg(test) [`super::launch_runner_unit`] on this
+    /// thread, before it reports its [`LaunchEnd`]: stands in for what a runner wrote
+    /// before it died.
+    pub(crate) fn run_during_launch(effect: impl FnOnce() + 'static) {
+        DURING_LAUNCH.with_borrow_mut(|slot| *slot = Some(Box::new(effect)));
+    }
+
+    pub(super) fn take_during_launch() -> Option<Box<dyn FnOnce()>> {
+        DURING_LAUNCH.with_borrow_mut(Option::take)
+    }
+
+    thread_local! {
+        static DURING_STOP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Run `effect` once, in the next cfg(test) [`super::stop_unit`] on this thread,
+    /// after it counts the call and before it ends the unit's runners: stands in for what
+    /// is observable while the unit stops.
+    pub(crate) fn run_during_stop(effect: impl FnOnce() + 'static) {
+        DURING_STOP.with_borrow_mut(|slot| *slot = Some(Box::new(effect)));
+    }
+
+    pub(super) fn take_during_stop() -> Option<Box<dyn FnOnce()>> {
+        DURING_STOP.with_borrow_mut(Option::take)
+    }
+
     pub(super) fn record_stop() {
         DOUBLE.with_borrow_mut(|double| double.stop_calls += 1);
     }
@@ -823,6 +853,9 @@ pub(crate) fn launch_runner_unit(
         ))
     })?;
     let timed_out = |unit: &str| launch_timeout_error(unit, "systemd-run (test double) timed out");
+    if let Some(effect) = double::take_during_launch() {
+        effect();
+    }
     match double::launch_end() {
         double::LaunchEnd::TimedOutLeaving(state) => {
             double::set_unit_state(state);
@@ -924,13 +957,16 @@ pub(crate) fn stop_unit(unit: &str) -> Result<(), String> {
     }
 }
 
-/// The cfg(test) build: count the call, then end the runner child the cfg(test)
-/// [`launch_runner_unit`] recorded for `unit` (or a child
+/// The cfg(test) build: count the call, run a [`double::run_during_stop`] effect, then end
+/// the runner child the cfg(test) [`launch_runner_unit`] recorded for `unit` (or a child
 /// [`double::register_stop_target`] gave it), SIGTERM, a wait of [`TIMEOUT_STOP_SEC`],
 /// then SIGKILL, as the manager does. Never reaches [`tool`].
 #[cfg(test)]
 pub(crate) fn stop_unit(unit: &str) -> Result<(), String> {
     double::record_stop();
+    if let Some(effect) = double::take_during_stop() {
+        effect();
+    }
     double::end_runners(Some(unit), TIMEOUT_STOP_SEC);
     Ok(())
 }

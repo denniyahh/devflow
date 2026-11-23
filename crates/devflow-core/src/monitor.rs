@@ -4253,15 +4253,11 @@ exit 0
 
         /// Write an executable `#!/bin/sh` fake agent named `name`.
         fn agent(&self, name: &str, body: &str) -> PathBuf {
-            use std::os::unix::fs::PermissionsExt;
             let path = self.path(name);
-            std::fs::write(
+            crate::test_support::write_executable(
                 &path,
-                format!("#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\n{body}\n"),
-            )
-            .expect("write the fake agent");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("make the fake agent executable");
+                &format!("#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\n{body}\n"),
+            );
             path
         }
 

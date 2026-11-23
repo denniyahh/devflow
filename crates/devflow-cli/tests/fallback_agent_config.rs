@@ -16,6 +16,7 @@ mod common;
 
 use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
+use devflow_core::test_support::write_executable;
 use std::fs;
 use std::path::Path;
 use std::process::Output;
@@ -80,9 +81,7 @@ fn stub_dir(stubs: &[(&str, &str)]) -> common::FakeBin {
     let fake = common::fake_bin_dir_for(first.0, first.1);
     for (program, body) in rest {
         let path = fake.path.join(program);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
     }
     fake
 }
@@ -121,9 +120,7 @@ fn run_start(
 fn dry_run(root: &Path, phase: PhaseId, fake: &common::FakeBin, extra: &[&str]) -> Output {
     let primary = fake.path.join("claude");
     if !primary.exists() {
-        fs::write(&primary, format!("#!/bin/sh\n{AGENT_STUB}\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&primary, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&primary, &format!("#!/bin/sh\n{AGENT_STUB}\n"));
     }
     // `--dry-run` launches nothing, so the home only has to outlive `output()`.
     let home = common::HermeticHome::new();

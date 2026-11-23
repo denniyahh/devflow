@@ -45,8 +45,10 @@ pub(crate) fn until_halt_reason(stage: Stage) -> String {
 /// during the capped stage leaves the same `stopped`, `stage` and `stop_until`; only
 /// the reason [`transition`] writes ([`until_halt_reason`]) tells the two apart.
 ///
-/// A fired cap resumes at [`Stage::next`] of the halted stage (999.251). The halt records
-/// no target, so a halt reached through a Plan->Validate transition also resumes at Code.
+/// A fired cap resumes at the stage the halted transition was moving to, which the halt
+/// records in [`State::until_halt_target`] (#281), so a halt reached through a
+/// Plan->Validate transition resumes at Validate. A state without it resumes at
+/// [`Stage::next`] of the halted stage (999.251).
 pub(crate) fn until_cap_fired(state: &State) -> bool {
     state.stopped
         && state.stop_until == Some(state.stage)
@@ -94,6 +96,8 @@ pub(crate) fn transition(
         commit(state, |s| {
             s.stopped = true;
             s.stop_reason = Some(until_halt_reason(from));
+            // #281 (D-09): the resume launches the stage this move was going to.
+            s.until_halt_target = Some(to);
             // T-20-03b / doctor gap (D-09): clear gate_pending so doctor does
             // not misreport this intentional stop as a gate with no waiter.
             s.gate_pending = false;
@@ -104,6 +108,8 @@ pub(crate) fn transition(
             s.code_fix_report = None;
             // U7: the run leaves the stage, so the stage's relaunch note goes.
             s.relaunch_note = None;
+            // D-04: a finished reviews pass is spent here, as `enter_stage` would.
+            s.reviews_pass = false;
         })?;
         events::emit(
             project_root,
@@ -159,6 +165,9 @@ pub(crate) fn enter_stage(state: &mut State, from: Stage, to: Stage) {
     }
     state.infra_failures = 0;
     state.gate_pending = false;
+    // #281: entering a stage spends an `--until` halt's target, so no later resume
+    // reuses it.
+    state.until_halt_target = None;
     // D-09: a fix type lives exactly as long as its Code pass, so a later
     // plain Code pass never replays a stale one. Its note goes with it.
     state.code_fix = None;
@@ -166,6 +175,8 @@ pub(crate) fn enter_stage(state: &mut State, from: Stage, to: Stage) {
     state.code_fix_report = None;
     // U7: a relaunch note is for the stage being left, never the next one.
     state.relaunch_note = None;
+    // D-04: a reviews pass lives exactly as long as its Plan stage.
+    state.reviews_pass = false;
 }
 
 /// The stop reason a run records when its Validate passes (D-35).
@@ -1049,7 +1060,11 @@ pub(crate) fn print_dry_run(state: &State) {
     println!("\nstage pipeline:");
     let mut stage = Some(Stage::Plan);
     while let Some(s) = stage {
-        let command = s.gsd_command().replace("{N}", &state.phase.to_string());
+        let mut command = s.gsd_command().replace("{N}", &state.phase.to_string());
+        // D-04 (#250): a reviews pass runs Plan as `/gsd-plan-phase N --reviews`.
+        if s == Stage::Plan && state.reviews_pass {
+            command.push_str(" --reviews");
+        }
         // F-7: these are PREDICTION probes, not live reads. Every one passes
         // literals rather than `state.consecutive_failures` /
         // `state.phase_validate_failures` on purpose — the preview answers
@@ -1167,6 +1182,61 @@ mod tests {
             devflow_core::events::last_event_of_kind_for_phase(root, phase, "workflow_finished")
                 .expect("the --until clean stop emits workflow_finished");
         assert_eq!(finished["reason"], "stopped_at", "{finished}");
+    }
+
+    /// D-04 (#250): entering another stage spends the reviews pass, so a later Plan (a
+    /// gap-closure pass) is never rendered as one.
+    #[test]
+    fn entering_another_stage_ends_the_reviews_pass() {
+        let mut state = State::new(
+            PhaseId::new(5312),
+            AgentKind::Claude,
+            Mode::Supervise,
+            std::path::PathBuf::from("/nonexistent"),
+        );
+        state.stage = Stage::Plan;
+        state.reviews_pass = true;
+
+        enter_stage(&mut state, Stage::Plan, Stage::Code);
+
+        assert!(
+            !state.reviews_pass,
+            "entering Code left the reviews pass set"
+        );
+    }
+
+    /// D-04 (#250): the `--until plan` halt after a reviews pass returns before
+    /// `enter_stage`, so it spends the reviews pass itself; a halted run carries no
+    /// spent flag.
+    #[test]
+    fn an_until_plan_halt_after_a_reviews_pass_ends_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(5313);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        state.reviews_pass = true;
+        workflow::save_state(&state).unwrap();
+
+        transition(root, &mut state, Stage::Code).unwrap();
+
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(
+            state.stopped && state.stop_reason == Some(until_halt_reason(Stage::Plan)),
+            "premise: the transition halts at the --until cap: {state:?}"
+        );
+        assert!(
+            !state.reviews_pass,
+            "the --until plan halt left the reviews pass set: {state:?}"
+        );
     }
 
     /// An `abort` whose state cannot be removed says so, on the event a supervisor's
@@ -2134,17 +2204,14 @@ mod tests {
     /// running and its supervisor writes no state while the test reads it.
     /// Codex is a capture-shape agent, so the launch spends no delivery canary.
     fn waiting_codex_dir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let path_dir = agent_free_dir_with_agent_stub("codex");
         let path = path_dir.path().join("codex");
-        std::fs::write(
+        devflow_core::test_support::write_executable(
             &path,
             "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
              i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
              exit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
             .into_iter()
             .map(Path::new)

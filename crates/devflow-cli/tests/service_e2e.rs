@@ -1,8 +1,10 @@
 //! Host-only tests of the foreground runner as a systemd user unit (D-01, D-04a, D-07).
 //!
-//! Every test here is `#[ignore]` and runs only under `scripts/check.sh service`, which
-//! needs a running systemd user manager; the container suite has none. Each test's first
-//! assertion is that `systemctl --user show -p Version --value` succeeds, so a host with
+//! Every test here that talks to a unit is `#[ignore]` and runs only under `scripts/check.sh
+//! service`, which needs a running systemd user manager; the container suite has none. The
+//! three pure tests of [`settle_unit_reads`] are not ignored, so they run in every `cargo
+//! test` and container run, and `scripts/check.sh service` (which runs only the ignored
+//! tests) does not count them. Each host test's first assertion is that `systemctl --user show -p Version --value` succeeds, so a host with
 //! no manager fails the test instead of skipping it.
 //!
 //! `systemctl` and `systemd-run` get the caller's real `XDG_RUNTIME_DIR` and
@@ -15,6 +17,7 @@ mod common;
 
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
+use devflow_core::test_support::write_executable;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -286,6 +289,138 @@ fn wait_inactive(unit: &str) -> Result<(), String> {
         }
         std::thread::sleep(UNIT_POLL);
     }
+}
+
+/// One read of a unit's `ActiveState`, `Result` and `ExecMainStatus`.
+#[derive(Clone, Debug)]
+struct UnitRead {
+    active: String,
+    result: String,
+    exec_main_status: String,
+}
+
+/// How often [`settle_unit_reads`] takes a read.
+const SETTLE_POLL: Duration = Duration::from_millis(50);
+
+/// How long a stopped unit may take to read `inactive` (#279).
+const STOPPED_UNIT_INACTIVE_WAIT: Duration = Duration::from_secs(10);
+
+/// Poll `next` until a read is `inactive`, for at most `budget` (#279).
+///
+/// A `failed` read is an error at once, with that read's `Result` and `ExecMainStatus`:
+/// a unit that failed and was then collected would otherwise read `inactive` (an unloaded
+/// unit's show reads `inactive` too) and hide its failure. Past the budget, the error
+/// names the budget and the last read.
+fn settle_unit_reads(budget: Duration, mut next: impl FnMut() -> UnitRead) -> Result<(), String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let read = next();
+        match read.active.as_str() {
+            "inactive" => return Ok(()),
+            "failed" => {
+                return Err(format!(
+                    "unit read failed before inactive: ActiveState=failed, Result={}, ExecMainStatus={}",
+                    read.result, read.exec_main_status
+                ));
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "did not read inactive within {budget:?}: ActiveState={}, Result={}, ExecMainStatus={}",
+                read.active, read.result, read.exec_main_status
+            ));
+        }
+        std::thread::sleep(SETTLE_POLL);
+    }
+}
+
+/// Wait for `unit` to read `inactive` within `budget`.
+///
+/// # Panics
+/// With `unit {unit} ` before [`settle_unit_reads`]'s error.
+fn wait_for_unit_inactive(unit: &str, budget: Duration) {
+    let read = || UnitRead {
+        active: unit_property(unit, "ActiveState"),
+        result: unit_property(unit, "Result"),
+        exec_main_status: unit_property(unit, "ExecMainStatus"),
+    };
+    if let Err(err) = settle_unit_reads(budget, read) {
+        panic!("unit {unit} {err}");
+    }
+}
+
+/// A read of `active`, with the given `Result` and `ExecMainStatus`.
+fn unit_read(active: &str, result: &str, exec_main_status: &str) -> UnitRead {
+    UnitRead {
+        active: active.to_string(),
+        result: result.to_string(),
+        exec_main_status: exec_main_status.to_string(),
+    }
+}
+
+/// A `next` for [`settle_unit_reads`] that returns `reads` in order, then repeats the last.
+fn scripted(reads: Vec<UnitRead>) -> impl FnMut() -> UnitRead {
+    let mut reads = reads.into_iter();
+    let mut last = None;
+    move || {
+        if let Some(read) = reads.next() {
+            last = Some(read);
+        }
+        last.clone().expect("a scripted read")
+    }
+}
+
+#[test]
+fn a_failed_read_before_inactive_is_reported_with_its_result() {
+    let outcome = settle_unit_reads(
+        Duration::from_secs(5),
+        scripted(vec![
+            unit_read("deactivating", "success", "0"),
+            unit_read("failed", "exit-code", "1"),
+            unit_read("inactive", "success", "0"),
+        ]),
+    );
+    let reported = outcome.as_ref().err().is_some_and(|text| {
+        text.contains("failed")
+            && text.contains("Result=exit-code")
+            && text.contains("ExecMainStatus=1")
+    });
+    assert!(
+        reported,
+        "a failed read before inactive was not surfaced: {outcome:?}"
+    );
+}
+
+#[test]
+fn an_inactive_read_after_deactivating_settles() {
+    let outcome = settle_unit_reads(
+        Duration::from_secs(5),
+        scripted(vec![
+            unit_read("deactivating", "success", "0"),
+            unit_read("inactive", "success", "0"),
+        ]),
+    );
+    assert!(
+        outcome.is_ok(),
+        "deactivating then inactive did not settle: {outcome:?}"
+    );
+}
+
+#[test]
+fn reads_that_never_settle_time_out_naming_the_last_read() {
+    let outcome = settle_unit_reads(
+        Duration::from_millis(100),
+        scripted(vec![unit_read("deactivating", "success", "0")]),
+    );
+    let reported = outcome
+        .as_ref()
+        .err()
+        .is_some_and(|text| text.contains("100ms") && text.contains("ActiveState=deactivating"));
+    assert!(
+        reported,
+        "a read that never settled was not reported: {outcome:?}"
+    );
 }
 
 /// Every event line of `kind` in the project's event log.
@@ -645,7 +780,23 @@ fn start_with_a_runner_path_that_no_longer_exists_fails_naming_the_unit_and_the_
     let guard = UnitGuard::named(fixture.unit());
     let scratch = tempfile::tempdir().unwrap();
     let copy = scratch.path().join("devflow");
-    fs::copy(common::devflow_bin(), &copy).expect("copy the devflow binary");
+    // A child copies the binary so this process never holds a write descriptor
+    // on a file it then executes (#276's ETXTBSY window, as for the stubs).
+    let cp = ["/usr/bin/cp", "/bin/cp"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("a real cp");
+    let copied = Command::new(cp)
+        .arg(common::devflow_bin())
+        .arg(&copy)
+        .output()
+        .unwrap_or_else(|error| panic!("copy the devflow binary: {cp} did not start: {error}"));
+    assert!(
+        copied.status.success(),
+        "copy the devflow binary: {cp} ended with {}: {}",
+        copied.status,
+        String::from_utf8_lossy(&copied.stderr)
+    );
     let wrapper = scratch.path().join("wrapper");
     fs::create_dir(&wrapper).unwrap();
     let real_systemctl = ["/usr/bin/systemctl", "/bin/systemctl"]
@@ -653,16 +804,13 @@ fn start_with_a_runner_path_that_no_longer_exists_fails_naming_the_unit_and_the_
         .find(|path| Path::new(path).is_file())
         .expect("a real systemctl");
     let script = wrapper.join("systemctl");
-    fs::write(
+    write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\n/usr/bin/rm -f '{}'\nexec {real_systemctl} \"$@\"\n",
             copy.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let out = fixture.start(
         common::host_service_devflow_from(&fixture.home, &copy),
@@ -852,11 +1000,42 @@ fn stop_on_a_live_unit_records_stopped() {
         "state not stopped: {state:?}\njournal:\n{}",
         journal_of(&guard.unit)
     );
-    assert_eq!(
-        unit_property(&guard.unit, "ActiveState"),
-        "inactive",
-        "the unit is not inactive after stop"
+    wait_for_unit_inactive(&guard.unit, STOPPED_UNIT_INACTIVE_WAIT);
+}
+
+/// #279 negative control: the stopped-unit wait, run on a live unit that is never
+/// stopped and given a short budget, fails naming the unit, `Result` and `ExecMainStatus`.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn a_unit_that_never_reads_inactive_fails_naming_result_and_exec_main_status() {
+    assert_manager_answers();
+    let phase = PhaseId::new(88);
+    let fixture = StartFixture::new(phase, "sleep 120");
+    let guard = UnitGuard::named(fixture.unit());
+    let out = fixture.start(
+        common::host_service_devflow(&fixture.home),
+        &fixture.path(None),
     );
+    assert!(out.status.success(), "start failed:\n{}", text(&out));
+    let argv_log = fixture.logs.path().join(common::AGENT_ARGV_LOG);
+    wait_until(
+        || argv_log.is_file(),
+        &guard.unit,
+        "the agent never started",
+    );
+
+    let unit = guard.unit.clone();
+    let payload = std::panic::catch_unwind(|| {
+        wait_for_unit_inactive(&unit, Duration::from_millis(500));
+    })
+    .expect_err("the wait passed on a unit that was never stopped");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .expect("a formatted panic message");
+    assert!(message.contains(&guard.unit), "{message}");
+    assert!(message.contains("Result="), "{message}");
+    assert!(message.contains("ExecMainStatus="), "{message}");
 }
 
 /// D-08: SIGKILL to the unit's MainPID leaves no member of the agent's group, and the
@@ -908,17 +1087,18 @@ fn a_hard_killed_runner_leaves_no_agent_and_the_unit_inactive() {
     );
 }
 
-/// D-07a: a stub agent leaves a SIGTERM-ignoring child, so after `devflow stop` sends
-/// SIGTERM the unit reads deactivating until the manager's SIGKILL. A `devflow discard`
-/// started meanwhile removes nothing until the unit reads inactive, then removes the
-/// run's state.
-#[test]
-#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
-fn discard_waits_for_a_straggler_in_a_deactivating_unit() {
-    assert_manager_answers();
-    let tail = "setsid sh -c 'trap \"\" TERM; sleep 60' </dev/null >/dev/null 2>&1 &\nsleep 120";
-    let phase = PhaseId::new(87);
-    let fixture = StartFixture::new(phase, tail);
+/// The stub agent's tail for the deactivating-unit scenarios: it leaves a child that
+/// ignores SIGTERM, so a stopped unit reads deactivating until the manager's SIGKILL. The
+/// child creates [`STRAGGLER_READY`] in the stub's logs dir once its trap is set.
+const STRAGGLER_TAIL: &str = "setsid sh -c 'trap \"\" TERM; : >\"@LOGS@/straggler-ready\"; sleep 60' \
+     </dev/null >/dev/null 2>&1 &\nsleep 120";
+
+/// The file [`STRAGGLER_TAIL`]'s child creates once it ignores SIGTERM.
+const STRAGGLER_READY: &str = "straggler-ready";
+
+/// Start `fixture`'s run in a worktree and wait until its agent has started and left
+/// its straggler, returning the guard that stops the unit.
+fn start_a_run_with_a_straggler(fixture: &StartFixture) -> UnitGuard {
     let guard = UnitGuard::named(fixture.unit());
     // In a worktree, so discard can remove the branch: `--no-worktree` checks it out in
     // the main checkout, which discard refuses.
@@ -934,21 +1114,139 @@ fn discard_waits_for_a_straggler_in_a_deactivating_unit() {
         &guard.unit,
         "the agent never started",
     );
-    std::thread::sleep(Duration::from_millis(500));
+    let ready = fixture.logs.path().join(STRAGGLER_READY);
+    wait_until(
+        || ready.is_file(),
+        &guard.unit,
+        "the straggler never set its TERM trap",
+    );
+    guard
+}
+
+/// Wait for `child` to exit, at most [`UNIT_FINISH_WAIT`], panicking with `what` and
+/// `unit`'s journal otherwise, and return its output.
+fn wait_for_child(mut child: std::process::Child, unit: &str, what: &str) -> Output {
+    let deadline = Instant::now() + UNIT_FINISH_WAIT;
+    while child.try_wait().expect("poll the child").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} after {UNIT_FINISH_WAIT:?}\njournal:\n{}",
+            journal_of(unit)
+        );
+        std::thread::sleep(UNIT_POLL);
+    }
+    child.wait_with_output().expect("the child's output")
+}
+
+/// D-07a, D-12: a stub agent leaves a SIGTERM-ignoring child, so after `devflow stop`
+/// sends SIGTERM the unit reads deactivating until the manager's SIGKILL. Stop holds the
+/// phase holder until the unit is down, so a `devflow discard` meanwhile is refused
+/// naming stop's pid and removes nothing, and succeeds once stop returns.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn discard_during_a_stop_of_a_deactivating_unit_is_refused_until_stop_returns() {
+    assert_manager_answers();
+    let phase = PhaseId::new(87);
+    let fixture = StartFixture::new(phase, STRAGGLER_TAIL);
+    let guard = start_a_run_with_a_straggler(&fixture);
 
     let number = phase.to_string();
     let root = fixture.root.display().to_string();
-    let mut stop = common::host_service_devflow(&fixture.home)
+    let stop = common::host_service_devflow(&fixture.home)
         .env("PATH", fixture.path(None))
         .args(["stop", "--phase", &number, &root])
         .current_dir(&fixture.root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn devflow stop");
+    let stop_pid = stop.id();
     wait_until(
         || unit_property(&guard.unit, "ActiveState") == "deactivating",
         &guard.unit,
         "the unit never read deactivating",
     );
+    let state_file = devflow_core::workflow::state_path(&fixture.root, phase);
+    let refused = devflow_in(&fixture, &["discard", "--phase", &number, &root]);
+    let state_after_refusal = unit_property(&guard.unit, "ActiveState");
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "discard ran during the stop:\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+    let holder = format!("another DevFlow verb holds phase {phase} (pid {stop_pid})");
+    assert!(
+        refused_stderr.contains(&holder),
+        "discard did not name stop as the holder ({holder}):\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+    assert!(
+        refused_stderr.contains("run this again once it returns"),
+        "discard's refusal did not say to run it again:\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+    assert_eq!(
+        state_after_refusal,
+        "deactivating",
+        "the unit left deactivating before discard returned, so the refusal is not \
+         known to have come while stop waited:\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+    assert!(
+        state_file.is_file(),
+        "the refused discard removed the state:\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+
+    let stopped = wait_for_child(stop, &guard.unit, "stop never returned");
+    assert!(
+        stopped.status.success() && String::from_utf8_lossy(&stopped.stdout).contains("stopped"),
+        "stop did not report stopped:\n{}",
+        text(&stopped)
+    );
+    let discarded = devflow_in(&fixture, &["discard", "--phase", &number, &root]);
+    assert!(
+        discarded.status.success() && !state_file.exists(),
+        "discard did not complete once stop returned:\n{}",
+        text(&discarded)
+    );
+}
+
+/// D-07a: with no DevFlow verb holding the phase, a unit put into deactivating by the
+/// manager alone (its runner gone, a SIGTERM-ignoring straggler left) is waited out by
+/// `devflow discard`, which removes nothing until the unit leaves deactivating and then
+/// removes the run's state.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn discard_with_no_stop_running_waits_out_a_deactivating_unit() {
+    assert_manager_answers();
+    let phase = PhaseId::new(90);
+    let fixture = StartFixture::new(phase, STRAGGLER_TAIL);
+    let guard = start_a_run_with_a_straggler(&fixture);
+
+    let stopping = systemctl(&["stop", "--no-block", &guard.unit]);
+    assert!(
+        stopping.status.success(),
+        "systemctl stop --no-block failed:\n{}",
+        String::from_utf8_lossy(&stopping.stderr)
+    );
+    wait_until(
+        || {
+            unit_property(&guard.unit, "ActiveState") == "deactivating"
+                && !fixture.runner_lock_live()
+        },
+        &guard.unit,
+        "the unit never read deactivating with its runner lock free",
+    );
+
+    let number = phase.to_string();
+    let root = fixture.root.display().to_string();
     let state_file = devflow_core::workflow::state_path(&fixture.root, phase);
     let mut discard = common::host_service_devflow(&fixture.home)
         .env("PATH", fixture.path(None))
@@ -958,23 +1256,36 @@ fn discard_waits_for_a_straggler_in_a_deactivating_unit() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn devflow discard");
-    while unit_property(&guard.unit, "ActiveState") == "deactivating" {
+    let mut waiting_passes = 0_u32;
+    loop {
+        // Both are read before the unit's state, so a unit seen deactivating afterwards
+        // was deactivating when they were taken.
+        let exited = discard.try_wait().expect("poll discard").is_some();
+        let state_kept = state_file.is_file();
+        if unit_property(&guard.unit, "ActiveState") != "deactivating" {
+            break;
+        }
         assert!(
-            state_file.is_file(),
+            !exited,
+            "discard returned while the unit read deactivating\njournal:\n{}",
+            journal_of(&guard.unit)
+        );
+        assert!(
+            state_kept,
             "discard acted while deactivating: the state is gone"
         );
+        waiting_passes += 1;
         std::thread::sleep(UNIT_POLL);
     }
-    let _ = stop.wait();
-    let deadline = Instant::now() + UNIT_FINISH_WAIT;
-    while discard.try_wait().expect("poll discard").is_none() {
-        assert!(Instant::now() < deadline, "discard never returned");
-        std::thread::sleep(UNIT_POLL);
-    }
-    let discarded = discard.wait_with_output().expect("discard's output");
+    assert!(
+        waiting_passes > 0,
+        "the unit left deactivating before discard was seen waiting"
+    );
+
+    let discarded = wait_for_child(discard, &guard.unit, "discard never returned");
     assert!(
         discarded.status.success() && !state_file.exists(),
-        "discard did not complete once the unit read inactive:\n{}",
+        "discard did not complete once the unit left deactivating:\n{}",
         text(&discarded)
     );
 }

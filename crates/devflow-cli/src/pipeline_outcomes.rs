@@ -180,12 +180,12 @@ fn rate_limit_gate_context(
         format!(
             "no usable fallback; for another agent now: `devflow stop --phase {phase}`, then \
              `devflow resume --phase {phase} --agent {other}`; {reset}; once this waiting \
-             supervisor has ended, `devflow resume --phase {phase}{agent}` relaunches the stage \
+             runner has ended, `devflow resume --phase {phase}{agent}` relaunches the stage \
              on the same agent. Cause: "
         )
     } else {
         format!(
-            "rate limited with no usable fallback; once this waiting supervisor has ended, \
+            "rate limited with no usable fallback; once this waiting runner has ended, \
              `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}. Cause: "
         )
     };

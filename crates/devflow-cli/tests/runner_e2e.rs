@@ -13,6 +13,7 @@ use devflow_core::gsd_reader::GsdStatus;
 use devflow_core::liveness::{self, Held};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
+use devflow_core::test_support::write_executable;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output};
@@ -890,8 +891,7 @@ fn a_stage_the_runner_cannot_start_opens_the_infra_gate_with_an_event() {
     let mut fixture = RunnerFixture::new(phase, Some(Stage::Plan), PASSING_CODEX);
     only_the_stub(&mut fixture);
     let stub = fixture.beside_agent("codex");
-    fs::write(&stub, "#!/nonexistent/devflow-test-interpreter\n").unwrap();
-    fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    write_executable(&stub, "#!/nonexistent/devflow-test-interpreter\n");
 
     let mut runner = fixture.spawn_runner();
     wait_for_exit_or_gate(&fixture, &mut runner);

@@ -48,5 +48,7 @@ jobs:
           # ci_parity_guards.rs asserts this.
           runCmd: |
             set -e
+            # #301: phase7_cli's waits get the CI-length budget; this container sees no CI.
+            export DEVFLOW_E2E_POLL_BUDGET_SECS=30
             git config --global --add safe.directory "$PWD"
             scripts/check.sh all

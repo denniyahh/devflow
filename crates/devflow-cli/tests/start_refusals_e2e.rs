@@ -7,8 +7,8 @@ mod common;
 
 use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
+use devflow_core::test_support::write_executable;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -101,8 +101,7 @@ struct FakeBin {
 fn fake_codex() -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("codex");
-    fs::write(&path, SUCCESS_AGENT).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&path, SUCCESS_AGENT);
     let path = dir.path().to_path_buf();
     FakeBin { _dir: dir, path }
 }
@@ -494,12 +493,17 @@ fn start_refuses_orphan_gate_files_naming_discard() {
 
 /// `devflow resume --phase 12` over `root`, with the fake agent on `PATH` and a reaper
 /// bound before it, so a resume that does launch has its run ended when the test ends.
-fn resume_phase(home: &common::HermeticHome, root: &Path) -> (Output, common::LaunchedRunReaper) {
+fn resume_phase(
+    home: &common::HermeticHome,
+    root: &Path,
+    extra: &[&str],
+) -> (Output, common::LaunchedRunReaper) {
     let reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(PHASE));
     let fake_bin = fake_codex();
     let parent = std::env::var_os("PATH").unwrap_or_default();
     let output = common::hermetic_devflow(home)
         .args(["resume", "--phase", &PHASE.to_string()])
+        .args(extra)
         .arg(root)
         .hermetic_path(format!(
             "{}:{}",
@@ -541,7 +545,7 @@ fn resume_refuses_a_finished_run_naming_close_out_or_discard() {
     });
     let before = state_bytes(root);
 
-    let (out, _reaper) = resume_phase(&home, root);
+    let (out, _reaper) = resume_phase(&home, root, &[]);
     let text = combined(&out);
     assert!(
         !out.status.success(),
@@ -567,6 +571,42 @@ fn resume_refuses_a_finished_run_naming_close_out_or_discard() {
     );
 }
 
+/// Restrictive verbs, through the binary: `resume --reviews` on a run stopped in Code is
+/// refused before any write, naming why and the plain resume, even with a REVIEWS.md.
+#[test]
+fn resume_reviews_on_a_run_stopped_in_code_is_refused() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".planning/phases/12-test/12-REVIEWS.md"),
+        "# reviews\n",
+    )
+    .unwrap();
+    save_phase_state(root, |state| {
+        state.verification_baseline_captured = true;
+        state.stage = devflow_core::stage::Stage::Code;
+        state.stopped = true;
+        state.stop_reason = Some("stopped via `devflow stop`".to_string());
+    });
+    let before = state_bytes(root);
+
+    let (out, _reaper) = resume_phase(&home, root, &["--reviews"]);
+    let text = combined(&out);
+    assert!(
+        !out.status.success()
+            && text.contains("halted after Plan")
+            && text.contains(&format!("devflow resume --phase {PHASE}")),
+        "resume --reviews on a run stopped in Code was not refused naming why: {text}"
+    );
+    assert_eq!(
+        state_bytes(root),
+        before,
+        "a refused resume --reviews changed the state: {text}"
+    );
+}
+
 /// 52.1 D-09.1: `resume` with no run state refuses, naming `devflow start --phase N`,
 /// and writes no state.
 #[test]
@@ -576,7 +616,7 @@ fn resume_with_no_state_names_start() {
     let root = repo.path();
     init_repo(root);
 
-    let (out, _reaper) = resume_phase(&home, root);
+    let (out, _reaper) = resume_phase(&home, root, &[]);
     let text = combined(&out);
     assert!(
         !out.status.success(),
@@ -833,8 +873,7 @@ fn fake_agents(programs: &[&str]) -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     for program in programs {
         let path = dir.path().join(program);
-        fs::write(&path, SUCCESS_AGENT).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&path, SUCCESS_AGENT);
     }
     let path = dir.path().to_path_buf();
     FakeBin { _dir: dir, path }
@@ -937,4 +976,233 @@ fn start_refuses_a_fallback_agent_without_an_ask_registration() {
         &["--agent", "codex", "--fallback-agent", "antigravity"],
     );
     assert_refused_without_registration(&home, &out, "antigravity");
+}
+
+/// The text of `start --reviews`'s refusal when the phase's REVIEWS.md is missing.
+const REVIEWS_REFUSAL: &str = "--reviews needs the phase's review file";
+
+/// D-04 (#250): `start --reviews` probes the base the run forks from, not the primary
+/// checkout: a REVIEWS.md only in the primary checkout's working tree is refused, before
+/// any run state, worktree or phase branch exists.
+#[test]
+fn start_reviews_with_the_reviews_file_only_in_the_primary_checkout_is_refused() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".planning/phases/12-test/12-REVIEWS.md"),
+        "reviews\n",
+    )
+    .unwrap();
+
+    let (out, _reaper) = start_phase(&home, root, &["--reviews"]);
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "start --reviews accepted a REVIEWS.md the base does not have: {text}"
+    );
+    assert!(
+        text.contains("12-REVIEWS.md") && text.contains("`develop`"),
+        "the refusal does not name 12-REVIEWS.md and the base: {text}"
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, PhaseId::new(PHASE)).exists(),
+        "a refused start --reviews left run state: {text}"
+    );
+    assert!(
+        !root.join(".worktrees/phase-12").exists(),
+        "a refused start --reviews created a worktree: {text}"
+    );
+    assert_eq!(
+        branch_tip(root, &phase_branch()),
+        None,
+        "a refused start --reviews created the phase branch: {text}"
+    );
+}
+
+/// D-04 control: a REVIEWS.md committed on the base is accepted even when the primary
+/// checkout's working tree lacks it, and the run's Plan reaches the agent as the reviews
+/// pass. Asserted on the agent's argv, not the state: the flag is spent once Plan
+/// completes, which the stub agent does at once.
+#[test]
+fn start_reviews_with_the_reviews_file_only_on_the_base_is_accepted() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    git(root, &["branch", "before-reviews"]);
+    fs::write(
+        root.join(".planning/phases/12-test/12-REVIEWS.md"),
+        "reviews\n",
+    )
+    .unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "reviews"]);
+    git(root, &["checkout", "-q", "before-reviews"]);
+    assert!(
+        !root.join(".planning/phases/12-test/12-REVIEWS.md").exists(),
+        "premise: the primary checkout lacks the REVIEWS.md"
+    );
+
+    let agents = tempfile::tempdir().unwrap();
+    let argv_file = agents.path().join("codex-argv");
+    write_executable(
+        &agents.path().join("codex"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n{}",
+            argv_file.display(),
+            SUCCESS_AGENT.trim_start_matches("#!/bin/sh\n")
+        ),
+    );
+    let parent = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", agents.path().display(), parent.to_string_lossy());
+
+    let (out, _reaper) = start_phase_on_path(&home, root, &["--reviews"], path.as_ref(), &[]);
+    let text = combined(&out);
+    assert!(
+        out.status.success() && !text.contains(REVIEWS_REFUSAL),
+        "start --reviews refused a REVIEWS.md that is on the base: {text}"
+    );
+    wait_for_settled(root);
+    let argv = fs::read_to_string(&argv_file).unwrap_or_default();
+    assert!(
+        argv.contains(&format!("plan-phase.md for phase {PHASE} --reviews")),
+        "start --reviews did not run Plan as a reviews pass: {argv}"
+    );
+}
+
+/// D-04 (F02): `start --reviews` accepts only `.planning/phases/NN-<slug>/NN-REVIEWS.md`
+/// on the base: a REVIEWS.md elsewhere under the phase directory, or one named for a plan
+/// rather than the phase, is refused before any run state, worktree or phase branch exists.
+#[test]
+fn start_reviews_with_only_lookalike_reviews_files_on_the_base_is_refused() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let dir = root.join(".planning/phases/12-test");
+    fs::create_dir_all(dir.join("archive")).unwrap();
+    fs::write(dir.join("archive/old-REVIEWS.md"), "old reviews\n").unwrap();
+    fs::write(dir.join("01-REVIEWS.md"), "plan reviews\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "lookalike reviews"]);
+
+    let (out, _reaper) = start_phase(&home, root, &["--reviews"]);
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains(REVIEWS_REFUSAL),
+        "start --reviews accepted lookalike REVIEWS.md files on the base: {text}"
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, PhaseId::new(PHASE)).exists(),
+        "a refused start --reviews left run state: {text}"
+    );
+    assert!(
+        !root.join(".worktrees/phase-12").exists(),
+        "a refused start --reviews created a worktree: {text}"
+    );
+    assert_eq!(
+        branch_tip(root, &phase_branch()),
+        None,
+        "a refused start --reviews created the phase branch: {text}"
+    );
+}
+
+/// D-13 (F01): the #285 warning comes after every refusal, so a refused start, here a
+/// `--reviews` start whose REVIEWS.md is only in the primary checkout, in a repo whose
+/// ignore rules lack GSD's derived files, prints none.
+#[test]
+fn a_refused_start_prints_no_gitignore_warning() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".planning/phases/12-test/12-REVIEWS.md"),
+        "reviews\n",
+    )
+    .unwrap();
+
+    let (out, _reaper) = start_phase(&home, root, &["--reviews"]);
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains(REVIEWS_REFUSAL),
+        "premise: start --reviews is refused: {text}"
+    );
+    assert!(
+        !text.contains(".gitignore"),
+        "a refused start printed the .gitignore warning: {text}"
+    );
+}
+
+/// D-13 (F03): an accepted start reads the ignore rules of the tree the run forks (its
+/// worktree, from the base), so a `.gitignore` only in the primary checkout's working
+/// tree does not silence the warning.
+#[test]
+fn start_warns_about_gsd_derived_files_from_the_run_checkout() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".gitignore"),
+        ".planning/state.json\n.planning/milestone.lock\n.gsd/\n",
+    )
+    .unwrap();
+
+    let (out, _reaper) = start_phase(&home, root, &[]);
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "premise: the start is accepted: {text}"
+    );
+    wait_for_settled(root);
+    let to_add: Vec<&str> = text
+        .lines()
+        .skip_while(|line| !line.contains("add these lines to .gitignore"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        to_add,
+        [".planning/state.json", ".planning/milestone.lock", ".gsd/"],
+        "start read the primary checkout's .gitignore, not the run's tree: {text}"
+    );
+}
+
+/// D-04, 52.1 D-27: the dry run probes no base tree, so with `--reviews` it names the
+/// REVIEWS.md check among those it skips; without the flag its line is unchanged.
+#[test]
+fn dry_run_with_reviews_names_the_reviews_check_as_not_checked() {
+    let not_checked_line = |extra: &[&str]| {
+        let home = common::HermeticHome::new();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        init_repo(root);
+        let (dry, _reaper) = start_phase(&home, root, extra);
+        let text = combined(&dry);
+        assert!(dry.status.success(), "premise: the dry run passes: {text}");
+        let line = text
+            .lines()
+            .find(|line| line.contains("not checked by the dry run"))
+            .unwrap_or_else(|| panic!("no skipped-checks line: {text}"))
+            .to_string();
+        (line, text)
+    };
+
+    let (line, out) = not_checked_line(&["--dry-run", "--reviews"]);
+    assert!(
+        line.contains("REVIEWS.md check on `develop`"),
+        "the dry run did not say it skips the REVIEWS.md check: {out}"
+    );
+    let (plain, _) = not_checked_line(&["--dry-run"]);
+    assert_eq!(
+        plain,
+        "not checked by the dry run: base currency (`develop` against its remote), phase \
+         reachability (phase 12 on `develop`), and the CONTEXT.md/PLAN.md checks on \
+         `develop`; a real start runs them after these checks",
+        "without --reviews the skipped-checks line changed"
+    );
 }
