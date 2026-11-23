@@ -1008,19 +1008,20 @@ mod tests {
     /// holds: the state a sibling test's fork leaves for the instant before
     /// its exec (999.222), kept until the returned guard is released.
     ///
-    /// Written through `File::create` on purpose: the reproduction needs this
-    /// process to hold a write descriptor on the launcher at the fork.
+    /// Written, with its mode, through `write_executable`; the reproduction needs this
+    /// process to hold a write descriptor on the launcher at the fork, so one is opened
+    /// (no create, no truncate) and held across `fork_held_before_exec`.
     fn launcher_whose_writer_a_fork_holds(
         fx: &Fixture,
     ) -> (PathBuf, crate::test_support::ForkHeldBeforeExec) {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
         let launcher = fx.home.join("launcher-with-a-held-writer");
-        let mut file = std::fs::File::create(&launcher).unwrap();
-        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        crate::test_support::write_executable(&launcher, "#!/bin/sh\nexit 0\n");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&launcher)
+            .unwrap();
         let held = crate::test_support::fork_held_before_exec();
-        drop(file);
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(writer);
         (launcher, held)
     }
 
