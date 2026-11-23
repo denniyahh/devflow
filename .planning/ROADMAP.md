@@ -57,7 +57,7 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 
 | Phase | Name | Requirements | Depends on | Status |
 |---|---|---|---|---|
-| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Executed — verification stale |
+| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Complete    |
 | 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Complete    |
 | 52.2 | Foreground Runner (INSERTED) | none (carries 52.1's D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27, D-08, D-15) | 52.1 | Complete    |
 | 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.2 (and through it 52.1 and 52 — the stage set must be final) | Complete    |
@@ -704,8 +704,8 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
-| 52 | 33/33 | Executed — verification stale | 2026-11-11 |
-| 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
+| 52 | 33/33 | Complete | 2026-11-11 |
+| 52.1 | 7/7 | Complete | 2026-11-15 |
 | 52.2 | 26/26 | Complete | 2026-11-17 |
 | 53 | 14/14 | Complete | 2026-11-20 |
 | 54 | 0/? | Not started | — |
