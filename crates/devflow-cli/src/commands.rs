@@ -14346,6 +14346,69 @@ mod tests {
         );
     }
 
+    /// #258 (D-11): a start whose systemd-run timed out and whose runner reads not live,
+    /// but whose state changed after start wrote it (a runner that ran, wrote and died),
+    /// keeps that state and names `status` and `discard`.
+    #[test]
+    fn a_timed_out_not_live_launch_keeps_a_state_that_progressed() {
+        const NAME: &str =
+            "commands::tests::a_timed_out_not_live_launch_keeps_a_state_that_progressed";
+        if run_launch_timeout_child(NAME).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5371);
+        let root = dir.path().to_path_buf();
+        crate::service::double::run_during_launch(move || {
+            workflow::update_state(&root, phase, |state| {
+                state.stage = Stage::Code;
+                Ok::<_, workflow::WorkflowError>(())
+            })
+            .expect("the stand-in runner moves the run to Code");
+        });
+        let err = start_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutLeaving(Ok("inactive")),
+        )
+        .expect_err("a launch with no live runner fails");
+        let kept = workflow::load_state(dir.path(), phase);
+        assert!(
+            err.contains("changed after start wrote it, so it was kept")
+                && err.contains("`devflow status`")
+                && err.contains("`devflow discard --phase 5371`")
+                && !err.contains("status --phase")
+                && kept.is_ok(),
+            "a timed-out launch cleared a run whose state had changed: {err}"
+        );
+    }
+
+    /// #258 control: with no change after start wrote the state, a timed-out launch whose
+    /// runner reads not live clears it, as before.
+    #[test]
+    fn a_timed_out_not_live_launch_clears_an_unchanged_state() {
+        const NAME: &str = "commands::tests::a_timed_out_not_live_launch_clears_an_unchanged_state";
+        if run_launch_timeout_child(NAME).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5372);
+        let error = start_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutLeaving(Ok("inactive")),
+        )
+        .expect_err("a launch with no live runner fails");
+        assert!(error.contains("phase 5372 was not launched"), "{error}");
+        assert!(
+            matches!(
+                workflow::load_state(dir.path(), phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "an unchanged state after a not-live timed-out launch is cleared: {error}"
+        );
+    }
+
     /// 999.244: a start whose systemd-run timed out while the unit is still activating
     /// keeps its state and names `status` and `discard`: the runner may yet start.
     #[test]

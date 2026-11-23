@@ -490,6 +490,21 @@ pub(crate) mod double {
         DOUBLE.with_borrow(|double| double.launch_end)
     }
 
+    thread_local! {
+        static DURING_LAUNCH: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Run `effect` once, in the next cfg(test) [`super::launch_runner_unit`] on this
+    /// thread, before it reports its [`LaunchEnd`]: stands in for what a runner wrote
+    /// before it died.
+    pub(crate) fn run_during_launch(effect: impl FnOnce() + 'static) {
+        DURING_LAUNCH.with_borrow_mut(|slot| *slot = Some(Box::new(effect)));
+    }
+
+    pub(super) fn take_during_launch() -> Option<Box<dyn FnOnce()>> {
+        DURING_LAUNCH.with_borrow_mut(Option::take)
+    }
+
     pub(super) fn record_stop() {
         DOUBLE.with_borrow_mut(|double| double.stop_calls += 1);
     }
@@ -823,6 +838,9 @@ pub(crate) fn launch_runner_unit(
         ))
     })?;
     let timed_out = |unit: &str| launch_timeout_error(unit, "systemd-run (test double) timed out");
+    if let Some(effect) = double::take_during_launch() {
+        effect();
+    }
     match double::launch_end() {
         double::LaunchEnd::TimedOutLeaving(state) => {
             double::set_unit_state(state);
