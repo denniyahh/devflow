@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 1
+open_count: 3
 waived_count: 3
 fixed_count: 16
-total_count: 20
-last_updated: 2026-11-19T18:23:22.482Z
+total_count: 22
+last_updated: 2026-11-23T06:36:09.198Z
 ---
 
 # Broken Windows Ledger
@@ -35,6 +35,8 @@ last_updated: 2026-11-19T18:23:22.482Z
 | 18 | 50 | deviation | crates/devflow-cli/tests/phase7_cli.rs |  | 50-03 Task 1 gate runs all of phase7_cli under nextest, but suite_reap_audit always fails there (per-process REAPED counter stays 0; same on pre-migration HEAD file). Sentinel-HOME check run instead with it excluded under nextest (41/41) and all 28 under cargo test; see 50-03 deferred-items.md | fixed |  | 2026-10-17T11:53:12.257Z | 2026-10-17T16:27:14.778Z |
 | 19 | 50 | skipped-test | crates/devflow-cli/src/commands.rs | 8823 | Under uid 0 (the pinned container and CI) doctor_reports_an_unlistable_socket_dir_instead_of_nothing (50-12) and the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state (50-15) skip, since root lists a 0o000 dir; their assertions run only on a non-root host (999.113 pattern, 50-16 cdb6efc) | fixed |  | 2026-10-18T18:26:52.972Z | 2026-10-19T11:37:40.414Z |
 | 20 | 53 | deviation | crates/devflow-cli/src/pipeline_launch.rs |  | 53-14: owned-file rule for a registration outside .devflow/ not built (no driver writes one); its three named tests absent | open |  | 2026-11-19T18:23:22.482Z |  |
+| 21 | 53.2 | unrun-verify | scripts/check-in-container.sh |  | 53.2-08 Task 3 verify: shellcheck exits 1 on pre-existing SC2155/SC1091 (issue #332) | open |  | 2026-11-23T05:47:16.737Z |  |
+| 22 | 53.2 | deviation | crates/devflow-cli/src/main.rs |  | 53.2-11 measured #178 with TMPDIR outside the checkout: project_root walk-up crosses git roots (#335) | open |  | 2026-11-23T06:36:09.198Z |  |
 
 ````json
 [
@@ -279,6 +281,32 @@ last_updated: 2026-11-19T18:23:22.482Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-11-19T18:23:22.482Z",
+    "resolved_at": null,
+    "milestone": "v4.0"
+  },
+  {
+    "id": 21,
+    "kind": "unrun-verify",
+    "phase": "53.2",
+    "file": "scripts/check-in-container.sh",
+    "line": null,
+    "description": "53.2-08 Task 3 verify: shellcheck exits 1 on pre-existing SC2155/SC1091 (issue #332)",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-11-23T05:47:16.737Z",
+    "resolved_at": null,
+    "milestone": "v4.0"
+  },
+  {
+    "id": 22,
+    "kind": "deviation",
+    "phase": "53.2",
+    "file": "crates/devflow-cli/src/main.rs",
+    "line": null,
+    "description": "53.2-11 measured #178 with TMPDIR outside the checkout: project_root walk-up crosses git roots (#335)",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-11-23T06:36:09.198Z",
     "resolved_at": null,
     "milestone": "v4.0"
   }

@@ -367,14 +367,7 @@ mod tests {
             body = body,
             exit_code = exit_code,
         );
-        std::fs::write(&stub, script).expect("write pi stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
-        }
+        crate::test_support::write_executable(&stub, &script);
         dir
     }
 

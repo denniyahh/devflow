@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: 54
 current_phase_name: Decision Triage
 status: planning
-stopped_at: Phase 53.2 context gathered
-last_updated: "2026-11-23T15:22:21.643Z"
-last_activity: 2026-11-22
-last_activity_desc: Phase 53.1 learnings extracted
-state_head: c23ba65bd673e7d3a73921d1b0a9d05bae7e4256
+stopped_at: Phase 53.2 complete, ready to plan Phase 54
+last_updated: "2026-11-23T20:01:59.036Z"
+last_activity: 2026-11-23
+last_activity_desc: Phase 53.2 complete, transitioned to Phase 54
+state_head: 9b8e8fc50f75eef6a091ea18c275bbe4dd134282
 progress:
   total_phases: 9
   completed_phases: 1
-  total_plans: 88
-  completed_plans: 88
+  total_plans: 107
+  completed_plans: 107
   percent: 11
 ---
 
@@ -77,7 +77,7 @@ Phase 51 (Rate-Limit Agent Failover) closed v3.0.0 on 2026-11-08: see `.planning
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-11-21)
+See: `.planning/PROJECT.md` (updated 2026-11-23)
 
 **Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
 continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
@@ -181,7 +181,7 @@ change earns 2.0.
 Phase: 54 — Decision Triage
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-11-22 — Phase 53.1 learnings extracted
+Last activity: 2026-11-23
 
 
 ## Recently Shipped
@@ -698,6 +698,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 261120-89i | Mark 53-UAT complete (3/3 passed) and 53-VERIFICATION passed with UAT citations | 2026-11-20 | f71d9ec | [261120-89i-update-53-uat-md-status-summary-counts-a](./quick/261120-89i-update-53-uat-md-status-summary-counts-a/) |
+| 261123-bv2 | Fix #341 by option B: discard refuses while stop holds the phase holder; rewrite the straggler service_e2e test, add service suite to final gate | 2026-11-23 | 921fca6 | [261123-bv2-fix-341-by-option-b-discard-refuses-whil](./quick/261123-bv2-fix-341-by-option-b-discard-refuses-whil/) |
+| 261123-fp8 | Fix the Phase 53.2 external code review findings (VERDICTS.md, operator 2026-11-23) | 2026-11-23 | 56f2eac | [261123-fp8-fix-the-phase-53-2-external-code-review-](./quick/261123-fp8-fix-the-phase-53-2-external-code-review-/) |
 
 ## Decisions
 
@@ -1060,6 +1062,31 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.1]: 53.1-07: the planning-root check compares canonical paths (falling back to the given path), so a symlinked evidence root is not read as a scoped planning directory
 - [Phase 53.1]: 53.1-07: a phase.complete reply with all four write flags false commits nothing and records ok true, committed false, commit_failure null
 - [Phase 53.1]: 53.1-08: 999.251's Plan->Validate residual filed as 999.260; the resume row names it
+- [Phase 53.2]: 53.2-01: D-02 discuss-before-plan is prompt text only (shared no_plan_branch in both Plan renderers); no StageIntent variant, no driver/refusal/preflight change; codex keeps its RequiresExistingArtifact Plan refusal
+- [Phase 53.2]: 53.2-01: the Plan prompt names no GSD mode flag, and a discussion that writes no CONTEXT.md is a reported stage failure
+- [Phase 53.2]: 53.2-02: #265 not reproduced (base/after/changed 40/40 each); reap decided on one reading with /proc diagnostics; #265 stays open (D-16 branch b)
+- [Phase 53.2]: 53.2-02: gsd_reader.rs launcher_whose_writer_a_fork_holds kept as raw writer (held-writer reproduction fixture); 53.2-07 allowlist must name it
+- [Phase 53.2]: 53.2-03: every 0o755 site in the CLI's src stubs and shared e2e fakes writes text, so all converted to write_executable; none left for 53.2-07's allowlist
+- [Phase 53.2]: 53.2-04: every 0o755 site in the eleven CLI e2e files writes text, so none is left for 53.2-07's allowlist
+- [Phase 53.2]: 53.2-05: an open-branch base is resolve-checked only when it has branches to compare; a run whose recorded base equals the project's is labelled the run's base
+- [Phase 53.2]: 53.2-06: the cross-phase readiness control holds .runner-01 via the test binary re-run as an #[ignore] child (claim_runner_lock), not flock(1), so it does not depend on the pinned image
+- [Phase 53.2]: 53.2-07: raw stub writer guard keeps 5 set_permissions sites with reasons (write_executable chmod, ETXTBSY control, gsd_reader held-writer launcher and 0o644 chmod, registry dir mode)
+- [Phase 53.2]: 53.2-08: no phase7_cli caller expects a helper timeout, so all seven wait helpers panic on the shared poll budget
+- [Phase 53.2]: 53.2-09: #310 left open per D-16; base and after loops both 0/40 target failures, so the post-release read waits are by construction
+- [Phase 53.2]: 53.2-10: StageIntent::PlanReviews is declared last on the enum so semver-checks reports only the planned variant addition, not discriminant shifts
+- [Phase 53.2]: 53.2-11: #178 measured with TMPDIR outside the checkout; zero leak, closed with no code change; project_root walk-up defect filed as #335
+- [Phase 53.2]: 53.2-12: the #258 resume sibling reproduced; re_mark_stopped_after_failed_launch keeps a stop_reason its runner wrote
+- [Phase 53.2]: 53.2-12: a NotLive timed-out start clears its run only on JSON equality with the state read back after start_reserved
+- [Phase 53.2]: 53.2-13: stop claims the phase holder via liveness::claim_phase_holder right before stop_unit (no write-lock barrier) and holds it through the reload; a stop while any verb holds the phase now refuses, Live runner or not
+- [Phase 53.2]: 53.2-14: the --until halt records its transition's target in State::until_halt_target; resume_advance reads it (else Stage::next); enter_stage clears it on every stage entry
+- [Phase 53.2]: start --reviews checks NN-REVIEWS.md on the resolved base (phase_artifact_on_base), after the CONTEXT.md refusal; a primary-checkout copy is refused
+- [Phase 53.2]: resume re-renders Plan from state, so a stopped reviews pass needs no resume flag; a run halted after Plan takes 53.2-17's resume --reviews
+- [Phase 53.2]: resume --reviews reruns the halted Plan as a reviews pass and keeps the --until plan cap; a plain resume then advances
+- [Phase 53.2]: resume --reviews is refused before any write unless the --until plan cap halted Plan, and without NN-REVIEWS.md in the run's checkout
+- [Phase 53.2]: a failed resume --reviews launch restores the --until plan halt so the run stays retryable
+- [Phase 53.2]: 53.2-18: #337 replaces D-14's readiness clause; the fake systemd-run reads a start only from the runner's READY=1 on a per-launch NOTIFY_SOCKET listener, not from a held runner lock in /proc fdinfo
+- [Phase 53.2]: 53.2-19: a failed resume launch whose state changed since resume committed it is kept with its reviews pass; the --until plan halt is restored only over the untouched state (#338 WR-01)
+- [Phase 53.2]: 53.2-19: the #285 warning probes check-ignore --no-index and gives git rm --cached advice for tracked GSD derived files under a separate header (#338 WR-02)
 
 ## Roadmap Evolution
 
@@ -1259,12 +1286,30 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.1 P06 | 17min | 3 tasks | 3 files |
 | Phase 53.1 P07 | 17min | 3 tasks | 6 files |
 | Phase 53.1 P08 | 8min | 2 tasks | 2 files |
+| Phase 53.2 P01 | 9 min | 2 tasks | 1 files |
+| Phase 53.2 P02 | 17 min | 3 tasks | 4 files |
+| Phase 53.2 P03 | 9 min | 2 tasks | 5 files |
+| Phase 53.2 P04 | 3 min | 3 tasks | 11 files |
+| Phase 53.2 P05 | 9min | 2 tasks | 2 files |
+| Phase 53.2 P06 | 13min | 2 tasks | 2 files |
+| Phase 53.2 P07 | 6min | 2 tasks | 2 files |
+| Phase 53.2 P08 | 7 min | 3 tasks | 7 files |
+| Phase 53.2 P09 | 27min | 2 tasks | 1 files |
+| Phase 53.2 P10 | 13min | 2 tasks | 2 files |
+| Phase 53.2 P11 | unrecorded | 3 tasks | 0 files |
+| Phase 53.2 P12 | 14min | 3 tasks | 5 files |
+| Phase 53.2 P13 | 35min | 2 tasks | 7 files |
+| Phase 53.2 P14 | 10min | 2 tasks | 4 files |
+| Phase 53.2 P15 | 14 min | 3 tasks | 8 files |
+| Phase 53.2 P17 | 10 min | 2 tasks | 5 files |
+| Phase 53.2 P18 | 11 min | 2 tasks | 2 files |
+| Phase 53.2 P19 | 9min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-11-23T01:27:31.953Z
-**Stopped at:** Phase 53.2 context gathered
-**Resume file:** .planning/phases/53.2-wsx-ude-first-use-and-dogfood-remediation/53.2-CONTEXT.md
+**Last session:** 2026-11-23T09:28:46.658Z
+**Stopped at:** Phase 53.2 complete, ready to plan Phase 54
+**Resume file:** None
 
 ## Operator Next Steps
 

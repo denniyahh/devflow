@@ -193,13 +193,26 @@ pub enum StageIntent {
         /// The operator's note for this relaunch of the stage, if any.
         relaunch_note: Option<String>,
     },
+    /// The Plan stage of a reviews pass (D-04), the twin of
+    /// [`StageIntent::PlanGaps`]: incorporates the phase's NN-REVIEWS.md
+    /// through `/gsd-plan-phase N --reviews`. Unlike [`StageIntent::Plan`] it
+    /// has no idempotency short-circuit, because the phase's PLAN.md files
+    /// exist by now and the pass must run anyway. Declared last so the
+    /// earlier variants keep their discriminants.
+    PlanReviews {
+        phase: PhaseId,
+        /// The operator's note for this relaunch of the stage, if any.
+        relaunch_note: Option<String>,
+    },
 }
 
 impl StageIntent {
     /// The stage this intent drives.
     pub fn stage(&self) -> Stage {
         match self {
-            StageIntent::Plan { .. } | StageIntent::PlanGaps { .. } => Stage::Plan,
+            StageIntent::Plan { .. }
+            | StageIntent::PlanGaps { .. }
+            | StageIntent::PlanReviews { .. } => Stage::Plan,
             StageIntent::Code { .. } => Stage::Code,
             StageIntent::Validate { .. } => Stage::Validate,
         }
@@ -237,6 +250,7 @@ impl StageIntent {
         match &mut self {
             StageIntent::Plan { relaunch_note, .. }
             | StageIntent::PlanGaps { relaunch_note, .. }
+            | StageIntent::PlanReviews { relaunch_note, .. }
             | StageIntent::Code { relaunch_note, .. }
             | StageIntent::Validate { relaunch_note, .. } => *relaunch_note = note,
         }
@@ -439,10 +453,21 @@ fn validate_stage_prompt(phase: PhaseId, notes: &str) -> String {
 /// v1 skip-stage config flags removed by the 2026-06-19 architecture
 /// decision — a stage with no pre-existing artifact still runs in full.
 /// It serves Plan only.
+///
+/// With no PLAN.md, the prompt branches on the phase's CONTEXT.md
+/// ([`no_plan_branch`], D-02, #246): with none, the agent runs
+/// `/gsd-discuss-phase N` first, every question through `devflow_ask` as a
+/// `discuss` question, then `/gsd-plan-phase N`; with one, it runs
+/// `/gsd-plan-phase N` as before.
 fn idempotent_stage_prompt(phase: PhaseId, notes: &str) -> String {
     let artifact = "PLAN.md";
     let command = gsd_command_for(Stage::Plan, phase);
     let padded = phase.padded();
+    let branch = no_plan_branch(
+        &padded,
+        &format!("Run the GSD workflow command:\n\n\x20   /gsd-discuss-phase {phase}\n\n"),
+        &format!("run the GSD workflow command for this stage:\n\n\x20   {command}\n\n"),
+    );
     format!(
         "First check whether this stage's deliverable already exists:\n\
         \n\
@@ -454,11 +479,40 @@ fn idempotent_stage_prompt(phase: PhaseId, notes: &str) -> String {
         \n\
         DEVFLOW_RESULT: {{\"status\": \"success\"}}\n\
         \n\
-        - If it does NOT exist: run the GSD workflow command for this stage:\n\
-        \n\
-        \x20   {command}\n\
-        \n\
+        {branch}\
         {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
+    )
+}
+
+/// The Plan prompt's arm for a phase with no PLAN.md (D-02, #246): probe for
+/// the phase's CONTEXT.md, and with none run the discussion before planning.
+///
+/// `discuss_step` and `plan_step` say how this renderer runs each GSD
+/// workflow (a slash command, or a workflow file); each ends with a blank
+/// line. The discussion is told to send every question, free text included,
+/// through `devflow_ask`, because under DevFlow's one-shot launch no next
+/// user message ever comes (RESEARCH Pitfall 1). After it, the PLAN.md probe
+/// runs again, because a project that auto-advances chains discuss into
+/// plan-phase itself (Pitfall 2), and a discussion that wrote no CONTEXT.md
+/// is a reported failure rather than a silent success. The text names no GSD
+/// mode flag at all, so the Plan prompt never carries
+/// [`AUTO_CHAIN_PRESERVING_FLAG`].
+fn no_plan_branch(padded: &str, discuss_step: &str, plan_step: &str) -> String {
+    format!(
+        "- If it does NOT exist: check whether the phase has a discussion context:\n\
+        \n\
+        ls .planning/phases/{padded}-*/{padded}-*CONTEXT.md 2>/dev/null\n\
+        \n\
+        - If no CONTEXT.md exists: discuss the phase first. {discuss_step}\
+        Run the discussion interactively, exactly as named here, adding no flags. Send \
+        every question it asks through `devflow_ask` with kind `discuss`, including a \
+        free-text \"Other\" follow-up, and never end your turn to wait for a next user \
+        message: none will come. When the discussion has finished, check for the \
+        CONTEXT.md again. If it still does not exist, do not plan: report the stage \
+        failed, naming the missing CONTEXT.md in the reason. Otherwise run the PLAN.md \
+        check above again. If it now finds a plan, the stage's work is done; if it finds \
+        none, {plan_step}\
+        - If CONTEXT.md EXISTS: {plan_step}"
     )
 }
 
@@ -473,6 +527,18 @@ fn gaps_plan_prompt(phase: PhaseId, notes: &str) -> String {
     format!(
         "Validation reported gaps. Plan their closure with the GSD workflow command for \
         this stage:\n\n    {command}\n\n{ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
+    )
+}
+
+/// The reviews pass's Plan prompt (D-04, #250): run
+/// `/gsd-plan-phase N --reviews`, which replans the phase from its
+/// REVIEWS.md. Like [`gaps_plan_prompt`] it has no idempotency short-circuit
+/// and no discuss branch: the phase's plans exist by now (Pitfall 4).
+fn reviews_plan_prompt(phase: PhaseId, notes: &str) -> String {
+    let command = format!("{} --reviews", gsd_command_for(Stage::Plan, phase));
+    format!(
+        "External review feedback for this phase is in its REVIEWS.md. Replan with the GSD \
+        workflow command for this stage:\n\n    {command}\n\n{ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -520,6 +586,10 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
             phase,
             relaunch_note,
         } => gaps_plan_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
+        StageIntent::PlanReviews {
+            phase,
+            relaunch_note,
+        } => reviews_plan_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
         StageIntent::Code {
             phase,
             fix: None,
@@ -572,6 +642,14 @@ pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> Strin
             workflow_root,
             &note_blocks(None, relaunch_note.as_deref()),
         ),
+        StageIntent::PlanReviews {
+            phase,
+            relaunch_note,
+        } => workflow_reviews_plan_prompt(
+            *phase,
+            workflow_root,
+            &note_blocks(None, relaunch_note.as_deref()),
+        ),
         StageIntent::Plan {
             phase,
             relaunch_note,
@@ -604,9 +682,23 @@ pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> Strin
     }
 }
 
+/// The workflow-style [`idempotent_stage_prompt`]: the same PLAN.md
+/// short-circuit and the same [`no_plan_branch`], naming the discuss-phase
+/// and plan-phase workflow files instead of slash commands.
 fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> String {
     let artifact = "PLAN.md";
     let padded = phase.padded();
+    let branch = no_plan_branch(
+        &padded,
+        &format!(
+            "Read and follow the GSD workflow file at {workflow_root}/discuss-phase.md \
+            for phase {phase}.\n\n"
+        ),
+        &format!(
+            "read and follow the GSD workflow file at {workflow_root}/plan-phase.md \
+            for phase {phase}.\n\n"
+        ),
+    );
     format!(
         "First check whether this stage's deliverable already exists:\n\
         \n\
@@ -618,9 +710,7 @@ fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> Str
         \n\
         DEVFLOW_RESULT: {{\"status\": \"success\"}}\n\
         \n\
-        - If it does NOT exist: read and follow the GSD workflow file at \
-        {workflow_root}/plan-phase.md for phase {phase}.\n\
-        \n\
+        {branch}\
         {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
@@ -632,6 +722,18 @@ fn workflow_gaps_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -
         "Validation reported gaps. Read and follow the GSD workflow file at \
         {workflow_root}/plan-phase.md for phase {phase} --gaps, to plan their closure. The \
         `--gaps` flag is part of the workflow invocation and must be preserved verbatim.\n\n\
+        {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
+    )
+}
+
+/// The workflow-style [`reviews_plan_prompt`]: the same pass, naming the
+/// plan-phase workflow file in its `--reviews` mode instead of a slash command.
+fn workflow_reviews_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> String {
+    format!(
+        "External review feedback for this phase is in its REVIEWS.md. Read and follow the \
+        GSD workflow file at {workflow_root}/plan-phase.md for phase {phase} --reviews, to \
+        replan the phase incorporating that feedback. The `--reviews` flag is part of the \
+        workflow invocation and must be preserved verbatim.\n\n\
         {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
@@ -1449,6 +1551,10 @@ mod tests {
                 phase,
                 relaunch_note: None,
             },
+            StageIntent::PlanReviews {
+                phase,
+                relaunch_note: None,
+            },
             StageIntent::Validate {
                 phase,
                 relaunch_note: None,
@@ -1527,7 +1633,7 @@ mod tests {
     #[test]
     fn every_stage_prompt_routes_questions_through_devflow_ask() {
         let prompts = every_rendered_prompt();
-        assert_eq!(prompts.len(), 6 * 8, "six drivers times eight intents");
+        assert_eq!(prompts.len(), 6 * 9, "six drivers times nine intents");
         let mut wrong = Vec::new();
         for (label, prompt) in &prompts {
             let completion = prompt
@@ -1745,10 +1851,16 @@ mod tests {
             .into_iter()
             .map(|stage| StageIntent::for_stage(stage, phase))
             // The gaps Plan pass (52-27) carries the relaunch note too.
-            .chain([StageIntent::PlanGaps {
-                phase,
-                relaunch_note: None,
-            }])
+            .chain([
+                StageIntent::PlanGaps {
+                    phase,
+                    relaunch_note: None,
+                },
+                StageIntent::PlanReviews {
+                    phase,
+                    relaunch_note: None,
+                },
+            ])
             .map(|intent| intent.with_relaunch_note(relaunch_note.map(str::to_string)))
             .collect()
     }
@@ -1816,6 +1928,132 @@ mod tests {
                 "control, {style}: the ordinary Plan prompt does not run --gaps:\n{prompt}"
             );
         }
+    }
+
+    /// D-02 (#246): a Plan launch on a phase with no CONTEXT.md runs
+    /// `/gsd-discuss-phase N` first, with every question through
+    /// `devflow_ask` as a `discuss` question, then plan-phase. The prompt
+    /// names no GSD mode flag, not even in a prohibition, so
+    /// `the_plan_prompt_never_carries_the_chain_flag_token` keeps holding.
+    #[test]
+    fn plan_prompt_runs_discuss_when_the_phase_has_no_context() {
+        let prompt = render_claude_style(&StageIntent::for_stage(Stage::Plan, PhaseId::new(7)));
+        let plan_probe = prompt.find("ls .planning/phases/07-*/07-*PLAN.md 2>/dev/null");
+        let context_probe = prompt.find("ls .planning/phases/07-*/07-*CONTEXT.md 2>/dev/null");
+        let discuss = prompt.find("/gsd-discuss-phase 7\n");
+        let last_plan = prompt.rfind("/gsd-plan-phase 7\n");
+        let ordered = matches!(
+            (plan_probe, context_probe, discuss, last_plan),
+            (Some(plan), Some(context), Some(discuss), Some(last))
+                if plan < context && context < discuss && discuss < last
+        );
+        assert!(
+            ordered && prompt.contains("kind `discuss`"),
+            "the Plan prompt has no discuss-before-plan branch: {prompt}"
+        );
+        for flag in ["--auto", "--chain", "--power"] {
+            assert!(
+                !prompt.contains(flag),
+                "the discuss branch names a GSD flag: {prompt}"
+            );
+        }
+    }
+
+    /// D-02 (#246): the workflow-style Plan prompt (pi's route) carries the
+    /// same discuss-before-plan branch, naming the workflow files instead of
+    /// slash commands, and no GSD mode flag.
+    #[test]
+    fn workflow_plan_prompt_runs_discuss_when_the_phase_has_no_context() {
+        let intent = StageIntent::for_stage(Stage::Plan, PhaseId::new(7));
+        let prompt = render_workflow_style(&intent, "/workflows");
+        let has_branch = [
+            "ls .planning/phases/07-*/07-*CONTEXT.md 2>/dev/null",
+            "/workflows/discuss-phase.md",
+            "/workflows/plan-phase.md",
+            "kind `discuss`",
+        ]
+        .iter()
+        .all(|wording| prompt.contains(wording));
+        let names_no_command_or_flag = !prompt.contains("/gsd-")
+            && ["--auto", "--chain", "--power"]
+                .iter()
+                .all(|flag| !prompt.contains(flag));
+        assert!(
+            has_branch && names_no_command_or_flag,
+            "the workflow-style Plan prompt has no discuss-before-plan branch: {prompt}"
+        );
+    }
+
+    /// D-02 control: the gaps Plan pass runs with the phase's plans already
+    /// written, so neither style carries the discuss branch.
+    #[test]
+    fn gaps_plan_prompt_has_no_discuss_branch() {
+        let gaps = StageIntent::PlanGaps {
+            phase: PhaseId::new(7),
+            relaunch_note: None,
+        };
+        for prompt in [
+            render_claude_style(&gaps),
+            render_workflow_style(&gaps, "/workflows"),
+        ] {
+            assert!(
+                !prompt.contains("discuss-phase") && !prompt.contains("CONTEXT.md"),
+                "the gaps Plan prompt must not run discuss: {prompt}"
+            );
+        }
+    }
+
+    /// D-04 (#250): the reviews Plan pass runs `plan-phase --reviews` with
+    /// the phase's plans already written, so its claude-style prompt has no
+    /// PLAN.md short-circuit and no discuss branch (Pitfall 4).
+    #[test]
+    fn reviews_plan_prompt_skips_the_plan_probe() {
+        let intent = StageIntent::PlanReviews {
+            phase: PhaseId::new(7),
+            relaunch_note: None,
+        };
+        let prompt = render_claude_style(&intent);
+        let runs_reviews = prompt.contains("/gsd-plan-phase 7 --reviews");
+        let no_probe = !prompt
+            .contains("First check whether this stage's deliverable already exists")
+            && PLAN_SHORT_CIRCUIT
+                .iter()
+                .all(|wording| !prompt.contains(wording));
+        assert!(
+            runs_reviews && no_probe && !prompt.contains("discuss-phase"),
+            "the reviews Plan prompt must run plan-phase --reviews with no plan probe: {prompt}"
+        );
+        assert_eq!(intent.stage(), Stage::Plan);
+        let noted = intent.with_relaunch_note(Some("n".to_string()));
+        assert!(
+            matches!(
+                &noted,
+                StageIntent::PlanReviews { relaunch_note: Some(note), .. } if note == "n"
+            ),
+            "the relaunch note lands on the reviews intent: {noted:?}"
+        );
+    }
+
+    /// D-04 (#250): the workflow-style reviews Plan prompt (codex, pi) names
+    /// plan-phase.md in its `--reviews` mode, and carries no slash command,
+    /// PLAN.md short-circuit or discuss branch.
+    #[test]
+    fn workflow_reviews_plan_prompt_runs_plan_phase_in_reviews_mode() {
+        let intent = StageIntent::PlanReviews {
+            phase: PhaseId::new(7),
+            relaunch_note: None,
+        };
+        let prompt = render_workflow_style(&intent, "/workflows");
+        let runs_reviews = prompt.contains("/workflows/plan-phase.md for phase 7 --reviews");
+        let carries_nothing_else = !prompt.contains("/gsd-")
+            && !prompt.contains("discuss-phase")
+            && PLAN_SHORT_CIRCUIT
+                .iter()
+                .all(|wording| !prompt.contains(wording));
+        assert!(
+            runs_reviews && carries_nothing_else,
+            "the workflow-style reviews prompt is wrong: {prompt}"
+        );
     }
 
     #[test]

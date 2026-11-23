@@ -1,0 +1,6 @@
+# devflow-core semver: accept-break (operator, 2026-11-22, devflow_ask 18e88967a11a6ead, recorded in 53.2-RESEARCH.md "Operator answers"); D-19's no-public-break premise corrected, tier B
+# Matching rule: each non-comment, non-blank line is a fixed string; an item that `cargo semver-checks` lists under `Failed in:` is planned when its line contains one of them. A module group ends in `::`; an exact item ends in `,` so that it cannot match a longer name.
+# Rule for later plans: when a run lists an item that no pattern matches, a plan adds the item's exact printed form under its own comment line only if its own PLAN.md names the removal (by item, or as a variant or field of a type it changes), and says so in its SUMMARY. Fields, variants and methods print without their module path, so this happens. Any other listed item is a stop: report it as an unplanned removal and do not add it.
+
+# 53.2-10: StageIntent::PlanReviews, a variant added to an exhaustive enum (semver-checks prints it with one colon and a trailing ` in <path>`, so the pattern ends in ` in` to keep it from matching a longer name)
+variant StageIntent:PlanReviews in

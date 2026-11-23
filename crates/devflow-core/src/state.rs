@@ -197,6 +197,14 @@ pub struct State {
     /// interception in `transition()`).
     #[serde(default)]
     pub stop_until: Option<Stage>,
+    /// The stage the transition an `--until` halt intercepted was moving to
+    /// (#281, D-09), written by that halt. The resume that advances past the
+    /// halt launches it and clears it as it enters the stage, so no later
+    /// resume reuses it. `None` means no halt recorded a target, OR the state
+    /// was written by a binary predating this field: a resume then advances to
+    /// [`Stage::next`] of the halted stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_halt_target: Option<Stage>,
     /// Set by `transition()` when `stop_until` names the stage just
     /// completed — a terminal-but-not-failed halt short of Ship (20c).
     /// `false` for a normal in-flight or completed-to-Ship phase, and for
@@ -394,6 +402,21 @@ pub struct State {
     /// field".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gap_closure_pass: bool,
+    /// Whether the run's Plan stage is a reviews pass (D-04, #250): Plan runs
+    /// `/gsd-plan-phase N --reviews`, replanning the phase from its
+    /// REVIEWS.md.
+    ///
+    /// Set by `devflow start --reviews`, or by `devflow resume --reviews` on a run
+    /// its `--until plan` cap halted after Plan. Read by the Plan prompt on every
+    /// launch, a resume included, so a stopped reviews pass relaunches as one
+    /// with no resume flag. Cleared when the run enters another stage and by
+    /// the `--until` halt after Plan, so a later gap-closure Plan renders its
+    /// gaps pass and a halted run carries no spent flag.
+    ///
+    /// `false` also means "the state was written by a binary predating this
+    /// field".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reviews_pass: bool,
 }
 
 /// Supported coding agents.
@@ -470,6 +493,7 @@ impl State {
             worktree_path: None,
             session_id: None,
             stop_until: None,
+            until_halt_target: None,
             stopped: false,
             stop_reason: None,
             finished: false,
@@ -486,6 +510,7 @@ impl State {
             abort_requested: None,
             validate_pass_head: None,
             gap_closure_pass: false,
+            reviews_pass: false,
         }
     }
 }
@@ -1127,6 +1152,46 @@ mod tests {
         let legacy: State = serde_json::from_str(&without)
             .expect("a state predating base_branch must still deserialize");
         assert_eq!(legacy.base_branch, None);
+    }
+
+    /// #281 (D-09): the target an `--until` halt records survives to the separate
+    /// `resume` process, and a state saved before the field existed loads as `None`,
+    /// so its resume falls back to `Stage::next`.
+    #[test]
+    fn until_halt_target_round_trips_and_tolerates_states_predating_the_field() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.until_halt_target = Some(Stage::Validate);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("until_halt_target"),
+            "until_halt_target must appear in persisted JSON: {json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.until_halt_target,
+            Some(Stage::Validate),
+            "until_halt_target must round-trip through serde"
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_object_mut()
+            .expect("a state serializes to an object")
+            .remove("until_halt_target")
+            .expect("the key was present to remove");
+        let without = value.to_string();
+        assert!(
+            !without.contains("until_halt_target"),
+            "the field must actually be removed for this control to mean anything"
+        );
+        let legacy: State = serde_json::from_str(&without)
+            .expect("a state predating until_halt_target must still deserialize");
+        assert_eq!(legacy.until_halt_target, None);
     }
 
     /// WR-02 (49-REVIEW.md): `gate_notify_cmd` round-trips, a state written

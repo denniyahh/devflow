@@ -397,10 +397,51 @@ Run conventions: discuss `--auto` in session, then `devflow start --phase 53.2 -
 --until plan`, external review (Tier B), close-out with `scripts/cut-pr-branch.sh`.
 **Requirements**: no REQ IDs; the issues above
 **Depends on:** Phase 53.1
-**Plans:** 0 plans
+**Plans:** 19/19 plans complete
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 53.2 to break down)
+**Wave 1**
+- [x] 53.2-01-PLAN.md — #246 Plan prompt runs discuss first when the phase has no CONTEXT.md (wave 1)
+- [x] 53.2-02-PLAN.md — #276 core stub writers through write_executable; #265 measured under load (wave 1)
+- [x] 53.2-03-PLAN.md — #276 CLI src stubs and shared e2e fakes through write_executable (wave 1)
+- [x] 53.2-04-PLAN.md — #276 remaining CLI integration-test stubs (wave 1)
+- [x] 53.2-05-PLAN.md — #247 question-gate banner; #248 open branches against the run's base (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [x] 53.2-06-PLAN.md — #296 fake systemctl reads active; held-lock readiness (wave 2)
+- [x] 53.2-07-PLAN.md — #276 raw-writer guard scan; #277 bounded write-lock read (wave 2)
+- [x] 53.2-08-PLAN.md — #301 one CI-aware poll budget; #279 wait for inactive (wave 2)
+- [x] 53.2-09-PLAN.md — #249 ISO-8601 start time; #310 reproduce then bounded reads (wave 2)
+- [x] 53.2-10-PLAN.md — #250 StageIntent::PlanReviews and the planned semver break (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [x] 53.2-11-PLAN.md — #178 measure the leak; close #273 and #308 with evidence (wave 3)
+- [x] 53.2-12-PLAN.md — #285 start warns on unignored GSD files; #258 keep a progressed run (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [x] 53.2-13-PLAN.md — #297 stop holds the phase holder; #324 no supervisor in texts (wave 4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+- [x] 53.2-14-PLAN.md — #281 (999.260) resume follows the until halt's target (wave 5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+- [x] 53.2-15-PLAN.md — #250 start --reviews flag, refusal, dry run, resume (wave 6)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+- [x] 53.2-17-PLAN.md — #250 resume --reviews reruns a halted Plan as a reviews pass (wave 7)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+- [x] 53.2-16-PLAN.md — D-03 live proof of the discuss route, run by the orchestrating session (wave 8)
+
+**Cross-cutting constraints:** <!-- gsd:generated -->
+- D-17: each target test fails on the code before its GREEN commit with its assertion text, checked once by reverting the GREEN change
+
+**Gap closure** *(gap_closure plans; waves count within the gaps-only run)*
+- [x] 53.2-18-PLAN.md — #337 fake systemd-run waits for the runner's READY=1 on a notify listener (wave 1)
+- [x] 53.2-19-PLAN.md — #338 WR-01 resume --reviews snapshot, WR-02 untrack advice; check.sh all twice (wave 2)
+
+**Cross-cutting constraints:** <!-- gsd:generated -->
+- D-17: each target test fails on the code before its GREEN commit with its assertion text, checked once by reverting the GREEN change
 
 ### Phase 54: Decision Triage
 
@@ -670,7 +711,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
-| 53.2. wsx/UDE first-use and dogfood remediation | 0/0 | Not started | - |
+| 53.2. wsx/UDE first-use and dogfood remediation | 19/19 | Complete | 2026-11-23 |
 | 54.1. Pause at the stage boundary | 0/0 | Not started | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)

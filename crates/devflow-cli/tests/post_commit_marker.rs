@@ -176,3 +176,41 @@ fn a_two_summary_commit_writes_a_marker_that_parses_as_json() {
         "the stale-state marker does not list both landed summaries: {text}"
     );
 }
+
+/// F22: outside a workspace checkout (no `.workspace-divergence`) the hook skips its
+/// workspace checks but still runs the post-commit the global `core.hooksPath` names.
+#[test]
+fn a_commit_outside_a_workspace_checkout_runs_the_global_post_commit() {
+    let fixture = Fixture::new();
+    fixture.git(&["rm", "-q", ".workspace-divergence"]);
+    fixture.git(&["commit", "-q", "-m", "chore: leave the workspace branch"]);
+    let scratch = fixture.scratch.path();
+    let global_hooks = scratch.join("global-hooks");
+    std::fs::create_dir_all(&global_hooks).expect("create the global hooks dir");
+    let ran = scratch.join("global-post-commit-ran");
+    write_executable(
+        &global_hooks.join("post-commit"),
+        &format!("#!/bin/sh\n: > '{}'\n", ran.display()),
+    );
+    let global_config = scratch.join("global-gitconfig");
+    std::fs::write(
+        &global_config,
+        format!("[core]\n\thooksPath = {}\n", global_hooks.display()),
+    )
+    .expect("write the scratch global git config");
+
+    fixture.write("other.txt", "not a summary\n");
+    fixture.git(&["add", "other.txt"]);
+    let out = fixture
+        .hermetic("git", &fixture.repo())
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .args(["commit", "-q", "-m", "chore: a plain commit"])
+        .output()
+        .expect("run git commit");
+    assert!(out.status.success(), "commit: {}", describe(&out));
+    assert!(
+        ran.is_file(),
+        "the global post-commit did not run outside a workspace checkout: {}",
+        describe(&out)
+    );
+}

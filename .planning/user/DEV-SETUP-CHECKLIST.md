@@ -429,6 +429,11 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   the same `/workspace` path aliases cargo's path-keyed fingerprints across the main checkout
   and worktrees — the worktree build reuses a stale `devflow-core` rmeta and dies with
   `E0599: no variant named Antigravity` (false RED), and the inverse yields a false GREEN.
+- [ ] **[PATTERN]** both container gates set `DEVFLOW_E2E_POLL_BUDGET_SECS` (phase7_cli's
+  polling budget, #301; 10 s by default, 30 s when `CI` is set): `devcontainer.yml`'s runCmd
+  exports 30, and `check-in-container.sh` passes `-e DEVFLOW_E2E_POLL_BUDGET_SECS` (a host value,
+  else 30). Neither container sees `CI`, and it is not forwarded because insta changes its
+  snapshot-update default under `CI`. `ci_parity_guards.rs` pins both.
 
 ## 6. Claude Code / agent tooling — mostly [GLOBAL], currently unversioned
 
