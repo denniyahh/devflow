@@ -367,6 +367,64 @@ fn discard_waits_for_a_deactivating_unit_before_removing_anything() {
     );
 }
 
+/// D-14 (#296): with the runner lock free and the unit `active` (the process the fake
+/// recorded for it is alive), discard waits and removes nothing until that process is
+/// gone; then it completes.
+#[test]
+fn discard_waits_for_an_active_unit_whose_runner_released_its_lock() {
+    let case = Case::finished(PhaseId::new(93));
+    let service_bin = case.home.service_bin();
+    let unit = case.unit();
+    let unit_process = ChildGuard(Some(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn the unit's lock-free process"),
+    ));
+    let pid = unit_process.0.as_ref().expect("the child is owned").id();
+    fs::write(service_bin.join(format!("{unit}.pid")), format!("{pid}\n")).unwrap();
+    let stubs = tempfile::tempdir().unwrap();
+    let mut discard = ChildGuard(Some(
+        case.devflow(
+            &["discard", "--phase", &case.phase.to_string()],
+            stubs.path(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn devflow discard"),
+    ));
+
+    let reads = service_bin.join(format!("{unit}.active-reads"));
+    devflow_core::test_support::wait_until(
+        Duration::from_secs(30),
+        "discard never read the unit active",
+        || fs::read_to_string(&reads).is_ok_and(|text| text.lines().any(|line| line == "active")),
+    );
+    let still_waiting = discard.child().try_wait().expect("poll discard").is_none();
+    assert!(
+        case.worktree_and_state_remain(),
+        "discard removed a run whose unit still read active"
+    );
+    assert!(
+        still_waiting,
+        "discard exited while the unit still read active"
+    );
+
+    drop(unit_process);
+    let out = discard.output_within(Duration::from_secs(30));
+    assert!(
+        out.status.success(),
+        "discard completes once the unit's process is gone:\n{}",
+        text(&out)
+    );
+    assert!(
+        !case.worktree().exists() && !case.state_file().exists(),
+        "discard removed the worktree and the state after the wait:\n{}",
+        text(&out)
+    );
+}
+
 /// D-07a: a unit that never reads inactive makes discard refuse after its bound,
 /// naming the unit and its state, with nothing removed.
 #[test]
