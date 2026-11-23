@@ -1180,6 +1180,61 @@ mod tests {
         assert_eq!(finished["reason"], "stopped_at", "{finished}");
     }
 
+    /// D-04 (#250): entering another stage spends the reviews pass, so a later Plan (a
+    /// gap-closure pass) is never rendered as one.
+    #[test]
+    fn entering_another_stage_ends_the_reviews_pass() {
+        let mut state = State::new(
+            PhaseId::new(5312),
+            AgentKind::Claude,
+            Mode::Supervise,
+            std::path::PathBuf::from("/nonexistent"),
+        );
+        state.stage = Stage::Plan;
+        state.reviews_pass = true;
+
+        enter_stage(&mut state, Stage::Plan, Stage::Code);
+
+        assert!(
+            !state.reviews_pass,
+            "entering Code left the reviews pass set"
+        );
+    }
+
+    /// D-04 (#250): the `--until plan` halt after a reviews pass returns before
+    /// `enter_stage`, so it spends the reviews pass itself; a halted run carries no
+    /// spent flag.
+    #[test]
+    fn an_until_plan_halt_after_a_reviews_pass_ends_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(5313);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        state.reviews_pass = true;
+        workflow::save_state(&state).unwrap();
+
+        transition(root, &mut state, Stage::Code).unwrap();
+
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(
+            state.stopped && state.stop_reason == Some(until_halt_reason(Stage::Plan)),
+            "premise: the transition halts at the --until cap: {state:?}"
+        );
+        assert!(
+            !state.reviews_pass,
+            "the --until plan halt left the reviews pass set: {state:?}"
+        );
+    }
+
     /// An `abort` whose state cannot be removed says so, on the event a supervisor's
     /// dead stderr cannot carry, and does not report the workflow aborted. The state path
     /// is a directory so the removal fails whichever process runs this.

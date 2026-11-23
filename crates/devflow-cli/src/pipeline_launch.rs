@@ -8104,6 +8104,36 @@ mod tests {
         assert!(!reloaded.gap_closure_pass, "control: no marker appears");
     }
 
+    /// D-04 (#250): a reviews pass's Plan state, saved and reloaded as a resume reloads
+    /// it, renders the reviews pass with no resume flag: by codex through plan-phase.md's
+    /// reviews mode, by claude as `/gsd-plan-phase N --reviews`, neither with the plain
+    /// Plan prompt's PLAN.md short-circuit.
+    #[test]
+    fn a_reviews_pass_plan_renders_reviews_after_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5273);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.reviews_pass = true;
+        state.stopped = true;
+        workflow::save_state(&state).unwrap();
+        let reloaded = workflow::load_state(root, phase).unwrap();
+
+        let codex = default_stage_prompt(&reloaded, agents::driver_for(AgentKind::Codex).as_ref());
+        let claude =
+            default_stage_prompt(&reloaded, agents::driver_for(AgentKind::Claude).as_ref());
+        for (prompt, needle) in [
+            (&codex, format!("plan-phase.md for phase {phase} --reviews")),
+            (&claude, format!("/gsd-plan-phase {phase} --reviews")),
+        ] {
+            assert!(
+                prompt.contains(&needle) && !prompt.contains("already exists"),
+                "a resumed reviews pass did not render --reviews: {prompt}"
+            );
+        }
+    }
+
     /// Review C6 (GATE-03): a gaps Code pass whose `code_fix` was cleared (as
     /// an `--until code` halt leaves it; a stop keeps `code_fix`), resumed with
     /// the gap-closure marker still set, relaunches the gaps-only execute and
