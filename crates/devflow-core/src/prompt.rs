@@ -1887,6 +1887,50 @@ mod tests {
         }
     }
 
+    /// D-02 (#246): the workflow-style Plan prompt (pi's route) carries the
+    /// same discuss-before-plan branch, naming the workflow files instead of
+    /// slash commands, and no GSD mode flag.
+    #[test]
+    fn workflow_plan_prompt_runs_discuss_when_the_phase_has_no_context() {
+        let intent = StageIntent::for_stage(Stage::Plan, PhaseId::new(7));
+        let prompt = render_workflow_style(&intent, "/workflows");
+        let has_branch = [
+            "ls .planning/phases/07-*/07-*CONTEXT.md 2>/dev/null",
+            "/workflows/discuss-phase.md",
+            "/workflows/plan-phase.md",
+            "kind `discuss`",
+        ]
+        .iter()
+        .all(|wording| prompt.contains(wording));
+        let names_no_command_or_flag = !prompt.contains("/gsd-")
+            && ["--auto", "--chain", "--power"]
+                .iter()
+                .all(|flag| !prompt.contains(flag));
+        assert!(
+            has_branch && names_no_command_or_flag,
+            "the workflow-style Plan prompt has no discuss-before-plan branch: {prompt}"
+        );
+    }
+
+    /// D-02 control: the gaps Plan pass runs with the phase's plans already
+    /// written, so neither style carries the discuss branch.
+    #[test]
+    fn gaps_plan_prompt_has_no_discuss_branch() {
+        let gaps = StageIntent::PlanGaps {
+            phase: PhaseId::new(7),
+            relaunch_note: None,
+        };
+        for prompt in [
+            render_claude_style(&gaps),
+            render_workflow_style(&gaps, "/workflows"),
+        ] {
+            assert!(
+                !prompt.contains("discuss-phase") && !prompt.contains("CONTEXT.md"),
+                "the gaps Plan prompt must not run discuss: {prompt}"
+            );
+        }
+    }
+
     #[test]
     fn fix_prompt_carries_the_note_byte_identical() {
         for fix in [FixType::GapsOnly, FixType::FullExecute] {
