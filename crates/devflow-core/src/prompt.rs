@@ -1818,6 +1818,35 @@ mod tests {
         }
     }
 
+    /// D-02 (#246): a Plan launch on a phase with no CONTEXT.md runs
+    /// `/gsd-discuss-phase N` first, with every question through
+    /// `devflow_ask` as a `discuss` question, then plan-phase. The prompt
+    /// names no GSD mode flag, not even in a prohibition, so
+    /// `the_plan_prompt_never_carries_the_chain_flag_token` keeps holding.
+    #[test]
+    fn plan_prompt_runs_discuss_when_the_phase_has_no_context() {
+        let prompt = render_claude_style(&StageIntent::for_stage(Stage::Plan, PhaseId::new(7)));
+        let plan_probe = prompt.find("ls .planning/phases/07-*/07-*PLAN.md 2>/dev/null");
+        let context_probe = prompt.find("ls .planning/phases/07-*/07-*CONTEXT.md 2>/dev/null");
+        let discuss = prompt.find("/gsd-discuss-phase 7\n");
+        let last_plan = prompt.rfind("/gsd-plan-phase 7\n");
+        let ordered = matches!(
+            (plan_probe, context_probe, discuss, last_plan),
+            (Some(plan), Some(context), Some(discuss), Some(last))
+                if plan < context && context < discuss && discuss < last
+        );
+        assert!(
+            ordered && prompt.contains("kind `discuss`"),
+            "the Plan prompt has no discuss-before-plan branch: {prompt}"
+        );
+        for flag in ["--auto", "--chain", "--power"] {
+            assert!(
+                !prompt.contains(flag),
+                "the discuss branch names a GSD flag: {prompt}"
+            );
+        }
+    }
+
     #[test]
     fn fix_prompt_carries_the_note_byte_identical() {
         for fix in [FixType::GapsOnly, FixType::FullExecute] {
