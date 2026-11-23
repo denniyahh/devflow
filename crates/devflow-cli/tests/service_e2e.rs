@@ -1086,17 +1086,14 @@ fn a_hard_killed_runner_leaves_no_agent_and_the_unit_inactive() {
     );
 }
 
-/// D-07a: a stub agent leaves a SIGTERM-ignoring child, so after `devflow stop` sends
-/// SIGTERM the unit reads deactivating until the manager's SIGKILL. A `devflow discard`
-/// started meanwhile removes nothing until the unit reads inactive, then removes the
-/// run's state.
-#[test]
-#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
-fn discard_waits_for_a_straggler_in_a_deactivating_unit() {
-    assert_manager_answers();
-    let tail = "setsid sh -c 'trap \"\" TERM; sleep 60' </dev/null >/dev/null 2>&1 &\nsleep 120";
-    let phase = PhaseId::new(87);
-    let fixture = StartFixture::new(phase, tail);
+/// The stub agent's tail for the deactivating-unit scenarios: it leaves a child that
+/// ignores SIGTERM, so a stopped unit reads deactivating until the manager's SIGKILL.
+const STRAGGLER_TAIL: &str =
+    "setsid sh -c 'trap \"\" TERM; sleep 60' </dev/null >/dev/null 2>&1 &\nsleep 120";
+
+/// Start `fixture`'s run in a worktree and wait until its agent has started and left
+/// its straggler, returning the guard that stops the unit.
+fn start_a_run_with_a_straggler(fixture: &StartFixture) -> UnitGuard {
     let guard = UnitGuard::named(fixture.unit());
     // In a worktree, so discard can remove the branch: `--no-worktree` checks it out in
     // the main checkout, which discard refuses.
@@ -1113,46 +1110,100 @@ fn discard_waits_for_a_straggler_in_a_deactivating_unit() {
         "the agent never started",
     );
     std::thread::sleep(Duration::from_millis(500));
+    guard
+}
+
+/// Wait for `child` to exit, at most [`UNIT_FINISH_WAIT`], panicking with `what` and
+/// `unit`'s journal otherwise, and return its output.
+fn wait_for_child(mut child: std::process::Child, unit: &str, what: &str) -> Output {
+    let deadline = Instant::now() + UNIT_FINISH_WAIT;
+    while child.try_wait().expect("poll the child").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} after {UNIT_FINISH_WAIT:?}\njournal:\n{}",
+            journal_of(unit)
+        );
+        std::thread::sleep(UNIT_POLL);
+    }
+    child.wait_with_output().expect("the child's output")
+}
+
+/// D-07a, D-12: a stub agent leaves a SIGTERM-ignoring child, so after `devflow stop`
+/// sends SIGTERM the unit reads deactivating until the manager's SIGKILL. Stop holds the
+/// phase holder until the unit is down, so a `devflow discard` meanwhile is refused
+/// naming stop's pid and removes nothing, and succeeds once stop returns.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn discard_during_a_stop_of_a_deactivating_unit_is_refused_until_stop_returns() {
+    assert_manager_answers();
+    let phase = PhaseId::new(87);
+    let fixture = StartFixture::new(phase, STRAGGLER_TAIL);
+    let guard = start_a_run_with_a_straggler(&fixture);
 
     let number = phase.to_string();
     let root = fixture.root.display().to_string();
-    let mut stop = common::host_service_devflow(&fixture.home)
+    let stop = common::host_service_devflow(&fixture.home)
         .env("PATH", fixture.path(None))
         .args(["stop", "--phase", &number, &root])
         .current_dir(&fixture.root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn devflow stop");
+    let stop_pid = stop.id();
     wait_until(
         || unit_property(&guard.unit, "ActiveState") == "deactivating",
         &guard.unit,
         "the unit never read deactivating",
     );
     let state_file = devflow_core::workflow::state_path(&fixture.root, phase);
-    let mut discard = common::host_service_devflow(&fixture.home)
-        .env("PATH", fixture.path(None))
-        .args(["discard", "--phase", &number, &root])
-        .current_dir(&fixture.root)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn devflow discard");
-    while unit_property(&guard.unit, "ActiveState") == "deactivating" {
-        assert!(
-            state_file.is_file(),
-            "discard acted while deactivating: the state is gone"
-        );
-        std::thread::sleep(UNIT_POLL);
-    }
-    let _ = stop.wait();
-    let deadline = Instant::now() + UNIT_FINISH_WAIT;
-    while discard.try_wait().expect("poll discard").is_none() {
-        assert!(Instant::now() < deadline, "discard never returned");
-        std::thread::sleep(UNIT_POLL);
-    }
-    let discarded = discard.wait_with_output().expect("discard's output");
+    let refused = devflow_in(&fixture, &["discard", "--phase", &number, &root]);
+    let state_after_refusal = unit_property(&guard.unit, "ActiveState");
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "discard ran during the stop:\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+    let holder = format!("another DevFlow verb holds phase {phase} (pid {stop_pid})");
+    assert!(
+        refused_stderr.contains(&holder),
+        "discard did not name stop as the holder ({holder}):\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+    assert!(
+        refused_stderr.contains("run this again once it returns"),
+        "discard's refusal did not say to run it again:\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+    assert_eq!(
+        state_after_refusal,
+        "deactivating",
+        "the unit left deactivating before discard returned, so the refusal is not \
+         known to have come while stop waited:\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+    assert!(
+        state_file.is_file(),
+        "the refused discard removed the state:\n{}\njournal:\n{}",
+        text(&refused),
+        journal_of(&guard.unit)
+    );
+
+    let stopped = wait_for_child(stop, &guard.unit, "stop never returned");
+    assert!(
+        stopped.status.success() && String::from_utf8_lossy(&stopped.stdout).contains("stopped"),
+        "stop did not report stopped:\n{}",
+        text(&stopped)
+    );
+    let discarded = devflow_in(&fixture, &["discard", "--phase", &number, &root]);
     assert!(
         discarded.status.success() && !state_file.exists(),
-        "discard did not complete once the unit read inactive:\n{}",
+        "discard did not complete once stop returned:\n{}",
         text(&discarded)
     );
 }
