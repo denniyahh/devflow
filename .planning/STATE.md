@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-15-PLAN.md
-last_updated: "2026-11-23T07:31:58.263Z"
+stopped_at: Completed 53.2-17-PLAN.md
+last_updated: "2026-11-23T07:45:16.205Z"
 last_activity: 2026-11-22
 last_activity_desc: Phase 53.2 execution started
-state_head: 8ab715ef4d8ea43822cb5f0fadcb0559292deace
+state_head: c1a644d8828b5da86c52c495e9744a0ae0cc3462
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 105
-  completed_plans: 103
+  completed_plans: 104
   percent: 13
 ---
 
@@ -179,7 +179,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
-Plan: 16 of 17
+Plan: 17 of 17
 Status: Ready to execute
 Last activity: 2026-11-22 — Phase 53.2 execution started
 
@@ -1079,6 +1079,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: 53.2-14: the --until halt records its transition's target in State::until_halt_target; resume_advance reads it (else Stage::next); enter_stage clears it on every stage entry
 - [Phase 53.2]: start --reviews checks NN-REVIEWS.md on the resolved base (phase_artifact_on_base), after the CONTEXT.md refusal; a primary-checkout copy is refused
 - [Phase 53.2]: resume re-renders Plan from state, so a stopped reviews pass needs no resume flag; a run halted after Plan takes 53.2-17's resume --reviews
+- [Phase 53.2]: resume --reviews reruns the halted Plan as a reviews pass and keeps the --until plan cap; a plain resume then advances
+- [Phase 53.2]: resume --reviews is refused before any write unless the --until plan cap halted Plan, and without NN-REVIEWS.md in the run's checkout
+- [Phase 53.2]: a failed resume --reviews launch restores the --until plan halt so the run stays retryable
 
 ## Roadmap Evolution
 
@@ -1293,11 +1296,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P13 | 35min | 2 tasks | 7 files |
 | Phase 53.2 P14 | 10min | 2 tasks | 4 files |
 | Phase 53.2 P15 | 14 min | 3 tasks | 8 files |
+| Phase 53.2 P17 | 10 min | 2 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-23T07:31:56.258Z
-**Stopped at:** Completed 53.2-15-PLAN.md
+**Last session:** 2026-11-23T07:45:14.117Z
+**Stopped at:** Completed 53.2-17-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
