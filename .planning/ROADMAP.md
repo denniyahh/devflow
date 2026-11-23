@@ -397,7 +397,7 @@ Run conventions: discuss `--auto` in session, then `devflow start --phase 53.2 -
 --until plan`, external review (Tier B), close-out with `scripts/cut-pr-branch.sh`.
 **Requirements**: no REQ IDs; the issues above
 **Depends on:** Phase 53.1
-**Plans:** 18/19 plans executed
+**Plans:** 19/19 plans executed
 
 Plans:
 **Wave 1**
@@ -438,7 +438,7 @@ Plans:
 
 **Gap closure** *(gap_closure plans; waves count within the gaps-only run)*
 - [x] 53.2-18-PLAN.md — #337 fake systemd-run waits for the runner's READY=1 on a notify listener (wave 1)
-- [ ] 53.2-19-PLAN.md — #338 WR-01 resume --reviews snapshot, WR-02 untrack advice; check.sh all twice (wave 2)
+- [x] 53.2-19-PLAN.md — #338 WR-01 resume --reviews snapshot, WR-02 untrack advice; check.sh all twice (wave 2)
 
 **Cross-cutting constraints:** <!-- gsd:generated -->
 - D-17: each target test fails on the code before its GREEN commit with its assertion text, checked once by reverting the GREEN change
@@ -682,7 +682,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
-| 53.2. wsx/UDE first-use and dogfood remediation | 18/19 | In Progress | - |
+| 53.2. wsx/UDE first-use and dogfood remediation | 19/19 | In Progress | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
