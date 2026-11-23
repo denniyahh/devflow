@@ -406,7 +406,8 @@ pub struct State {
     /// `/gsd-plan-phase N --reviews`, replanning the phase from its
     /// REVIEWS.md.
     ///
-    /// Set by `devflow start --reviews`. Read by the Plan prompt on every
+    /// Set by `devflow start --reviews`, or by `devflow resume --reviews` on a run
+    /// its `--until plan` cap halted after Plan. Read by the Plan prompt on every
     /// launch, a resume included, so a stopped reviews pass relaunches as one
     /// with no resume flag. Cleared when the run enters another stage and by
     /// the `--until` halt after Plan, so a later gap-closure Plan renders its

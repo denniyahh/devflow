@@ -59,7 +59,9 @@ use tracing::{info, warn};
 /// In a reviews pass ([`State::reviews_pass`], D-04) Plan renders the reviews
 /// Plan intent, ahead of the gaps arm; the two never hold together, because the
 /// reviews flag is spent when the run leaves Plan and only Validate sets the
-/// gaps marker.
+/// gaps marker. `resume --reviews` sets the flag only at an `--until plan` halt,
+/// which always comes before the run's first Validate: only `start` sets the cap,
+/// and `transition` halts the first Plan exit under it.
 ///
 /// The only place a default stage prompt is rendered:
 /// [`launch_stage_inner`] (whose prompt the agent receives) and
@@ -2173,12 +2175,17 @@ pub(crate) fn resume(
 /// D-06: a rerun asks again. Before it relaunches, `resume` closes the phase's gates and
 /// reports each answer it set aside and each claimed answer it found unapplied
 /// ([`close_gates_for_resume`]). It never applies a pending answer to the rerun's gate.
+///
+/// D-04 (#250): `reviews` (`resume --reviews`) reruns a Plan its `--until plan` cap
+/// halted as a reviews pass, `/gsd-plan-phase N --reviews`, with the cap kept, instead
+/// of advancing; see [`resume_loaded`]. It combines with `--agent` and
+/// `--fallback-agent` as a plain resume does.
 pub(crate) fn resume_with_fallback(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
-    _reviews: bool,
+    reviews: bool,
 ) -> Result<(), CliError> {
     // 999.229: said first, so it prints even when the resume then refuses.
     if let Some(warning) = devflow_core::config::external_verify_env_warning_now() {
@@ -2208,8 +2215,15 @@ pub(crate) fn resume_with_fallback(
     launch_test_hold("holder_claimed");
     // 999.251: a resume past a fired `--until` cap archives the halted stage's capture
     // under that stage, not the one it advances to.
-    let archived_stage = resume_advance(&reserved.state).map(|(from, _)| from);
-    let mut state = resume_loaded(project_root, phase, reserved.state, agent, fallback_agent)?;
+    let archived_stage = resume_advance(&reserved.state, reviews).map(|(from, _)| from);
+    let mut state = resume_loaded(
+        project_root,
+        phase,
+        reserved.state,
+        agent,
+        fallback_agent,
+        reviews,
+    )?;
     // The runner checks the agent binary again at each launch; checked here too, so a
     // resume that cannot run its agent fails now, re-marked stopped below, rather than
     // in a unit nobody watches.
@@ -2522,18 +2536,23 @@ fn record_leftover_question(project_root: &Path, phase: PhaseId, stage: Stage) {
 /// ([`crate::pipeline_gate::enter_stage`]) and a `transition` event, recorded before any
 /// handoff so `agent_handoff` names the stage launched. Every check before the first
 /// write judges that stage. Any other stop reruns its stage.
+///
+/// `reviews` (`resume --reviews`, D-04) reruns the halted Plan instead of advancing:
+/// the final commit sets [`State::reviews_pass`] and keeps the `--until plan` cap, so
+/// the reviews Plan halts again and a plain `resume` then advances.
 fn resume_loaded(
     project_root: &Path,
     phase: PhaseId,
     mut state: State,
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
+    reviews: bool,
 ) -> Result<State, CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
     // 999.251 (D-02): a run its own `--until` cap halted resumes at the next stage;
     // any other stop reruns the stage it stopped in.
     let saved_stage = state.stage;
-    let advance = resume_advance(&state);
+    let advance = resume_advance(&state, reviews);
     // Every check before the first write judges the stage this resume launches, on a
     // copy that is never written (`commit` applies its closure to the file's copy).
     let mut judged = state.clone();
@@ -2616,11 +2635,17 @@ fn resume_loaded(
     }
     commit(&mut state, |s| {
         if s.stopped {
-            if crate::pipeline_gate::until_cap_fired(s) {
+            // D-04: a reviews resume reruns the halted Plan, so it does not pass the
+            // `--until plan` boundary and keeps the cap; `until_halt_target` stays as the
+            // halt wrote it, read only after a fired cap, whose halt rewrites it.
+            if crate::pipeline_gate::until_cap_fired(s) && !reviews {
                 s.stop_until = None;
             }
             s.stopped = false;
             s.stop_reason = None;
+        }
+        if reviews {
+            s.reviews_pass = true;
         }
         s.gate_pending = false;
         // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
@@ -2631,6 +2656,12 @@ fn resume_loaded(
             s.fallback_consumed = false;
         }
     })?;
+    if reviews {
+        println!(
+            "resume: Plan reruns as a reviews pass (/gsd-plan-phase {phase} --reviews); the \
+             --until plan cap still holds, so the run halts again after Plan"
+        );
+    }
     if let Some(fallback) = fallback_agent {
         print_fallback_notice(fallback, state.agent);
     }
@@ -2643,8 +2674,11 @@ fn resume_loaded(
 /// halt reached through Plan->Validate resumes at Validate. A state without a recorded
 /// target advances to [`Stage::next`]; an `--until` halt never happens after Validate,
 /// so a fired cap always has a next.
-fn resume_advance(state: &State) -> Option<(Stage, Stage)> {
-    if !crate::pipeline_gate::until_cap_fired(state) {
+///
+/// A reviews resume (`resume --reviews`, D-04) never advances: it reruns the halted
+/// Plan as a reviews pass, so it is `None` too.
+fn resume_advance(state: &State, reviews: bool) -> Option<(Stage, Stage)> {
+    if reviews || !crate::pipeline_gate::until_cap_fired(state) {
         return None;
     }
     state
@@ -8817,7 +8851,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = resume_loaded(root, phase, state, None, None);
+        let result = resume_loaded(root, phase, state, None, None, false);
         result.unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
