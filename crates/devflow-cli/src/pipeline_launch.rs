@@ -2243,9 +2243,9 @@ pub(crate) fn resume_with_fallback(
             crate::commands::print_runner_launched(phase, &headline, &unit);
             Ok(())
         }
-        Err(crate::service::LaunchError::Failed(why)) => {
-            Err(re_mark_stopped_after_failed_launch(&mut state, phase, &why))
-        }
+        Err(crate::service::LaunchError::Failed(why)) => Err(
+            re_mark_stopped_after_failed_launch(&mut state, phase, &why, reviews),
+        ),
         // 999.244: systemd-run was killed at its bound, so the manager may have accepted
         // the unit; the runner is read once under the holder, which it never takes.
         Err(crate::service::LaunchError::Unknown { unit, why }) => {
@@ -2256,9 +2256,9 @@ pub(crate) fn resume_with_fallback(
                     crate::commands::print_timed_out_live_note(&why);
                     Ok(())
                 }
-                crate::commands::TimedOutLaunch::NotLive => {
-                    Err(re_mark_stopped_after_failed_launch(&mut state, phase, &why))
-                }
+                crate::commands::TimedOutLaunch::NotLive => Err(
+                    re_mark_stopped_after_failed_launch(&mut state, phase, &why, reviews),
+                ),
                 crate::commands::TimedOutLaunch::Unknown(reading) => Err(CliError::Message(
                     crate::commands::unconfirmed_launch_message("resume", phase, &why, &reading),
                 )),
@@ -2273,12 +2273,28 @@ pub(crate) fn resume_with_fallback(
 /// `stopped` was stopped by its runner after that commit (a timed-out launch whose runner
 /// ran, recorded its own stop and exited, #258), so its stop reason is the runner's and is
 /// kept. Best effort: the launch error is what the caller needs either way.
-fn re_mark_stopped_after_failed_launch(state: &mut State, phase: PhaseId, why: &str) -> CliError {
+///
+/// A failed `resume --reviews` launch (`reviews`, D-04, review item 8) puts the
+/// `--until plan` halt back instead: the halt's stop reason and no reviews pass, so
+/// [`crate::pipeline_gate::until_cap_fired`] holds again and both a retried
+/// `resume --reviews` and a plain `resume` are accepted. The runner's own recorded stop
+/// is kept first, as above.
+fn re_mark_stopped_after_failed_launch(
+    state: &mut State,
+    phase: PhaseId,
+    why: &str,
+    reviews: bool,
+) -> CliError {
     let err = CliError::Message(format!("resume: phase {phase} was not launched: {why}"));
     let _ = commit(state, |s| {
         if !s.stopped {
             s.stopped = true;
-            s.stop_reason = Some(format!("resume launch failed: {err}"));
+            if reviews {
+                s.stop_reason = Some(crate::pipeline_gate::until_halt_reason(Stage::Plan));
+                s.reviews_pass = false;
+            } else {
+                s.stop_reason = Some(format!("resume launch failed: {err}"));
+            }
         }
     });
     err
@@ -2549,6 +2565,18 @@ fn resume_loaded(
     reviews: bool,
 ) -> Result<State, CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
+    // D-04, restrictive verbs: `--reviews` is judged before any write, the state first,
+    // so a wrong-state refusal never depends on the review file.
+    if reviews {
+        if let Some(refusal) = reviews_resume_refusal(&state) {
+            return Err(CliError::Message(refusal));
+        }
+        let launch_root = state
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| project_root.to_path_buf());
+        require_reviews_file_in_checkout(&launch_root, phase)?;
+    }
     // 999.251 (D-02): a run its own `--until` cap halted resumes at the next stage;
     // any other stop reruns the stage it stopped in.
     let saved_stage = state.stage;
@@ -2688,10 +2716,42 @@ fn resume_advance(state: &State, reviews: bool) -> Option<(Stage, Stage)> {
 }
 
 /// The refusal of a `resume --reviews` (D-04) on a run that is not halted after Plan by
-/// its own `--until plan` cap, else `None`.
-#[allow(dead_code)]
-fn reviews_resume_refusal(_state: &State) -> Option<String> {
-    None
+/// its own `--until plan` cap, else `None`. Restrictive verbs: the flag does one job,
+/// rerunning that halted Plan as a reviews pass, and names the plain resume otherwise.
+fn reviews_resume_refusal(state: &State) -> Option<String> {
+    if crate::pipeline_gate::until_cap_fired(state) && state.stage == Stage::Plan {
+        return None;
+    }
+    let phase = state.phase;
+    let stage = state.stage;
+    let fact = if state.stopped {
+        let reason = state.stop_reason.as_deref().unwrap_or("no reason recorded");
+        format!("stopped in {stage}: {reason}")
+    } else {
+        format!("is in {stage} and not stopped")
+    };
+    Some(format!(
+        "resume: --reviews reruns Plan as a reviews pass only on a run its --until plan cap \
+         halted after Plan; phase {phase} {fact}; run devflow resume --phase {phase} without \
+         --reviews"
+    ))
+}
+
+/// D-04: refuse a `resume --reviews` whose run checkout, `launch_root` (the tree the
+/// reviews Plan reads), has no `{padded}-REVIEWS.md` in the phase's directory on disk.
+/// Unlike `start`, which reads the base it forks from, the run's tree already exists.
+fn require_reviews_file_in_checkout(launch_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    let padded = phase.padded();
+    let present = devflow_core::gsd_reader::phase_dir(launch_root, phase)
+        .is_ok_and(|dir| dir.join(format!("{padded}-REVIEWS.md")).is_file());
+    if present {
+        return Ok(());
+    }
+    Err(crate::commands::reviews_file_refusal(
+        crate::commands::LaunchVerb::Resume,
+        phase,
+        &format!("in the run's checkout {}", launch_root.display()),
+    ))
 }
 
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
