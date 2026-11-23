@@ -2224,6 +2224,10 @@ pub(crate) fn resume_with_fallback(
         fallback_agent,
         reviews,
     )?;
+    // #338 WR-01: the state resume committed, read back from disk as start keeps `written`.
+    let written = workflow::load_state(project_root, phase)
+        .ok()
+        .and_then(|loaded| serde_json::to_value(&loaded).ok());
     // The runner checks the agent binary again at each launch; checked here too, so a
     // resume that cannot run its agent fails now, re-marked stopped below, rather than
     // in a unit nobody watches.
@@ -2244,7 +2248,11 @@ pub(crate) fn resume_with_fallback(
             Ok(())
         }
         Err(crate::service::LaunchError::Failed(why)) => Err(re_mark_stopped_after_failed_launch(
-            &mut state, phase, &why, reviews,
+            &mut state,
+            phase,
+            &why,
+            reviews,
+            written.as_ref(),
         )),
         // 999.244: systemd-run was killed at its bound, so the manager may have accepted
         // the unit; the runner is read once under the holder, which it never takes.
@@ -2256,9 +2264,15 @@ pub(crate) fn resume_with_fallback(
                     crate::commands::print_timed_out_live_note(&why);
                     Ok(())
                 }
-                crate::commands::TimedOutLaunch::NotLive => Err(
-                    re_mark_stopped_after_failed_launch(&mut state, phase, &why, reviews),
-                ),
+                crate::commands::TimedOutLaunch::NotLive => {
+                    Err(re_mark_stopped_after_failed_launch(
+                        &mut state,
+                        phase,
+                        &why,
+                        reviews,
+                        written.as_ref(),
+                    ))
+                }
                 crate::commands::TimedOutLaunch::Unknown(reading) => Err(CliError::Message(
                     crate::commands::unconfirmed_launch_message("resume", phase, &why, &reading),
                 )),
@@ -2275,28 +2289,44 @@ pub(crate) fn resume_with_fallback(
 /// kept. Best effort: the launch error is what the caller needs either way.
 ///
 /// A failed `resume --reviews` launch (`reviews`, D-04, review item 8) puts the
-/// `--until plan` halt back instead: the halt's stop reason and no reviews pass, so
+/// `--until plan` halt back, the halt's stop reason and no reviews pass, so
 /// [`crate::pipeline_gate::until_cap_fired`] holds again and both a retried
-/// `resume --reviews` and a plain `resume` are accepted. The runner's own recorded stop
-/// is kept first, as above.
+/// `resume --reviews` and a plain `resume` are accepted. That halt is restored only over
+/// the state resume committed (`written`, #338 WR-01, D-11's snapshot rule): a state that
+/// changed since (a runner that ran, wrote and died) is kept, stopped with the launch
+/// failure and its reviews pass, so a plain `resume` reruns the reviews Plan, and the
+/// error names `devflow status` and `devflow discard`. The runner's own recorded stop is
+/// kept first, as above.
 fn re_mark_stopped_after_failed_launch(
     state: &mut State,
     phase: PhaseId,
     why: &str,
     reviews: bool,
+    written: Option<&serde_json::Value>,
 ) -> CliError {
     let err = CliError::Message(format!("resume: phase {phase} was not launched: {why}"));
+    let mut kept = false;
     let _ = commit(state, |s| {
-        if !s.stopped {
-            s.stopped = true;
-            if reviews {
-                s.stop_reason = Some(crate::pipeline_gate::until_halt_reason(Stage::Plan));
-                s.reviews_pass = false;
-            } else {
-                s.stop_reason = Some(format!("resume launch failed: {err}"));
-            }
+        if s.stopped {
+            return;
+        }
+        let untouched = written.is_some() && written == serde_json::to_value(&*s).ok().as_ref();
+        s.stopped = true;
+        if reviews && untouched {
+            s.stop_reason = Some(crate::pipeline_gate::until_halt_reason(Stage::Plan));
+            s.reviews_pass = false;
+        } else {
+            s.stop_reason = Some(format!("resume launch failed: {err}"));
+            kept = !untouched;
         }
     });
+    if kept {
+        return CliError::Message(format!(
+            "resume: phase {phase} was not confirmed launched ({why}), and its run state \
+             changed after resume wrote it, so it was kept: run `devflow status` to inspect \
+             it, and `devflow discard --phase {phase}` to remove it"
+        ));
+    }
     err
 }
 
