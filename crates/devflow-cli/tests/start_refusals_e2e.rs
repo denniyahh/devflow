@@ -493,12 +493,17 @@ fn start_refuses_orphan_gate_files_naming_discard() {
 
 /// `devflow resume --phase 12` over `root`, with the fake agent on `PATH` and a reaper
 /// bound before it, so a resume that does launch has its run ended when the test ends.
-fn resume_phase(home: &common::HermeticHome, root: &Path) -> (Output, common::LaunchedRunReaper) {
+fn resume_phase(
+    home: &common::HermeticHome,
+    root: &Path,
+    extra: &[&str],
+) -> (Output, common::LaunchedRunReaper) {
     let reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(PHASE));
     let fake_bin = fake_codex();
     let parent = std::env::var_os("PATH").unwrap_or_default();
     let output = common::hermetic_devflow(home)
         .args(["resume", "--phase", &PHASE.to_string()])
+        .args(extra)
         .arg(root)
         .hermetic_path(format!(
             "{}:{}",
@@ -540,7 +545,7 @@ fn resume_refuses_a_finished_run_naming_close_out_or_discard() {
     });
     let before = state_bytes(root);
 
-    let (out, _reaper) = resume_phase(&home, root);
+    let (out, _reaper) = resume_phase(&home, root, &[]);
     let text = combined(&out);
     assert!(
         !out.status.success(),
@@ -566,6 +571,38 @@ fn resume_refuses_a_finished_run_naming_close_out_or_discard() {
     );
 }
 
+/// Restrictive verbs, through the binary: `resume --reviews` on a run stopped in Code is
+/// refused before any write, naming why and the plain resume, even with a REVIEWS.md.
+#[test]
+fn resume_reviews_on_a_run_stopped_in_code_is_refused() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(root.join(".planning/phases/12-test/12-REVIEWS.md"), "# reviews\n").unwrap();
+    save_phase_state(root, |state| {
+        state.verification_baseline_captured = true;
+        state.stage = devflow_core::stage::Stage::Code;
+        state.stopped = true;
+        state.stop_reason = Some("stopped via `devflow stop`".to_string());
+    });
+    let before = state_bytes(root);
+
+    let (out, _reaper) = resume_phase(&home, root, &["--reviews"]);
+    let text = combined(&out);
+    assert!(
+        !out.status.success()
+            && text.contains("halted after Plan")
+            && text.contains(&format!("devflow resume --phase {PHASE}")),
+        "resume --reviews on a run stopped in Code was not refused naming why: {text}"
+    );
+    assert_eq!(
+        state_bytes(root),
+        before,
+        "a refused resume --reviews changed the state: {text}"
+    );
+}
+
 /// 52.1 D-09.1: `resume` with no run state refuses, naming `devflow start --phase N`,
 /// and writes no state.
 #[test]
@@ -575,7 +612,7 @@ fn resume_with_no_state_names_start() {
     let root = repo.path();
     init_repo(root);
 
-    let (out, _reaper) = resume_phase(&home, root);
+    let (out, _reaper) = resume_phase(&home, root, &[]);
     let text = combined(&out);
     assert!(
         !out.status.success(),

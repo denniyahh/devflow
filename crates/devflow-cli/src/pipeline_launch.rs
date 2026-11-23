@@ -2687,6 +2687,13 @@ fn resume_advance(state: &State, reviews: bool) -> Option<(Stage, Stage)> {
         .map(|to| (state.stage, to))
 }
 
+/// The refusal of a `resume --reviews` (D-04) on a run that is not halted after Plan by
+/// its own `--until plan` cap, else `None`.
+#[allow(dead_code)]
+fn reviews_resume_refusal(_state: &State) -> Option<String> {
+    None
+}
+
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
 /// anything.
 ///
@@ -3923,6 +3930,133 @@ mod tests {
         let dir = root.join(format!(".planning/phases/{padded}-x"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{padded}-REVIEWS.md")), "# reviews\n").unwrap();
+    }
+
+    /// A Plan or Code state of `phase` stopped with `stop_until = Some(stage)` and `reason`.
+    fn stopped_state(phase: PhaseId, stage: Stage, reason: &str) -> State {
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, PathBuf::new());
+        state.stage = stage;
+        state.stop_until = Some(stage);
+        state.stopped = true;
+        state.stop_reason = Some(reason.to_string());
+        state
+    }
+
+    /// Restrictive verbs: an operator stop during the capped Plan is not a halt after
+    /// Plan, so `resume --reviews` refuses it, naming why and the plain resume.
+    #[test]
+    fn reviews_resume_refuses_an_operator_stop_in_plan() {
+        let phase = PhaseId::new(5276);
+        let state = stopped_state(phase, Stage::Plan, "stopped via `devflow stop`");
+        let refusal = reviews_resume_refusal(&state);
+        assert!(
+            refusal.as_deref().is_some_and(|text| text.contains("halted after Plan")
+                && text.contains(&format!("devflow resume --phase {phase}"))),
+            "resume --reviews accepted a Plan the operator stopped: {refusal:?}"
+        );
+    }
+
+    /// Restrictive verbs: an `--until code` halt is a fired cap, but after Code, so
+    /// `resume --reviews` refuses it.
+    #[test]
+    fn reviews_resume_refuses_an_until_code_halt() {
+        let state = stopped_state(
+            PhaseId::new(5277),
+            Stage::Code,
+            &crate::pipeline_gate::until_halt_reason(Stage::Code),
+        );
+        let refusal = reviews_resume_refusal(&state);
+        assert!(
+            refusal.is_some(),
+            "resume --reviews accepted a halt after Code: {refusal:?}"
+        );
+    }
+
+    /// D-04: `resume --reviews` on an `--until plan` halt whose checkout has no
+    /// REVIEWS.md is refused, naming the expected path, and writes no state.
+    #[test]
+    fn resume_with_reviews_without_a_reviews_file_is_refused() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_reviews_without_a_reviews_file_is_refused";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5275);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        let padded = phase.padded();
+        std::fs::create_dir_all(root.join(format!(".planning/phases/{padded}-x"))).unwrap();
+        let state_file = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let result = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        let err = result.err().map(|err| err.to_string()).unwrap_or_default();
+        assert!(
+            err.contains(&format!(".planning/phases/{padded}-*/{padded}-REVIEWS.md"))
+                && err.contains(&root.display().to_string()),
+            "resume --reviews without a REVIEWS.md was not refused naming the path: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "a refused resume --reviews changed the state: {err}"
+        );
+    }
+
+    /// Review item 8: a `resume --reviews` whose launch fails puts the `--until plan`
+    /// halt back, so the run stays retryable by `resume --reviews` and a plain `resume`.
+    #[test]
+    fn a_failed_resume_with_reviews_launch_stays_retryable() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_failed_resume_with_reviews_launch_stays_retryable";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5278);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        write_reviews_file(root, phase);
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::Failed);
+        let error = resume_with_fallback(root, phase, None, None, true)
+            .expect_err("a failed launch fails")
+            .to_string();
+        assert!(
+            error.contains("systemd-run could not start unit"),
+            "{error}"
+        );
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(
+            crate::pipeline_gate::until_cap_fired(&state)
+                && !state.reviews_pass
+                && reviews_resume_refusal(&state).is_none(),
+            "a failed resume --reviews launch left the run unretryable: {state:?}"
+        );
+
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::Started);
+        let retry = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        retry.expect("the retried resume --reviews launches");
     }
 
     /// D-04 (#250), the resume clause: `resume --reviews` on a run its `--until plan`
