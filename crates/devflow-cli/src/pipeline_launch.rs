@@ -2243,9 +2243,9 @@ pub(crate) fn resume_with_fallback(
             crate::commands::print_runner_launched(phase, &headline, &unit);
             Ok(())
         }
-        Err(crate::service::LaunchError::Failed(why)) => Err(
-            re_mark_stopped_after_failed_launch(&mut state, phase, &why, reviews),
-        ),
+        Err(crate::service::LaunchError::Failed(why)) => Err(re_mark_stopped_after_failed_launch(
+            &mut state, phase, &why, reviews,
+        )),
         // 999.244: systemd-run was killed at its bound, so the manager may have accepted
         // the unit; the runner is read once under the holder, which it never takes.
         Err(crate::service::LaunchError::Unknown { unit, why }) => {
@@ -4010,8 +4010,10 @@ mod tests {
         let state = stopped_state(phase, Stage::Plan, "stopped via `devflow stop`");
         let refusal = reviews_resume_refusal(&state);
         assert!(
-            refusal.as_deref().is_some_and(|text| text.contains("halted after Plan")
-                && text.contains(&format!("devflow resume --phase {phase}"))),
+            refusal
+                .as_deref()
+                .is_some_and(|text| text.contains("halted after Plan")
+                    && text.contains(&format!("devflow resume --phase {phase}"))),
             "resume --reviews accepted a Plan the operator stopped: {refusal:?}"
         );
     }
