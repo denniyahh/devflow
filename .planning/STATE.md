@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-17-PLAN.md
-last_updated: "2026-11-23T08:58:27.710Z"
-last_activity: 2026-11-22
+stopped_at: Completed 53.2-18-PLAN.md
+last_updated: "2026-11-23T09:10:45.323Z"
+last_activity: 2026-11-23
 last_activity_desc: Phase 53.2 execution started
-state_head: 7a4f22c1defafd14b6ba17a2a30029f7aef8080f
+state_head: 6d9ce8541d59c4cf5a77a836109e9c446d753d15
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 107
-  completed_plans: 105
+  completed_plans: 106
   percent: 13
 ---
 
@@ -178,10 +178,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — READY TO EXECUTE
-Plan: 17 of 17
+Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
+Plan: 19 of 19
 Status: Ready to execute
-Last activity: 2026-11-22 — Phase 53.2 execution started
+Last activity: 2026-11-23 — Phase 53.2 execution started
 
 
 ## Recently Shipped
@@ -1082,6 +1082,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: resume --reviews reruns the halted Plan as a reviews pass and keeps the --until plan cap; a plain resume then advances
 - [Phase 53.2]: resume --reviews is refused before any write unless the --until plan cap halted Plan, and without NN-REVIEWS.md in the run's checkout
 - [Phase 53.2]: a failed resume --reviews launch restores the --until plan halt so the run stays retryable
+- [Phase 53.2]: 53.2-18: #337 replaces D-14's readiness clause; the fake systemd-run reads a start only from the runner's READY=1 on a per-launch NOTIFY_SOCKET listener, not from a held runner lock in /proc fdinfo
 
 ## Roadmap Evolution
 
@@ -1297,11 +1298,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P14 | 10min | 2 tasks | 4 files |
 | Phase 53.2 P15 | 14 min | 3 tasks | 8 files |
 | Phase 53.2 P17 | 10 min | 2 tasks | 5 files |
+| Phase 53.2 P18 | 11 min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-23T07:45:14.117Z
-**Stopped at:** Completed 53.2-17-PLAN.md
+**Last session:** 2026-11-23T09:10:43.213Z
+**Stopped at:** Completed 53.2-18-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
