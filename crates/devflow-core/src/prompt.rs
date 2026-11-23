@@ -439,10 +439,21 @@ fn validate_stage_prompt(phase: PhaseId, notes: &str) -> String {
 /// v1 skip-stage config flags removed by the 2026-06-19 architecture
 /// decision — a stage with no pre-existing artifact still runs in full.
 /// It serves Plan only.
+///
+/// With no PLAN.md, the prompt branches on the phase's CONTEXT.md
+/// ([`no_plan_branch`], D-02, #246): with none, the agent runs
+/// `/gsd-discuss-phase N` first, every question through `devflow_ask` as a
+/// `discuss` question, then `/gsd-plan-phase N`; with one, it runs
+/// `/gsd-plan-phase N` as before.
 fn idempotent_stage_prompt(phase: PhaseId, notes: &str) -> String {
     let artifact = "PLAN.md";
     let command = gsd_command_for(Stage::Plan, phase);
     let padded = phase.padded();
+    let branch = no_plan_branch(
+        &padded,
+        &format!("Run the GSD workflow command:\n\n\x20   /gsd-discuss-phase {phase}\n\n"),
+        &format!("run the GSD workflow command for this stage:\n\n\x20   {command}\n\n"),
+    );
     format!(
         "First check whether this stage's deliverable already exists:\n\
         \n\
@@ -454,11 +465,40 @@ fn idempotent_stage_prompt(phase: PhaseId, notes: &str) -> String {
         \n\
         DEVFLOW_RESULT: {{\"status\": \"success\"}}\n\
         \n\
-        - If it does NOT exist: run the GSD workflow command for this stage:\n\
-        \n\
-        \x20   {command}\n\
-        \n\
+        {branch}\
         {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
+    )
+}
+
+/// The Plan prompt's arm for a phase with no PLAN.md (D-02, #246): probe for
+/// the phase's CONTEXT.md, and with none run the discussion before planning.
+///
+/// `discuss_step` and `plan_step` say how this renderer runs each GSD
+/// workflow (a slash command, or a workflow file); each ends with a blank
+/// line. The discussion is told to send every question, free text included,
+/// through `devflow_ask`, because under DevFlow's one-shot launch no next
+/// user message ever comes (RESEARCH Pitfall 1). After it, the PLAN.md probe
+/// runs again, because a project that auto-advances chains discuss into
+/// plan-phase itself (Pitfall 2), and a discussion that wrote no CONTEXT.md
+/// is a reported failure rather than a silent success. The text names no GSD
+/// mode flag at all, so the Plan prompt never carries
+/// [`AUTO_CHAIN_PRESERVING_FLAG`].
+fn no_plan_branch(padded: &str, discuss_step: &str, plan_step: &str) -> String {
+    format!(
+        "- If it does NOT exist: check whether the phase has a discussion context:\n\
+        \n\
+        ls .planning/phases/{padded}-*/{padded}-*CONTEXT.md 2>/dev/null\n\
+        \n\
+        - If no CONTEXT.md exists: discuss the phase first. {discuss_step}\
+        Run the discussion interactively, exactly as named here, adding no flags. Send \
+        every question it asks through `devflow_ask` with kind `discuss`, including a \
+        free-text \"Other\" follow-up, and never end your turn to wait for a next user \
+        message: none will come. When the discussion has finished, check for the \
+        CONTEXT.md again. If it still does not exist, do not plan: report the stage \
+        failed, naming the missing CONTEXT.md in the reason. Otherwise run the PLAN.md \
+        check above again. If it now finds a plan, the stage's work is done; if it finds \
+        none, {plan_step}\
+        - If CONTEXT.md EXISTS: {plan_step}"
     )
 }
 
