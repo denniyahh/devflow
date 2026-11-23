@@ -1141,6 +1141,75 @@ fn start_dry_run_lists_exactly_plan_code_validate() {
     );
 }
 
+/// The `.gitignore` lines GSD's derived files need, as the #285 warning names them.
+const GSD_IGNORE_LINES: &[&str] = &[".planning/state.json", ".planning/milestone.lock", ".gsd/"];
+
+/// `devflow start --dry-run --phase 1 --mode supervise` on `root`. Returns the child's
+/// stderr, after asserting the dry run exits 0.
+fn start_dry_run_stderr(root: &Path) -> String {
+    let home = common::HermeticHome::new();
+    let fake_bin = fake_bin_dir(&[]);
+    let output = common::hermetic_devflow(&home)
+        .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
+        .arg(root)
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "dry-run must not fail\nstderr: {stderr}"
+    );
+    stderr
+}
+
+/// #285 (D-13): a project whose `.gitignore` lacks GSD's derived files hears, at start,
+/// which lines to add; the dry run still succeeds, since the check never refuses.
+#[test]
+fn start_dry_run_warns_when_gsd_derived_files_are_not_ignored() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+
+    let stderr = start_dry_run_stderr(root);
+
+    let to_add: Vec<&str> = stderr
+        .lines()
+        .skip_while(|line| !line.contains(".gitignore"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        to_add, GSD_IGNORE_LINES,
+        "start did not warn about unignored GSD derived files: {stderr}"
+    );
+}
+
+/// Control for the test above: with those lines committed in `.gitignore`, the dry run
+/// prints no `.gitignore` warning.
+#[test]
+fn start_dry_run_is_silent_when_gsd_derived_files_are_ignored() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".gitignore"),
+        format!("{}\n", GSD_IGNORE_LINES.join("\n")),
+    )
+    .unwrap();
+    git(root, &["add", ".gitignore"]);
+    git(root, &["commit", "-q", "-m", "ignore GSD derived files"]);
+
+    let stderr = start_dry_run_stderr(root);
+
+    assert!(
+        !stderr.contains(".gitignore"),
+        "start warned about GSD derived files that are ignored: {stderr}"
+    );
+}
+
 const EXTERNAL_VERIFY_WARNING_PREFIX: &str = "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=";
 const EXTERNAL_VERIFY_YES_WARNING: &str =
     "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=\"yes\" is not true or false";
