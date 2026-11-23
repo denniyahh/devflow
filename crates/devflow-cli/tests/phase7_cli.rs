@@ -1305,6 +1305,32 @@ fn start_dry_run_tells_to_untrack_a_tracked_gsd_derived_file() {
     );
 }
 
+/// D-13 (F04): `.gsd/` is a directory GSD writes several files into, so every tracked
+/// file under it is told to be untracked, not only the sentinel the ignore check probes.
+#[test]
+fn start_dry_run_tells_to_untrack_any_tracked_file_under_gsd() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".gitignore"),
+        format!("{}\n", GSD_IGNORE_LINES.join("\n")),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".gsd")).unwrap();
+    fs::write(root.join(".gsd/other.json"), "{}").unwrap();
+    git(root, &["add", ".gitignore"]);
+    git(root, &["add", "-f", ".gsd/other.json"]);
+    git(root, &["commit", "-q", "-m", "commit a file under .gsd"]);
+
+    let stderr = start_dry_run_stderr(root);
+
+    assert!(
+        stderr.contains("untrack it: git rm --cached .gsd/other.json"),
+        "start did not tell to untrack a tracked file under .gsd/: {stderr}"
+    );
+}
+
 const EXTERNAL_VERIFY_WARNING_PREFIX: &str = "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=";
 const EXTERNAL_VERIFY_YES_WARNING: &str =
     "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=\"yes\" is not true or false";

@@ -4215,6 +4215,51 @@ mod tests {
         );
     }
 
+    /// D-11 (F05): a timed-out resume whose runner ran, recorded its own stop and exited
+    /// keeps that stop, and the error names it rather than saying the run was not launched.
+    #[test]
+    fn a_timed_out_resume_whose_runner_recorded_its_stop_names_that_stop() {
+        const NAME: &str = "pipeline_launch::tests::a_timed_out_resume_whose_runner_recorded_its_stop_names_that_stop";
+        const RUNNER_STOP: &str = "runner stop reason";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5395);
+        save_stopped_in_plan(root, phase, AgentKind::Codex, "stopped via `devflow stop`");
+        crate::service::double::set_launch_end(crate::service::double::LaunchEnd::TimedOutLeaving(
+            Ok("inactive"),
+        ));
+        let runner_root = root.to_path_buf();
+        crate::service::double::run_during_launch(move || {
+            workflow::update_state(&runner_root, phase, |state| {
+                state.stopped = true;
+                state.stop_reason = Some(RUNNER_STOP.to_string());
+                Ok::<_, workflow::WorkflowError>(())
+            })
+            .expect("the stand-in runner records its own stop");
+        });
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        let error = result
+            .expect_err("a timed-out resume with no live runner fails")
+            .to_string();
+        let state = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(RUNNER_STOP),
+            "the failed resume overwrote the stop its runner recorded"
+        );
+        assert!(
+            error.contains(RUNNER_STOP) && !error.contains("was not launched"),
+            "the error did not name the runner's own stop: {error}"
+        );
+    }
+
     /// D-04 (#250), the resume clause: `resume --reviews` on a run its `--until plan`
     /// cap halted reruns Plan as a reviews pass instead of advancing, and keeps the cap,
     /// so the reviews Plan halts again.
