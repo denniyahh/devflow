@@ -1207,3 +1207,75 @@ fn discard_during_a_stop_of_a_deactivating_unit_is_refused_until_stop_returns() 
         text(&discarded)
     );
 }
+
+/// D-07a: with no DevFlow verb holding the phase, a unit put into deactivating by the
+/// manager alone (its runner gone, a SIGTERM-ignoring straggler left) is waited out by
+/// `devflow discard`, which removes nothing until the unit leaves deactivating and then
+/// removes the run's state.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn discard_with_no_stop_running_waits_out_a_deactivating_unit() {
+    assert_manager_answers();
+    let phase = PhaseId::new(90);
+    let fixture = StartFixture::new(phase, STRAGGLER_TAIL);
+    let guard = start_a_run_with_a_straggler(&fixture);
+
+    let stopping = systemctl(&["stop", "--no-block", &guard.unit]);
+    assert!(
+        stopping.status.success(),
+        "systemctl stop --no-block failed:\n{}",
+        String::from_utf8_lossy(&stopping.stderr)
+    );
+    wait_until(
+        || {
+            unit_property(&guard.unit, "ActiveState") == "deactivating"
+                && !fixture.runner_lock_live()
+        },
+        &guard.unit,
+        "the unit never read deactivating with its runner lock free",
+    );
+
+    let number = phase.to_string();
+    let root = fixture.root.display().to_string();
+    let state_file = devflow_core::workflow::state_path(&fixture.root, phase);
+    let mut discard = common::host_service_devflow(&fixture.home)
+        .env("PATH", fixture.path(None))
+        .args(["discard", "--phase", &number, &root])
+        .current_dir(&fixture.root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn devflow discard");
+    let mut waiting_passes = 0_u32;
+    loop {
+        // Both are read before the unit's state, so a unit seen deactivating afterwards
+        // was deactivating when they were taken.
+        let exited = discard.try_wait().expect("poll discard").is_some();
+        let state_kept = state_file.is_file();
+        if unit_property(&guard.unit, "ActiveState") != "deactivating" {
+            break;
+        }
+        assert!(
+            !exited,
+            "discard returned while the unit read deactivating\njournal:\n{}",
+            journal_of(&guard.unit)
+        );
+        assert!(
+            state_kept,
+            "discard acted while deactivating: the state is gone"
+        );
+        waiting_passes += 1;
+        std::thread::sleep(UNIT_POLL);
+    }
+    assert!(
+        waiting_passes > 0,
+        "the unit left deactivating before discard was seen waiting"
+    );
+
+    let discarded = wait_for_child(discard, &guard.unit, "discard never returned");
+    assert!(
+        discarded.status.success() && !state_file.exists(),
+        "discard did not complete once the unit left deactivating:\n{}",
+        text(&discarded)
+    );
+}
