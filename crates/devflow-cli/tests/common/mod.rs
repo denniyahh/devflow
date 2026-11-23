@@ -47,13 +47,20 @@ pub const FAKE_TOOL_PREFIX: &str = "fake ";
 /// (`version.fail` in its own dir: exit 1 with the error `systemctl` prints when it
 /// cannot reach a user manager), `--user show -p ActiveState --value U` (`U.fail` in its own dir: exit 1
 /// with a bus error; `U.deactivating`: deactivating; `U.activating`: activating;
-/// `U.failed`: failed; otherwise inactive), `--user reset-failed U` (appends
+/// `U.failed`: failed; otherwise active while the pid the fake `systemd-run` recorded in
+/// `U.pid` is alive and not a zombie, else inactive; each answer is also appended, one
+/// per line, to `U.active-reads`), `--user reset-failed U` (appends
 /// `reset-failed U` to [`FAKE_CALL_LOG`] and removes `U.failed`) and `--user stop U`. The stop writes
 /// `U.stop-called`, removes `U.activating`, and ends the pid the fake `systemd-run`
 /// recorded in `U.pid`: SIGKILL at once with a `U.kill` marker, else SIGTERM, a bounded
 /// wait, then SIGKILL, as the manager does at `TimeoutStopSec`. With no recorded pid it
 /// exits 0.
-const FAKE_SYSTEMCTL_CALLS: &str = r#"if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4 $5" = "--user show -p Version --value" ]; then
+const FAKE_SYSTEMCTL_CALLS: &str = r#"alive() {
+  s=""
+  if [ -r "/proc/$1/stat" ]; then read -r a b s rest <"/proc/$1/stat"; fi
+  [ -n "$s" ] && [ "$s" != Z ]
+}
+if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4 $5" = "--user show -p Version --value" ]; then
   if [ -e "$dir/version.fail" ]; then
     echo "Failed to connect to bus: No medium found" >&2; exit 1
   fi
@@ -63,10 +70,18 @@ if [ "$#" -eq 6 ] && [ "$1 $2 $3 $4 $5" = "--user show -p ActiveState --value" ]
   if [ -e "$dir/$6.fail" ]; then
     echo "Failed to get properties: Transport endpoint is not connected" >&2; exit 1
   fi
-  if [ -e "$dir/$6.deactivating" ]; then echo deactivating
-  elif [ -e "$dir/$6.activating" ]; then echo activating
-  elif [ -e "$dir/$6.failed" ]; then echo failed
-  else echo inactive; fi
+  if [ -e "$dir/$6.deactivating" ]; then state=deactivating
+  elif [ -e "$dir/$6.activating" ]; then state=activating
+  elif [ -e "$dir/$6.failed" ]; then state=failed
+  else
+    state=inactive
+    if [ -e "$dir/$6.pid" ]; then
+      read -r pid rest <"$dir/$6.pid"
+      alive "$pid" && state=active
+    fi
+  fi
+  echo "$state" >>"$dir/$6.active-reads"
+  echo "$state"
   exit 0
 fi
 if [ "$#" -eq 3 ] && [ "$1 $2" = "--user reset-failed" ]; then
@@ -79,21 +94,16 @@ if [ "$#" -eq 3 ] && [ "$1 $2" = "--user stop" ]; then
   @RM@ -f "$dir/$3.activating"
   [ -e "$dir/$3.pid" ] || exit 0
   read -r pid rest <"$dir/$3.pid"
-  alive() {
-    s=""
-    if [ -r "/proc/$pid/stat" ]; then read -r a b s rest <"/proc/$pid/stat"; fi
-    [ -n "$s" ] && [ "$s" != Z ]
-  }
   if [ -e "$dir/$3.kill" ]; then
     kill -KILL "$pid" 2>/dev/null
   else
     kill -TERM "$pid" 2>/dev/null
     tries=0
-    while [ "$tries" -lt 200 ] && alive; do tries=$((tries + 1)); @SLEEP@ 0.05; done
-    alive && kill -KILL "$pid" 2>/dev/null
+    while [ "$tries" -lt 200 ] && alive "$pid"; do tries=$((tries + 1)); @SLEEP@ 0.05; done
+    alive "$pid" && kill -KILL "$pid" 2>/dev/null
   fi
   tries=0
-  while [ "$tries" -lt 100 ] && alive; do tries=$((tries + 1)); @SLEEP@ 0.05; done
+  while [ "$tries" -lt 100 ] && alive "$pid"; do tries=$((tries + 1)); @SLEEP@ 0.05; done
   exit 0
 fi
 "#;
