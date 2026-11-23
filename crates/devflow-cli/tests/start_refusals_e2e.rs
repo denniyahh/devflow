@@ -579,7 +579,11 @@ fn resume_reviews_on_a_run_stopped_in_code_is_refused() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    fs::write(root.join(".planning/phases/12-test/12-REVIEWS.md"), "# reviews\n").unwrap();
+    fs::write(
+        root.join(".planning/phases/12-test/12-REVIEWS.md"),
+        "# reviews\n",
+    )
+    .unwrap();
     save_phase_state(root, |state| {
         state.verification_baseline_captured = true;
         state.stage = devflow_core::stage::Stage::Code;
