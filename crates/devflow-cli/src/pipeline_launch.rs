@@ -6737,6 +6737,29 @@ mod tests {
             .collect()
     }
 
+    /// D-10 (#324): an advance stop's reason and its `advance_stopped` event name the
+    /// runner, not the supervisor Phase 52.2 removed.
+    #[test]
+    fn an_advance_stop_names_the_runner_not_the_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5324);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.into());
+        workflow::save_state(&state).unwrap();
+        record_advance_stop(&mut state, 2).unwrap();
+        let reason = workflow::load_state(root, phase).unwrap().stop_reason;
+        let source = events_named(root, "advance_stopped")
+            .last()
+            .map(|event| event["source"].clone());
+        assert!(
+            reason.as_deref() == Some(ADVANCE_STOP_REASON)
+                && ADVANCE_STOP_REASON.contains("runner")
+                && !ADVANCE_STOP_REASON.contains("supervisor")
+                && source.as_ref().and_then(serde_json::Value::as_str) == Some("runner"),
+            "the advance stop still names the supervisor: {reason:?} / {source:?}"
+        );
+    }
+
     // ---- 51-01: rate-limit failover at Code (SUPV-02) ----
 
     /// The capture-shape rate-limit envelope a rate-limited stub prints. Its

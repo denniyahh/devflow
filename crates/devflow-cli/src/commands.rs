@@ -6779,6 +6779,193 @@ mod tests {
             .collect()
     }
 
+    /// Where [`lines_with_a_literal_naming_the_supervisor`]'s lexer is between
+    /// characters: it carries from line to line, so a multi-line literal's quote-free
+    /// continuation lines are inside it.
+    #[derive(Clone, Copy)]
+    enum Lexed {
+        Code,
+        Str,
+        RawStr { hashes: usize },
+        BlockComment { depth: usize },
+    }
+
+    /// Lex one `line` from `lexed`, returning the text it holds inside string literals
+    /// and the state the next line starts in. `//` ends the line's scan, `/*` skips to
+    /// its `*/`, a char literal (`'"'`, `'\"'`) opens nothing, and a raw literal closes
+    /// only at `"` followed by its own number of `#`. A `b` or `c` prefix precedes the
+    /// same openers, so it needs no case of its own.
+    fn lex_literal_text(line: &str, mut lexed: Lexed) -> (String, Lexed) {
+        let chars: Vec<char> = line.chars().collect();
+        let mut text = String::new();
+        let mut at = 0;
+        while at < chars.len() {
+            let here = chars[at];
+            let next = chars.get(at + 1).copied();
+            match lexed {
+                Lexed::Code => match (here, next) {
+                    ('/', Some('/')) => break,
+                    ('/', Some('*')) => {
+                        lexed = Lexed::BlockComment { depth: 1 };
+                        at += 1;
+                    }
+                    ('"', _) => lexed = Lexed::Str,
+                    ('r', _) => {
+                        let hashes = chars[at + 1..].iter().take_while(|c| **c == '#').count();
+                        if chars.get(at + 1 + hashes) == Some(&'"') {
+                            lexed = Lexed::RawStr { hashes };
+                            at += 1 + hashes;
+                        }
+                    }
+                    ('\'', Some('\\')) => {
+                        let close = chars[at + 3..].iter().position(|c| *c == '\'');
+                        at += close.map_or(1, |close| close + 3);
+                    }
+                    ('\'', Some(_)) if chars.get(at + 2) == Some(&'\'') => at += 2,
+                    _ => {}
+                },
+                Lexed::Str => match here {
+                    '\\' => at += 1,
+                    '"' => lexed = Lexed::Code,
+                    _ => text.push(here),
+                },
+                Lexed::RawStr { hashes } => {
+                    let closes = here == '"'
+                        && chars.len() >= at + 1 + hashes
+                        && chars[at + 1..at + 1 + hashes].iter().all(|c| *c == '#');
+                    if closes {
+                        lexed = Lexed::Code;
+                        at += hashes;
+                    } else {
+                        text.push(here);
+                    }
+                }
+                Lexed::BlockComment { depth } => match (here, next) {
+                    ('*', Some('/')) => {
+                        lexed = if depth == 1 {
+                            Lexed::Code
+                        } else {
+                            Lexed::BlockComment { depth: depth - 1 }
+                        };
+                        at += 1;
+                    }
+                    ('/', Some('*')) => {
+                        lexed = Lexed::BlockComment { depth: depth + 1 };
+                        at += 1;
+                    }
+                    _ => {}
+                },
+            }
+            at += 1;
+        }
+        (text, lexed)
+    }
+
+    /// The lines of `source` before its first `mod tests {` line whose text inside a
+    /// string literal, a multi-line literal's continuation lines included, names the
+    /// supervisor (any case). Comments do not count.
+    fn lines_with_a_literal_naming_the_supervisor(source: &str) -> Vec<String> {
+        let mut lexed = Lexed::Code;
+        let mut found = Vec::new();
+        for line in source
+            .lines()
+            .take_while(|line| !line.contains("mod tests {"))
+        {
+            let (text, after) = lex_literal_text(line, lexed);
+            lexed = after;
+            if text.to_lowercase().contains("supervisor") {
+                found.push(line.to_string());
+            }
+        }
+        found
+    }
+
+    /// The `///` lines of `source` before its first `mod tests {` line that name the
+    /// supervisor (any case): clap turns them into help text.
+    fn help_lines_naming_the_supervisor(source: &str) -> Vec<String> {
+        source
+            .lines()
+            .take_while(|line| !line.contains("mod tests {"))
+            .filter(|line| {
+                line.trim_start().starts_with("///") && line.to_lowercase().contains("supervisor")
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// D-10 (#324): no user-facing text of either crate names the supervisor Phase 52.2
+    /// removed: no string literal outside a test module, and no `///` help line in
+    /// main.rs. Comments recording the removal stay. Controls pin the lexer: literals
+    /// count, a continuation line counts, comments after a char or raw literal that
+    /// holds a quote do not, nor does a test-module line.
+    #[test]
+    fn no_user_facing_text_names_the_supervisor() {
+        let count = |source: &str| lines_with_a_literal_naming_the_supervisor(source).len();
+        assert_eq!(
+            count("let s = \"the supervisor\";\n"),
+            1,
+            "planted control: a one-line literal counts 1"
+        );
+        let continued = "let s = \"first \\\n    the supervisor ended \\\n    last\";\n";
+        assert_eq!(
+            lines_with_a_literal_naming_the_supervisor(continued),
+            vec!["    the supervisor ended \\".to_string()],
+            "planted control: a continuation line inside a multi-line literal counts 1"
+        );
+        assert_eq!(
+            count("// the supervisor\n"),
+            0,
+            "planted control: a comment counts 0"
+        );
+        assert_eq!(
+            count("let c = '\"'; // the supervisor\n"),
+            0,
+            "planted control: a comment after a char literal holding a quote counts 0"
+        );
+        assert_eq!(
+            count("let r = r#\"a \"quoted\" word\"#; // the supervisor\n"),
+            0,
+            "planted control: a comment after a raw string with inner quotes counts 0"
+        );
+        assert_eq!(
+            count("let s = b\"the supervisor\";\n"),
+            1,
+            "planted control: a byte-string literal counts 1"
+        );
+        assert_eq!(
+            count("let b = b'\"'; // the supervisor\n"),
+            0,
+            "planted control: a comment after a byte-char literal holding a quote counts 0"
+        );
+        assert_eq!(
+            count("fn f() {}\nmod tests {\nlet s = \"the supervisor\";\n}\n"),
+            0,
+            "planted control: a literal inside the test module counts 0"
+        );
+        assert_eq!(
+            help_lines_naming_the_supervisor("/// before the first supervisor spawns\n").len(),
+            1,
+            "planted control: a help line naming the supervisor counts 1"
+        );
+
+        let main_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let lines: Vec<String> = kept_lines_with_paths(
+            &both_crates_rust_sources(),
+            lines_with_a_literal_naming_the_supervisor,
+        )
+        .into_iter()
+        .chain(kept_lines_with_paths(
+            &[main_rs],
+            help_lines_naming_the_supervisor,
+        ))
+        .map(|(path, line)| format!("{}: {line}", path.display()))
+        .collect();
+        assert!(
+            lines.is_empty(),
+            "user-facing text names the removed supervisor: {lines:#?}"
+        );
+    }
+
     /// Whether `source`'s `pub struct State {` block, through the first line that is
     /// exactly `}`, declares a field named `supervisor`.
     fn state_struct_has_a_supervisor_field(source: &str) -> bool {
