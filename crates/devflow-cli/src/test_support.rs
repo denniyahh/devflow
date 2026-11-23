@@ -539,7 +539,6 @@ pub(crate) fn assert_child_ran_exactly_one_passing_test(
 /// real system directories that hold it (19i's replace-not-prepend
 /// requirement is preserved).
 pub(crate) fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
     let dir = agent_free_git_only_path_dir();
     let real_sh = std::env::var_os("PATH")
         .and_then(|paths| {
@@ -551,10 +550,7 @@ pub(crate) fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir
         .expect("sh must be resolvable on PATH to run this test");
     std::os::unix::fs::symlink(&real_sh, dir.path().join("sh")).unwrap();
     let path = dir.path().join(program);
-    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
+    devflow_core::test_support::write_executable(&path, "#!/bin/sh\nexit 0\n");
     dir
 }
 
@@ -562,12 +558,8 @@ pub(crate) fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir
 /// [`agent_free_dir_with_agent_stub`], for a test whose run names two agents
 /// (a primary and its fallback) and so needs both binaries resolvable.
 pub(crate) fn add_agent_stub(path_dir: &Path, program: &str) {
-    use std::os::unix::fs::PermissionsExt;
     let path = path_dir.join(program);
-    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
+    devflow_core::test_support::write_executable(&path, "#!/bin/sh\nexit 0\n");
 }
 
 /// An agent `program` stand-in that answers `--version`, then waits for `go`

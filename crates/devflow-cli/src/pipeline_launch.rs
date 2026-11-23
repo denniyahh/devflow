@@ -6897,18 +6897,15 @@ mod tests {
     /// relaunched onto either stays running, so its supervisor makes no further
     /// state write while the test reads the state.
     fn waiting_agents_dir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let path_dir = agent_free_dir_with_agent_stub("claude");
         for program in ["claude", "codex"] {
             let path = path_dir.path().join(program);
-            std::fs::write(
+            devflow_core::test_support::write_executable(
                 &path,
                 "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
                  i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
                  exit 0\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
         }
         let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
             .into_iter()
@@ -7294,22 +7291,19 @@ mod tests {
     /// stubs they replace. The marker is created after the write completes, so a
     /// reader that sees it reads the whole argv.
     fn argv_recording_agents_dir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let path_dir = waiting_agents_dir();
         for program in ["claude", "codex"] {
             let path = path_dir.path().join(program);
-            std::fs::write(
+            devflow_core::test_support::write_executable(
                 &path,
-                format!(
+                &format!(
                     "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
                      for arg in \"$@\"; do printf '%s\\0' \"$arg\"; done > {program}-argv.bin\n\
                      : > {program}-argv.done\n\
                      i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
                      exit 0\n"
                 ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
         }
         path_dir
     }
@@ -9585,14 +9579,12 @@ mod tests {
     /// long. `true` in the parent,
     /// whose work is done.
     fn parent_of_a_past_reset_claude_child(name: &str) -> bool {
-        use std::os::unix::fs::PermissionsExt;
         if devflow_core::test_support::in_child_test(name) {
             return false;
         }
         let path_dir = agent_free_dir_with_agent_stub("claude");
         let stub = path_dir.path().join("claude");
-        std::fs::write(&stub, past_reset_claude_script()).unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        devflow_core::test_support::write_executable(&stub, &past_reset_claude_script());
         let output = crate::test_support::run_hermetic_test_in_child(
             name,
             path_dir.path(),
