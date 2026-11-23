@@ -397,7 +397,7 @@ Run conventions: discuss `--auto` in session, then `devflow start --phase 53.2 -
 --until plan`, external review (Tier B), close-out with `scripts/cut-pr-branch.sh`.
 **Requirements**: no REQ IDs; the issues above
 **Depends on:** Phase 53.1
-**Plans:** 13/17 plans executed
+**Plans:** 14/17 plans executed
 
 Plans:
 **Wave 1**
@@ -422,7 +422,7 @@ Plans:
 - [x] 53.2-13-PLAN.md — #297 stop holds the phase holder; #324 no supervisor in texts (wave 4)
 
 **Wave 5** *(blocked on Wave 4 completion)*
-- [ ] 53.2-14-PLAN.md — #281 (999.260) resume follows the until halt's target (wave 5)
+- [x] 53.2-14-PLAN.md — #281 (999.260) resume follows the until halt's target (wave 5)
 
 **Wave 6** *(blocked on Wave 5 completion)*
 - [ ] 53.2-15-PLAN.md — #250 start --reviews flag, refusal, dry run, resume (wave 6)
@@ -675,7 +675,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
-| 53.2. wsx/UDE first-use and dogfood remediation | 13/17 | In Progress | - |
+| 53.2. wsx/UDE first-use and dogfood remediation | 14/17 | In Progress | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 

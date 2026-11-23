@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-13-PLAN.md
-last_updated: "2026-11-23T07:04:51.462Z"
+stopped_at: Completed 53.2-14-PLAN.md
+last_updated: "2026-11-23T07:16:10.164Z"
 last_activity: 2026-11-22
 last_activity_desc: Phase 53.2 execution started
-state_head: d53fc2a0804540a947e8407b879b301e9d0a2cb0
+state_head: 418057ebb04ca663514531bceb8b04dd74265be1
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 105
-  completed_plans: 101
+  completed_plans: 102
   percent: 13
 ---
 
@@ -179,7 +179,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
-Plan: 14 of 17
+Plan: 15 of 17
 Status: Ready to execute
 Last activity: 2026-11-22 — Phase 53.2 execution started
 
@@ -1076,6 +1076,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: 53.2-12: the #258 resume sibling reproduced; re_mark_stopped_after_failed_launch keeps a stop_reason its runner wrote
 - [Phase 53.2]: 53.2-12: a NotLive timed-out start clears its run only on JSON equality with the state read back after start_reserved
 - [Phase 53.2]: 53.2-13: stop claims the phase holder via liveness::claim_phase_holder right before stop_unit (no write-lock barrier) and holds it through the reload; a stop while any verb holds the phase now refuses, Live runner or not
+- [Phase 53.2]: 53.2-14: the --until halt records its transition's target in State::until_halt_target; resume_advance reads it (else Stage::next); enter_stage clears it on every stage entry
 
 ## Roadmap Evolution
 
@@ -1288,11 +1289,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P11 | unrecorded | 3 tasks | 0 files |
 | Phase 53.2 P12 | 14min | 3 tasks | 5 files |
 | Phase 53.2 P13 | 35min | 2 tasks | 7 files |
+| Phase 53.2 P14 | 10min | 2 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-11-23T07:04:49.484Z
-**Stopped at:** Completed 53.2-13-PLAN.md
+**Last session:** 2026-11-23T07:16:08.161Z
+**Stopped at:** Completed 53.2-14-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
