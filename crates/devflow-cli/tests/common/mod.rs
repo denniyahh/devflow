@@ -126,9 +126,12 @@ pub const FAKE_FAIL_NEXT: &str = "fail-next";
 /// --working-directory=D ... -- PROGRAM ARGS`): it changes to D, starts the command
 /// in its own session with stdin from `/dev/null` and stdout and stderr to `U.out` in
 /// its own dir, so the caller's output capture reaches EOF when this script exits, and
-/// records the command's pid as `U.pid`. It exits 0 once a `D/.devflow/.runner-*`
-/// record's first field is that pid, and exits 1 with systemd's text when the command
-/// dies first. A `fail-next` marker makes the launch print the marker's text and
+/// records the command's pid as `U.pid`. It exits 0 once that pid holds the launched
+/// phase's runner lock `D/.devflow/.runner-{padded}` (the phase is the argument after
+/// the command's `--phase`): one of the pid's descriptors is that file and its
+/// `/proc/PID/fdinfo` has a `lock:` line. It reads `/proc` and takes no lock itself, and
+/// skips without a word a descriptor that closed while it looked. It exits 1 with
+/// systemd's text when the command dies first. A `fail-next` marker makes the launch print the marker's text and
 /// exit 1 instead. A `U.failed` marker (the fake `systemctl` reads the unit `failed`)
 /// makes it refuse as systemd refuses a unit still loaded: it prints that text and
 /// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@` and `@RM@` are absolute paths written in
@@ -155,19 +158,32 @@ if [ -n "$unit" ] && [ -n "$wd" ] && [ "$#" -gt 0 ]; then
     @RM@ -f "$dir/fail-next"
     exit 1
   fi
+  phase=""; after_phase=""
+  for arg in "$@"; do
+    if [ -n "$after_phase" ]; then phase=$arg; after_phase=""; fi
+    [ "$arg" = --phase ] && after_phase=1
+  done
+  case "$phase" in
+    *.*) padded="$(printf '%02d' "${phase%%.*}").${phase#*.}" ;;
+    *) padded=$(printf '%02d' "$phase") ;;
+  esac
+  lock="$wd/.devflow/.runner-$padded"
+  held() {
+    for fd in /proc/"$pid"/fd/*; do
+      [ -e "$fd" ] && [ "$fd" -ef "$lock" ] || continue
+      if ( while read -r key rest; do [ "$key" = lock: ] && exit 0; done <"/proc/$pid/fdinfo/${fd##*/}"; exit 1 ) 2>/dev/null; then
+        return 0
+      fi
+    done
+    return 1
+  }
   cd "$wd" || exit 1
   @SETSID@ "$@" </dev/null >"$dir/$unit.out" 2>&1 &
   pid=$!
   echo "$pid" >"$dir/$unit.pid"
   tries=0
   while [ "$tries" -lt 600 ]; do
-    for lock in "$wd"/.devflow/.runner-*; do
-      if [ -f "$lock" ]; then
-        first=""
-        read -r first rest <"$lock"
-        if [ "$first" = "$pid" ]; then exit 0; fi
-      fi
-    done
+    held && exit 0
     state=""
     if [ -r "/proc/$pid/stat" ]; then read -r p comm state rest <"/proc/$pid/stat"; fi
     if [ -z "$state" ] || [ "$state" = Z ]; then
