@@ -2132,7 +2132,7 @@ pub(crate) fn resume(
     phase: PhaseId,
     agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
-    resume_with_fallback(project_root, phase, agent, None)
+    resume_with_fallback(project_root, phase, agent, None, false)
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
@@ -2178,6 +2178,7 @@ pub(crate) fn resume_with_fallback(
     phase: PhaseId,
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
+    _reviews: bool,
 ) -> Result<(), CliError> {
     // 999.229: said first, so it prints even when the resume then refuses.
     if let Some(warning) = devflow_core::config::external_verify_env_warning_now() {
@@ -3882,6 +3883,79 @@ mod tests {
         );
     }
 
+    /// Write `{padded}-REVIEWS.md` into a phase directory of `root`'s checkout.
+    fn write_reviews_file(root: &Path, phase: PhaseId) {
+        let padded = phase.padded();
+        let dir = root.join(format!(".planning/phases/{padded}-x"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{padded}-REVIEWS.md")), "# reviews\n").unwrap();
+    }
+
+    /// D-04 (#250), the resume clause: `resume --reviews` on a run its `--until plan`
+    /// cap halted reruns Plan as a reviews pass instead of advancing, and keeps the cap,
+    /// so the reviews Plan halts again.
+    #[test]
+    fn resume_with_reviews_after_an_until_plan_halt_reruns_plan_as_a_reviews_pass() {
+        const NAME: &str = "pipeline_launch::tests::resume_with_reviews_after_an_until_plan_halt_reruns_plan_as_a_reviews_pass";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5274);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        write_reviews_file(root, phase);
+        let saved = workflow::load_state(root, phase).unwrap();
+
+        let result = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let mut probed = reloaded.clone();
+        LAUNCH_PROBE.set(Some(Vec::new()));
+        let first = runner_first_step(&mut probed);
+        let probe = LAUNCH_PROBE.take().expect("the probe was set");
+        assert_eq!(
+            probe,
+            vec![(Stage::Plan, AgentKind::Codex)],
+            "resume --reviews after an --until plan halt launched {probe:?}, not a reviews Plan"
+        );
+        match first {
+            Ok(Some(launch)) => assert_eq!(launch.state.stage, Stage::Plan),
+            Ok(None) => panic!("the runner's first step resolved no Plan launch"),
+            Err(err) => panic!("the runner's first step refused the Plan launch: {err}"),
+        }
+        assert!(
+            reloaded.reviews_pass,
+            "resume --reviews set no reviews pass"
+        );
+        assert_eq!(
+            reloaded.stop_until,
+            Some(Stage::Plan),
+            "the cap was dropped"
+        );
+        assert_eq!(reloaded.until_halt_target, saved.until_halt_target);
+        assert!(!reloaded.stopped, "the resumed run still reads stopped");
+        let prompt =
+            default_stage_prompt(&reloaded, agents::driver_for(AgentKind::Claude).as_ref());
+        assert!(
+            prompt.contains(&format!("/gsd-plan-phase {phase} --reviews")),
+            "the resumed Plan does not render the reviews pass: {prompt}"
+        );
+    }
+
     /// #281 (D-09): a Plan gate answered "validate again" under `--until plan` moves
     /// Plan->Validate, which the cap halts; the resume launches the Validate that move
     /// asked for, not Code, and spends the recorded target.
@@ -5183,7 +5257,7 @@ mod tests {
         let phase = PhaseId::new(5144);
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5230,7 +5304,7 @@ mod tests {
         let paused = workflow::load_state(root, phase).unwrap();
         assert!(!paused.stopped, "the run is not stopped");
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5300,7 +5374,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None);
+        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None, false);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let err = result
             .expect_err("handing the run to its own unused fallback is refused")
@@ -5344,7 +5418,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude), false);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let err = result
             .expect_err("a fallback equal to the run's agent is refused")
