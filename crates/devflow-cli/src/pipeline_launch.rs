@@ -3866,6 +3866,56 @@ mod tests {
         );
     }
 
+    /// #281 (D-09): a Plan gate answered "validate again" under `--until plan` moves
+    /// Plan->Validate, which the cap halts; the resume launches the Validate that move
+    /// asked for, not Code, and spends the recorded target.
+    #[test]
+    fn resume_after_an_until_plan_halt_reached_through_validate_again_launches_validate() {
+        const NAME: &str = "pipeline_launch::tests::resume_after_an_until_plan_halt_reached_through_validate_again_launches_validate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5380);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        workflow::save_state(&state).unwrap();
+        std::fs::write(agent_result::stdout_path(root, phase), "plan output\n").unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "0\n").unwrap();
+        // The move `Step::ValidateAgain` makes at a Plan gate.
+        let halted = crate::pipeline_gate::transition(root, &mut state, Stage::Validate);
+        assert!(
+            matches!(halted, Ok(None)),
+            "the cap halted the move to Validate"
+        );
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let (launched, probe) = first_step_after_resume(root, phase);
+        assert_eq!(
+            probe,
+            vec![(Stage::Validate, AgentKind::Codex)],
+            "resume after a validate-again --until halt launched {probe:?}, not Validate"
+        );
+        assert_eq!(launched.stage, Stage::Validate);
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().until_halt_target,
+            None,
+            "the resume spent the halt target"
+        );
+    }
+
     /// #258 (operator decision 3): a resume whose launch timed out with its runner not
     /// live keeps the `--until` halt the runner recorded during the launch, so the run
     /// still reads as halted by its cap rather than as a failed resume.
