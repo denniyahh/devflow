@@ -528,6 +528,18 @@ fn gaps_plan_prompt(phase: PhaseId, notes: &str) -> String {
     )
 }
 
+/// The reviews pass's Plan prompt (D-04, #250): run
+/// `/gsd-plan-phase N --reviews`, which replans the phase from its
+/// REVIEWS.md. Like [`gaps_plan_prompt`] it has no idempotency short-circuit
+/// and no discuss branch: the phase's plans exist by now (Pitfall 4).
+fn reviews_plan_prompt(phase: PhaseId, notes: &str) -> String {
+    let command = format!("{} --reviews", gsd_command_for(Stage::Plan, phase));
+    format!(
+        "External review feedback for this phase is in its REVIEWS.md. Replan with the GSD \
+        workflow command for this stage:\n\n    {command}\n\n{ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
+    )
+}
+
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: PhaseId) -> String {
     render_claude_style(&StageIntent::for_stage(stage, phase))
@@ -575,7 +587,7 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
         StageIntent::PlanReviews {
             phase,
             relaunch_note,
-        } => gaps_plan_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
+        } => reviews_plan_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
         StageIntent::Code {
             phase,
             fix: None,
