@@ -1056,7 +1056,11 @@ pub(crate) fn print_dry_run(state: &State) {
     println!("\nstage pipeline:");
     let mut stage = Some(Stage::Plan);
     while let Some(s) = stage {
-        let command = s.gsd_command().replace("{N}", &state.phase.to_string());
+        let mut command = s.gsd_command().replace("{N}", &state.phase.to_string());
+        // D-04 (#250): a reviews pass runs Plan as `/gsd-plan-phase N --reviews`.
+        if s == Stage::Plan && state.reviews_pass {
+            command.push_str(" --reviews");
+        }
         // F-7: these are PREDICTION probes, not live reads. Every one passes
         // literals rather than `state.consecutive_failures` /
         // `state.phase_validate_failures` on purpose — the preview answers

@@ -329,7 +329,7 @@ pub(crate) fn start(
     worktree: bool,
     dry_run: bool,
     until: Option<Stage>,
-    _reviews: bool,
+    reviews: bool,
     fallback: FallbackSource,
 ) -> Result<(), CliError> {
     // 999.229: said first, before any other output, a refusal or the dry-run
@@ -343,6 +343,7 @@ pub(crate) fn start(
     // forced restart and every other counter does not.
     let mut state = fresh_state_carrying_phase_failures(project_root, phase, agent, mode);
     state.stop_until = until;
+    state.reviews_pass = reviews;
     // Persist the operator's gate notify hook for the processes that outlive
     // this one (monitor chain, rate-limit resume), on the same "before
     // `create_run_state`" idiom. Captured here rather than in `State::new`
