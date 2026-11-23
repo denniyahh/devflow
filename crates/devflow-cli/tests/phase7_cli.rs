@@ -115,6 +115,81 @@ fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: 
     output
 }
 
+/// The polling budget of this file's wait helpers, from the values of `CI`
+/// and `DEVFLOW_E2E_POLL_BUDGET_SECS` (#301).
+fn poll_budget_from(_ci: Option<&str>, _override_secs: Option<&str>) -> Duration {
+    Duration::from_secs(10)
+}
+
+/// Poll `predicate` until it holds, panicking once `budget` has passed.
+fn poll_until(_budget: Duration, what: &str, mut predicate: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if predicate() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// The panic text of `f`, which must panic.
+fn panic_text(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+    let payload = std::panic::catch_unwind(f).expect_err("expected a panic");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .expect("a string panic payload")
+}
+
+#[test]
+fn poll_budget_is_longer_under_ci_and_overridable() {
+    let default = Duration::from_secs(10);
+    let under_ci = Duration::from_secs(30);
+    assert_eq!(poll_budget_from(None, None), default, "no CI");
+    assert_eq!(poll_budget_from(Some("true"), None), under_ci, "CI=true");
+    assert_eq!(poll_budget_from(Some("1"), None), under_ci, "CI=1");
+    assert_eq!(poll_budget_from(Some("false"), None), default, "CI=false");
+    assert_eq!(poll_budget_from(Some(""), None), default, "CI empty");
+    assert_eq!(poll_budget_from(Some("0"), None), default, "CI=0");
+    assert_eq!(
+        poll_budget_from(Some("true"), Some("5")),
+        Duration::from_secs(5),
+        "an override beats CI"
+    );
+}
+
+#[test]
+fn an_unparsable_poll_budget_override_panics_naming_it() {
+    let text = panic_text(|| {
+        poll_budget_from(None, Some("ten"));
+    });
+    assert!(text.contains("DEVFLOW_E2E_POLL_BUDGET_SECS"), "{text}");
+    assert!(text.contains("ten"), "{text}");
+}
+
+#[test]
+fn a_zero_poll_budget_override_panics() {
+    let text = panic_text(|| {
+        poll_budget_from(None, Some("0"));
+    });
+    assert!(text.contains("DEVFLOW_E2E_POLL_BUDGET_SECS"), "{text}");
+    assert!(text.contains("at least 1"), "{text}");
+}
+
+#[test]
+fn a_poll_helper_that_times_out_names_its_budget() {
+    let text = panic_text(|| {
+        poll_until(
+            Duration::from_millis(50),
+            "a condition that never holds",
+            || false,
+        )
+    });
+    assert!(text.contains("50ms"), "{text}");
+    assert!(text.contains("a condition that never holds"), "{text}");
+}
+
 fn wait_for(path: &Path) {
     for _ in 0..200 {
         if path.exists() {
