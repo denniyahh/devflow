@@ -7099,6 +7099,73 @@ mod tests {
         );
     }
 
+    /// D-06 (#247), in a process of its own: a question gate with a live waiter is
+    /// answered with `gate answer`, so its banner offers that verb, its option ids
+    /// and `--text`, and never approve or reject.
+    #[test]
+    fn a_live_question_gate_banner_offers_answer_not_approve() {
+        const NAME: &str = "commands::tests::a_live_question_gate_banner_offers_answer_not_approve";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_runner_liveness_child(NAME, &[]);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let (phase, stage) = (PhaseId::new(5321), Stage::Code);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+        let open = Gates::list_open(root);
+        assert_eq!(open.len(), 1, "{open:?}");
+
+        let banner = render_pending_gate_banner(root, &open, 10_000).unwrap();
+        let answer = format!("devflow gate answer {phase} --gate-id {}", opened.gate_id);
+        assert!(
+            banner.contains(&answer)
+                && banner.contains("budget-30")
+                && banner.contains("budget-120")
+                && banner.contains("--text")
+                && !banner.contains("gate approve")
+                && !banner.contains("gate reject"),
+            "a question gate's banner must offer gate answer, not approve/reject: {banner}"
+        );
+        registration.finish();
+    }
+
+    /// D-06 control, in a process of its own: an approval gate with a live waiter
+    /// still offers approve and reject, and no `gate answer`.
+    #[test]
+    fn a_live_approval_gate_banner_offers_approve_and_reject() {
+        const NAME: &str = "commands::tests::a_live_approval_gate_banner_offers_approve_and_reject";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_runner_liveness_child(NAME, &[]);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = PhaseId::new(5322);
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "stage code failed",
+        )
+        .unwrap();
+        let open = Gates::list_open(root);
+        assert_eq!(open.len(), 1, "{open:?}");
+        let gate_id = GateId::parse(&open[0].gate_id).unwrap();
+        let waiter = Gates::register_waiter(root, phase, Stage::Code, &gate_id).unwrap();
+
+        let banner = render_pending_gate_banner(root, &open, 10_000).unwrap();
+        assert!(
+            banner.contains(&format!("devflow gate approve {phase} --stage"))
+                && banner.contains(&format!("devflow gate reject {phase} --stage"))
+                && banner.contains("--note <reason>")
+                && !banner.contains("gate answer"),
+            "an approval gate's banner must offer approve and reject: {banner}"
+        );
+        drop(waiter);
+    }
+
     /// D-10 (review r2 codex-7), in a process of its own: a runner held between its
     /// agent's exit and its advance. The exit file alone does not end
     /// [`post_exit_line`]'s wait; the advance that commits a pending gate does, with the
