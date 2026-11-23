@@ -4745,31 +4745,106 @@ fn print_open_branches(project_root: &Path, rows: &[(PhaseId, workflow::Existing
     }
 }
 
-/// `status`'s lines under "open branches:", one per feature branch.
+/// `status`'s lines under "open branches:", one per feature branch (D-07, #248). A
+/// branch of a loaded run that recorded a base is compared against that base; every
+/// other branch against the project's. Each line names the base it was compared
+/// against and whose it is. A base that is not a local branch, or whose branches
+/// cannot be listed, gets one line saying its branches could not be compared.
 fn open_branch_lines(
     project_root: &Path,
-    _rows: &[(PhaseId, workflow::Existing, RunStatus)],
+    rows: &[(PhaseId, workflow::Existing, RunStatus)],
 ) -> Vec<String> {
-    let git = GitFlow::for_project(project_root);
-    let base = config::git_flow_for_project(project_root).develop;
-    let branches = match git.list_feature_branches() {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let mut lines = Vec::new();
-    for b in &branches {
-        // Interpolated, not literal (45-01): the comparison this suffix
-        // reports was computed against whatever trunk `list_feature_branches`
-        // actually used, and naming a different one is a false statement to
-        // the operator that reads as authoritative.
-        let staleness = if b.behind > 0 {
-            format!(" ({} behind {base})", b.behind)
-        } else {
-            String::new()
+    let flow = config::git_flow_for_project(project_root);
+    let run_bases: std::collections::BTreeMap<String, String> = rows
+        .iter()
+        .filter_map(|(phase, existing, _)| match existing {
+            workflow::Existing::Loaded(state) => state.base_branch.clone().map(|base| {
+                let branch = format!("{}phase-{}", flow.feature_prefix, phase.padded());
+                (branch, base)
+            }),
+            workflow::Existing::Missing | workflow::Existing::Unloadable(_) => None,
+        })
+        .collect();
+    let mut compared: Vec<(String, String)> = Vec::new();
+    let mut not_compared: Vec<String> = Vec::new();
+    let mut compare = |base: &str, source: &str, owns: &dyn Fn(&str) -> bool| {
+        let git = GitFlow::with_config(
+            project_root,
+            config::GitFlowConfig {
+                develop: base.to_string(),
+                ..flow.clone()
+            },
+        );
+        let listed = git
+            .list_feature_branches()
+            .map_err(|error| error.to_string());
+        let branches = match listed {
+            Ok(branches) => branches
+                .into_iter()
+                .filter(|b| owns(&b.name))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                not_compared.push(not_compared_line(base, &error));
+                return;
+            }
         };
-        lines.push(format!("  {} — {} ahead{staleness}", b.name, b.ahead));
+        if branches.is_empty() {
+            return;
+        }
+        // `list_feature_branches` counts a failed `rev-list` as 0, so a base that
+        // does not resolve would read as an even comparison: check it first.
+        if let Err(error) = local_branch_resolves(project_root, base) {
+            not_compared.push(not_compared_line(base, &error));
+            return;
+        }
+        // The base named is the one compared against (45-01).
+        for b in branches {
+            let line = format!(
+                "  {} — {} ahead, {} behind {base} ({source})",
+                b.name, b.ahead, b.behind
+            );
+            compared.push((b.name, line));
+        }
+    };
+    compare(&flow.develop, "the project's base", &|name| {
+        !run_bases.contains_key(name)
+    });
+    let distinct: std::collections::BTreeSet<&String> = run_bases.values().collect();
+    for base in distinct {
+        compare(base, "the run's base", &|name| {
+            run_bases.get(name) == Some(base)
+        });
     }
-    lines
+    compared.sort();
+    compared
+        .into_iter()
+        .map(|(_, line)| line)
+        .chain(not_compared)
+        .collect()
+}
+
+/// The line for a base whose branches could not be compared.
+fn not_compared_line(base: &str, error: &str) -> String {
+    format!("  (branches of runs based on {base} could not be compared: {error})")
+}
+
+/// Whether `base` names a local branch of `project_root`'s repository.
+fn local_branch_resolves(project_root: &Path, base: &str) -> Result<(), String> {
+    let status = devflow_core::git::git_command(project_root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{base}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("git rev-parse could not run: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{base} is not a local branch"))
+    }
 }
 
 // ---------------------------------------------------------------------------
