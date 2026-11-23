@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-12-PLAN.md
-last_updated: "2026-11-23T06:52:54.838Z"
+stopped_at: Completed 53.2-13-PLAN.md
+last_updated: "2026-11-23T07:04:51.462Z"
 last_activity: 2026-11-22
 last_activity_desc: Phase 53.2 execution started
-state_head: f9fa7f1c241d5584892d0196899522d81cb3ddb8
+state_head: d53fc2a0804540a947e8407b879b301e9d0a2cb0
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 105
-  completed_plans: 100
+  completed_plans: 101
   percent: 13
 ---
 
@@ -179,7 +179,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
-Plan: 13 of 17
+Plan: 14 of 17
 Status: Ready to execute
 Last activity: 2026-11-22 — Phase 53.2 execution started
 
@@ -1075,6 +1075,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: 53.2-11: #178 measured with TMPDIR outside the checkout; zero leak, closed with no code change; project_root walk-up defect filed as #335
 - [Phase 53.2]: 53.2-12: the #258 resume sibling reproduced; re_mark_stopped_after_failed_launch keeps a stop_reason its runner wrote
 - [Phase 53.2]: 53.2-12: a NotLive timed-out start clears its run only on JSON equality with the state read back after start_reserved
+- [Phase 53.2]: 53.2-13: stop claims the phase holder via liveness::claim_phase_holder right before stop_unit (no write-lock barrier) and holds it through the reload; a stop while any verb holds the phase now refuses, Live runner or not
 
 ## Roadmap Evolution
 
@@ -1286,11 +1287,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P10 | 13min | 2 tasks | 2 files |
 | Phase 53.2 P11 | unrecorded | 3 tasks | 0 files |
 | Phase 53.2 P12 | 14min | 3 tasks | 5 files |
+| Phase 53.2 P13 | 35min | 2 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-11-23T06:52:52.891Z
-**Stopped at:** Completed 53.2-12-PLAN.md
+**Last session:** 2026-11-23T07:04:49.484Z
+**Stopped at:** Completed 53.2-13-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
