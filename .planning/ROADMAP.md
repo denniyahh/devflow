@@ -416,7 +416,7 @@ discuss questions.
 (operator, 2026-11-08). The bake-off is scored on recordings, so the model choice is a measured result, not a
 preference; its record (corpus size, agreement with the operator's answers, calibration) is a phase artifact. The
 `typesafe-ai` skill is the reference for the System One primitives (`choice`, `score`, `noul`).
-**Requirements**: TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04; plus GitHub issues #330 (codex) and #331 (antigravity), operator 2026-11-22
+**Requirements**: TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04; plus GitHub issues #330 (codex) and #331 (antigravity), operator 2026-11-22; #343 (answerer provenance), operator 2026-11-23
 **Success Criteria** (what must be TRUE):
 
   1. The bake-off record names the chosen model and the corpus it was scored on (Phase 53's recorded questions, with
@@ -439,6 +439,9 @@ preference; its record (corpus size, agreement with the operator's answers, cali
      real discuss question reaches the operator as a `discuss` gate and its scripted answer appears in the written
      CONTEXT.md; or the spike's record says why that agent cannot and its named refusal stays. **Control:** with a
      CONTEXT.md present, no discuss gate opens for either agent. (#330, #331)
+  6. A gate answer records who answered it, the operator or a delegated agent (`agent:<name>`), in the events,
+     `history` and `gate show`; the bake-off corpus in criterion 1 counts only operator-answered gates as the
+     reference. **Control:** the same answer without the agent marker records the operator. (#343)
 
 **Plans**: TBD
 **UI hint**: no
