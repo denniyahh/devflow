@@ -395,6 +395,12 @@ pub(crate) fn start(
         }
     }
 
+    // #285 (D-13): a warning, never a refusal, said by the dry run and the real start
+    // alike, after every refusal above so a refused start prints none.
+    if let Some(warning) = gsd_derived_paths_warning(project_root) {
+        eprintln!("{warning}");
+    }
+
     if dry_run {
         return start_dry_run(project_root, &state);
     }
@@ -461,6 +467,59 @@ pub(crate) fn start(
             }
         }
     }
+}
+
+/// #285: files GSD writes on every step, as (a path `git check-ignore` probes, the
+/// `.gitignore` line that ignores it). `.gsd/` is probed through a file GSD writes there.
+const GSD_DERIVED_PATHS: &[(&str, &str)] = &[
+    (".planning/state.json", ".planning/state.json"),
+    (".planning/milestone.lock", ".planning/milestone.lock"),
+    (".gsd/dispatch-isolation-sentinel.json", ".gsd/"),
+];
+
+/// #285 (D-13): the warning naming the `.gitignore` lines to add for each of
+/// [`GSD_DERIVED_PATHS`] git does not ignore at `project_root`, or `None` when all are
+/// ignored or `project_root` is not a git work tree (start refuses such a root itself).
+/// A check git could not answer is named with its error, never read as not ignored.
+fn gsd_derived_paths_warning(project_root: &Path) -> Option<String> {
+    let inside = git_command(project_root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .is_ok_and(|out| out.status.success() && out.stdout.trim_ascii() == b"true");
+    if !inside {
+        return None;
+    }
+    let mut to_add = Vec::new();
+    let mut unchecked = Vec::new();
+    for (probe, line) in GSD_DERIVED_PATHS {
+        match git_command(project_root)
+            .args(["check-ignore", "-q", probe])
+            .output()
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) if out.status.code() == Some(1) => to_add.push(*line),
+            Ok(out) => unchecked.push(format!(
+                "could not check {probe}: {} ({})",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                out.status
+            )),
+            Err(err) => unchecked.push(format!("could not check {probe}: {err}")),
+        }
+    }
+    if to_add.is_empty() && unchecked.is_empty() {
+        return None;
+    }
+    let mut warning = String::from(
+        "warning: GSD writes derived files that git does not ignore here; add these lines to \
+         .gitignore:",
+    );
+    for line in to_add {
+        warning.push_str(&format!("\n  {line}"));
+    }
+    for line in unchecked {
+        warning.push_str(&format!("\n{line}"));
+    }
+    Some(warning)
 }
 
 /// WR-11's rule: a run that never launched leaves no state behind, so `devflow status`
@@ -6364,6 +6423,18 @@ mod tests {
     use devflow_core::gates::AnswerRead;
     use devflow_core::gates::WaiterRegistration;
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
+
+    /// #285: outside a git work tree the ignore check says nothing, so no
+    /// `could not check … exit status: 128` lines reach the operator.
+    #[test]
+    fn gsd_derived_paths_warning_is_silent_outside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let warning = gsd_derived_paths_warning(dir.path());
+        assert!(
+            warning.is_none(),
+            "the GSD ignore check warned outside a git repo: {warning:?}"
+        );
+    }
 
     #[test]
     fn state_age_secs_parses_epoch() {
