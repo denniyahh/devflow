@@ -875,6 +875,12 @@ mod tests {
         true
     }
 
+    /// How long a released state write lock may keep reading held before the test
+    /// calls it a leak. The wait polls the shared read `write_lock_status` makes, not
+    /// `write_lock_is_free`: that probe takes an exclusive lock, and a fork during the
+    /// probe would leave a child holding it, so a following read could still say held.
+    const RELEASED_WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// One of `update_state`'s callers, changing one field.
     fn update_field(root: &Path, phase: PhaseId, set: impl FnOnce(&mut State)) {
         update_state(root, phase, |state| {
@@ -1323,10 +1329,10 @@ mod tests {
                 }
             );
         });
-        assert!(wait_for_free_write_lock(root, phase));
-        assert_eq!(
-            write_lock_status(root, phase).unwrap(),
-            WriteLockStatus::Free
+        crate::test_support::wait_until(
+            RELEASED_WRITE_LOCK_WAIT,
+            "the state write lock to read free after its release",
+            || write_lock_status(root, phase).unwrap() == WriteLockStatus::Free,
         );
         let lock_path = state_lock_path(root, phase);
         assert_eq!(
