@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-03-PLAN.md
-last_updated: "2026-11-23T05:01:42.327Z"
+stopped_at: Completed 53.2-04-PLAN.md
+last_updated: "2026-11-23T05:06:11.391Z"
 last_activity: 2026-11-22
 last_activity_desc: Phase 53.2 execution started
-state_head: 4cf1db9ae0b8a9b89de0c1bf1014e97666a1afb8
+state_head: 33274ee799bcc79d4085b0283877de79426d6b4e
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 105
-  completed_plans: 91
+  completed_plans: 92
   percent: 13
 ---
 
@@ -179,7 +179,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
-Plan: 4 of 17
+Plan: 5 of 17
 Status: Ready to execute
 Last activity: 2026-11-22 — Phase 53.2 execution started
 
@@ -1065,6 +1065,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: 53.2-02: #265 not reproduced (base/after/changed 40/40 each); reap decided on one reading with /proc diagnostics; #265 stays open (D-16 branch b)
 - [Phase 53.2]: 53.2-02: gsd_reader.rs launcher_whose_writer_a_fork_holds kept as raw writer (held-writer reproduction fixture); 53.2-07 allowlist must name it
 - [Phase 53.2]: 53.2-03: every 0o755 site in the CLI's src stubs and shared e2e fakes writes text, so all converted to write_executable; none left for 53.2-07's allowlist
+- [Phase 53.2]: 53.2-04: every 0o755 site in the eleven CLI e2e files writes text, so none is left for 53.2-07's allowlist
 
 ## Roadmap Evolution
 
@@ -1267,11 +1268,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P01 | 9 min | 2 tasks | 1 files |
 | Phase 53.2 P02 | 17 min | 3 tasks | 4 files |
 | Phase 53.2 P03 | 9 min | 2 tasks | 5 files |
+| Phase 53.2 P04 | 3 min | 3 tasks | 11 files |
 
 ## Session
 
-**Last session:** 2026-11-23T05:01:40.336Z
-**Stopped at:** Completed 53.2-03-PLAN.md
+**Last session:** 2026-11-23T05:06:09.496Z
+**Stopped at:** Completed 53.2-04-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

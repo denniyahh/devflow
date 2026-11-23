@@ -397,14 +397,14 @@ Run conventions: discuss `--auto` in session, then `devflow start --phase 53.2 -
 --until plan`, external review (Tier B), close-out with `scripts/cut-pr-branch.sh`.
 **Requirements**: no REQ IDs; the issues above
 **Depends on:** Phase 53.1
-**Plans:** 3/17 plans executed
+**Plans:** 4/17 plans executed
 
 Plans:
 **Wave 1**
 - [x] 53.2-01-PLAN.md — #246 Plan prompt runs discuss first when the phase has no CONTEXT.md (wave 1)
 - [x] 53.2-02-PLAN.md — #276 core stub writers through write_executable; #265 measured under load (wave 1)
 - [x] 53.2-03-PLAN.md — #276 CLI src stubs and shared e2e fakes through write_executable (wave 1)
-- [ ] 53.2-04-PLAN.md — #276 remaining CLI integration-test stubs (wave 1)
+- [x] 53.2-04-PLAN.md — #276 remaining CLI integration-test stubs (wave 1)
 - [ ] 53.2-05-PLAN.md — #247 question-gate banner; #248 open branches against the run's base (wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
@@ -675,7 +675,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
-| 53.2. wsx/UDE first-use and dogfood remediation | 3/17 | In Progress | - |
+| 53.2. wsx/UDE first-use and dogfood remediation | 4/17 | In Progress | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
