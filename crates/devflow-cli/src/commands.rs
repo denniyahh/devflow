@@ -424,6 +424,11 @@ pub(crate) fn start(
     let result = start_reserved(project_root, state, worktree, &mut created);
     crate::pipeline_launch::abandon_reservation(project_root, phase, created);
     let mode = result?;
+    // #258 (D-11): the state as `create_run_state` wrote it, read back from disk, so a
+    // timed-out launch can tell a run that progressed from one that never ran.
+    let written = workflow::load_state(project_root, phase)
+        .ok()
+        .and_then(|state| serde_json::to_value(&state).ok());
     match crate::service::launch_runner_unit(project_root, phase) {
         Ok(unit) => {
             drop(phase_holder);
@@ -455,11 +460,12 @@ pub(crate) fn start(
                     print_timed_out_live_note(&why);
                     Ok(())
                 }
-                TimedOutLaunch::NotLive => Err(clear_after_failed_launch(
+                TimedOutLaunch::NotLive => Err(not_live_after_timed_out_launch(
                     project_root,
                     phase,
                     worktree,
                     &why,
+                    written.as_ref(),
                 )),
                 TimedOutLaunch::Unknown(reading) => Err(CliError::Message(
                     unconfirmed_launch_message("start", phase, &why, &reading),
@@ -535,6 +541,30 @@ fn clear_after_failed_launch(
         eprintln!("warning: could not clear state after the failed launch: {clear_err}");
     }
     CliError::Message(failed_launch_message(phase, worktree, why))
+}
+
+/// #258 (D-11): a timed-out launch whose runner reads not live. The run is cleared, as a
+/// failed launch is, only when its state on disk equals, as JSON, `written` (the state as
+/// `start` wrote it); a state that changed since (a runner that ran, wrote and died), one
+/// that does not load, or no `written` keeps it and names `status` and `discard`.
+fn not_live_after_timed_out_launch(
+    project_root: &Path,
+    phase: PhaseId,
+    worktree: bool,
+    why: &str,
+    written: Option<&serde_json::Value>,
+) -> CliError {
+    let now = workflow::load_state(project_root, phase)
+        .ok()
+        .and_then(|state| serde_json::to_value(&state).ok());
+    if written.is_some() && now.as_ref() == written {
+        return clear_after_failed_launch(project_root, phase, worktree, why);
+    }
+    CliError::Message(format!(
+        "start: phase {phase} was not confirmed launched ({why}), and its run state changed \
+         after start wrote it, so it was kept: run `devflow status` to inspect it, and \
+         `devflow discard --phase {phase}` to remove it"
+    ))
 }
 
 /// 999.244: what the phase's runner says after a launch whose `systemd-run` timed out.
