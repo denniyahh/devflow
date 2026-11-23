@@ -1138,6 +1138,46 @@ mod tests {
         assert_eq!(legacy.base_branch, None);
     }
 
+    /// #281 (D-09): the target an `--until` halt records survives to the separate
+    /// `resume` process, and a state saved before the field existed loads as `None`,
+    /// so its resume falls back to `Stage::next`.
+    #[test]
+    fn until_halt_target_round_trips_and_tolerates_states_predating_the_field() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.until_halt_target = Some(Stage::Validate);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("until_halt_target"),
+            "until_halt_target must appear in persisted JSON: {json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.until_halt_target,
+            Some(Stage::Validate),
+            "until_halt_target must round-trip through serde"
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_object_mut()
+            .expect("a state serializes to an object")
+            .remove("until_halt_target")
+            .expect("the key was present to remove");
+        let without = value.to_string();
+        assert!(
+            !without.contains("until_halt_target"),
+            "the field must actually be removed for this control to mean anything"
+        );
+        let legacy: State = serde_json::from_str(&without)
+            .expect("a state predating until_halt_target must still deserialize");
+        assert_eq!(legacy.until_halt_target, None);
+    }
+
     /// WR-02 (49-REVIEW.md): `gate_notify_cmd` round-trips, a state written
     /// before the field existed loads as `None`, and an unset value is not
     /// written at all.
