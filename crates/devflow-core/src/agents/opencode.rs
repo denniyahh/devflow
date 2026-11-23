@@ -1404,13 +1404,25 @@ mod tests {
             "the guarded probe must deny setpgid rather than merely timing out after it succeeds"
         );
         let pid = hanging_stub_child_pid(&stub_dir);
-        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
+        // One reading decides: the poll hands back the observation that ended
+        // it, so a second, later read cannot contradict the one that stopped
+        // the wait. The /proc snapshots at that reading and at the assertion,
+        // with the elapsed time, separate a recycled pid (another `starttime`),
+        // a zombie and a process the kill never reached.
+        let wait_started = std::time::Instant::now();
+        let reaped_by = wait_started + std::time::Duration::from_secs(2);
+        let (still_running, at_decisive_reading) = loop {
+            let running = crate::agent::agent_running(pid);
+            if !running || std::time::Instant::now() >= reaped_by {
+                break (running, probe_proc_snapshot(pid));
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        };
+        let elapsed = wait_started.elapsed();
         assert!(
-            !crate::agent::agent_running(pid),
-            "the attempted group-escape process must be reaped: pid {pid}"
+            !still_running,
+            "the attempted group-escape process must be reaped: pid {pid} still running after {elapsed:?}; /proc at the decisive reading: {at_decisive_reading}; /proc at the assertion: {}",
+            probe_proc_snapshot(pid)
         );
     }
 
