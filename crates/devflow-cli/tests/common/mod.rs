@@ -1,8 +1,12 @@
 //! Helpers shared by the `devflow` CLI integration tests (999.141, D-07).
 //!
 //! Each test target includes this file with `mod common;`. It holds helpers
-//! only and no `#[test]`: every target that declares `mod common;` compiles
-//! it, so a test here would be added to each of those targets' counts.
+//! and one `#[test]`: every target that declares `mod common;` compiles it,
+//! so a test here is added to each of those targets' counts. The one is
+//! [`fake_notify_listener_entry`], an `#[ignore]` no-op without its variable,
+//! which adds one ignored test to each count. The fake `systemd-run` re-runs
+//! the test binary as it to read a notify datagram, which `/bin/sh` cannot
+//! do, and every target that writes the fake has its own binary.
 //!
 //! The rule it exists for: an e2e child that runs the `devflow` binary gets a
 //! tempdir `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME` and `DEVFLOW_CACHE_DIR`
@@ -109,7 +113,7 @@ fi
 "#;
 
 /// What the fake `systemd-run` prints on stderr when the runner it started exits
-/// before it holds its runner lock: the text `systemd-run` prints for a `Type=notify`
+/// before it sends `READY=1`: the text `systemd-run` prints for a `Type=notify`
 /// unit whose main process exits before `READY=1`.
 pub const FAKE_START_FAILED: &str = "failed because the control process exited with error code.";
 
@@ -126,16 +130,23 @@ pub const FAKE_FAIL_NEXT: &str = "fail-next";
 /// --working-directory=D ... -- PROGRAM ARGS`): it changes to D, starts the command
 /// in its own session with stdin from `/dev/null` and stdout and stderr to `U.out` in
 /// its own dir, so the caller's output capture reaches EOF when this script exits, and
-/// records the command's pid as `U.pid`. It exits 0 once that pid holds the launched
-/// phase's runner lock `D/.devflow/.runner-{padded}` (the phase is the argument after
-/// the command's `--phase`): one of the pid's descriptors is that file and its
-/// `/proc/PID/fdinfo` has a `lock:` line. It reads `/proc` and takes no lock itself, and
-/// skips without a word a descriptor that closed while it looked. It exits 1 with
-/// systemd's text when the command dies first. A `fail-next` marker makes the launch print the marker's text and
+/// records the command's pid as `U.pid`. Readiness is the command's `READY=1`, as for a
+/// `Type=notify` unit: before the launch the fake starts [`fake_notify_listener_entry`]
+/// (this test binary re-run) with the per-launch files `U.notify-<fake pid>.*` in its own
+/// dir. The listener binds `.sock` and creates `.listening`; the fake then sets
+/// `NOTIFY_SOCKET` to `.sock` on the command and writes the command's pid to `.launched`;
+/// the listener writes its verdict to `.result`, its own output going to `.log`. On
+/// `ready` the fake exits 0; on `exited` (the command is gone with no `READY=1` queued)
+/// it prints `Job for U` and [`FAKE_START_FAILED`] and exits 1; on `timeout` (no
+/// `READY=1` within [`FAKE_NOTIFY_READY_WAIT`]) it prints systemd's timeout text and
+/// exits 1; a listener that does not start or reports an error makes it print
+/// `fake systemd-run: ` with what it found and exit 1. It takes no lock and reads no
+/// descriptor of the command. A `fail-next` marker makes the launch print the marker's text and
 /// exit 1 instead. A `U.failed` marker (the fake `systemctl` reads the unit `failed`)
 /// makes it refuse as systemd refuses a unit still loaded: it prints that text and
-/// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@` and `@RM@` are absolute paths written in
-/// when the fake is written, because the devflow child's `PATH` can be stub-only.
+/// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@`, `@RM@` and `@TESTEXE@` (this test binary)
+/// are absolute paths written in when the fake is written, because the devflow child's
+/// `PATH` can be stub-only.
 const FAKE_SYSTEMD_RUN_CALLS: &str = r#"all="$*"
 unit=""; wd=""
 while [ "$#" -gt 0 ]; do
@@ -487,7 +498,9 @@ impl HermeticHome {
     /// `<unit>.fail` or `<unit>.deactivating` here sets what the fake
     /// `systemctl` reports for that unit's `ActiveState`; [`FAKE_FAIL_NEXT`]
     /// fails the next launch; `linger.no` makes lingering read off. The fake
-    /// `systemd-run` writes `<unit>.pid` and `<unit>.out` here.
+    /// `systemd-run` writes `<unit>.pid` and `<unit>.out` here, and per launch its
+    /// notify-listener files `<unit>.notify-<pid>.sock`, `.listening`, `.launched`,
+    /// `.result` and `.log`.
     pub fn service_bin(&self) -> PathBuf {
         self.home().join("service-bin")
     }
