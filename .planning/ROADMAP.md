@@ -397,7 +397,7 @@ Run conventions: discuss `--auto` in session, then `devflow start --phase 53.2 -
 --until plan`, external review (Tier B), close-out with `scripts/cut-pr-branch.sh`.
 **Requirements**: no REQ IDs; the issues above
 **Depends on:** Phase 53.1
-**Plans:** 16/17 plans executed
+**Plans:** 17/17 plans executed
 
 Plans:
 **Wave 1**
@@ -431,7 +431,7 @@ Plans:
 - [x] 53.2-17-PLAN.md — #250 resume --reviews reruns a halted Plan as a reviews pass (wave 7)
 
 **Wave 8** *(blocked on Wave 7 completion)*
-- [ ] 53.2-16-PLAN.md — D-03 live proof of the discuss route, run by the orchestrating session (wave 8)
+- [x] 53.2-16-PLAN.md — D-03 live proof of the discuss route, run by the orchestrating session (wave 8)
 
 **Cross-cutting constraints:** <!-- gsd:generated -->
 - D-17: each target test fails on the code before its GREEN commit with its assertion text, checked once by reverting the GREEN change
@@ -675,7 +675,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
-| 53.2. wsx/UDE first-use and dogfood remediation | 16/17 | In Progress | - |
+| 53.2. wsx/UDE first-use and dogfood remediation | 17/17 | In Progress | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
