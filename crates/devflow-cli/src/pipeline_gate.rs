@@ -108,6 +108,8 @@ pub(crate) fn transition(
             s.code_fix_report = None;
             // U7: the run leaves the stage, so the stage's relaunch note goes.
             s.relaunch_note = None;
+            // D-04: a finished reviews pass is spent here, as `enter_stage` would.
+            s.reviews_pass = false;
         })?;
         events::emit(
             project_root,
@@ -173,6 +175,8 @@ pub(crate) fn enter_stage(state: &mut State, from: Stage, to: Stage) {
     state.code_fix_report = None;
     // U7: a relaunch note is for the stage being left, never the next one.
     state.relaunch_note = None;
+    // D-04: a reviews pass lives exactly as long as its Plan stage.
+    state.reviews_pass = false;
 }
 
 /// The stop reason a run records when its Validate passes (D-35).

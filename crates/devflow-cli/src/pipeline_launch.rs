@@ -56,6 +56,10 @@ use tracing::{info, warn};
 /// attached to the intent the default builder returns. In a gap-closure pass
 /// ([`State::gap_closure_pass`], GATE-03) Plan renders the gaps Plan intent
 /// and Code the gaps-only pass, so a stop and resume keeps the pass's commands.
+/// In a reviews pass ([`State::reviews_pass`], D-04) Plan renders the reviews
+/// Plan intent, ahead of the gaps arm; the two never hold together, because the
+/// reviews flag is spent when the run leaves Plan and only Validate sets the
+/// gaps marker.
 ///
 /// The only place a default stage prompt is rendered:
 /// [`launch_stage_inner`] (whose prompt the agent receives) and
@@ -63,6 +67,13 @@ use tracing::{info, warn};
 /// `every_no_override_launch_renders_through_default_stage_prompt` pins.
 pub(crate) fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
     let intent = match state.stage {
+        // D-04 (#250): a reviews pass's Plan runs `--reviews`, at its first launch and
+        // at every relaunch, a resume included. Checked first, though it cannot hold
+        // with the gaps marker: it is spent on leaving Plan, and only Validate sets that.
+        Stage::Plan if state.reviews_pass => prompt::StageIntent::PlanReviews {
+            phase: state.phase,
+            relaunch_note: state.relaunch_note.clone(),
+        },
         // GATE-03 (review C6): a gap-closure pass's Plan runs `--gaps`, at its
         // first launch and at every relaunch, a resume included.
         Stage::Plan if state.gap_closure_pass => prompt::StageIntent::PlanGaps {
