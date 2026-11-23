@@ -659,19 +659,40 @@ fn start_dry_run(project_root: &Path, state: &State) -> Result<(), CliError> {
     ensure_agent_binary(agent_program(state.agent))?;
     crate::preflight::ensure_ask_registration(state.agent)?;
     let base = crate::preflight::resolve_start_base(project_root)?.value;
-    println!("{}", dry_run_not_checked_line(phase, &base));
+    println!(
+        "{}",
+        dry_run_not_checked_line(phase, &base, state.reviews_pass)
+    );
     print_dry_run(state);
     Ok(())
 }
 
 /// The start checks a dry run skips (52.1 D-27): each reads the remote or the base's
-/// tree, and the first may fast-forward the base, so only a real start runs them.
-fn dry_run_not_checked_line(phase: PhaseId, base: &str) -> String {
+/// tree, and the first may fast-forward the base, so only a real start runs them. With
+/// `reviews` (D-04) the list also names `start --reviews`'s REVIEWS.md check on the base.
+fn dry_run_not_checked_line(phase: PhaseId, base: &str, reviews: bool) -> String {
+    let reviews_check = if reviews {
+        format!(", and, with --reviews, the REVIEWS.md check on `{base}`")
+    } else {
+        String::new()
+    };
     format!(
         "not checked by the dry run: base currency (`{base}` against its remote), phase \
          reachability (phase {phase} on `{base}`), and the CONTEXT.md/PLAN.md checks on \
-         `{base}`; a real start runs them after these checks"
+         `{base}`{reviews_check}; a real start runs them after these checks"
     )
+}
+
+/// The refusal of a `--reviews` launch (D-04, #250) whose phase has no REVIEWS.md at
+/// `location` (for `start`, "on `<base>`", the tree the run forks from).
+pub(crate) fn reviews_file_refusal(verb: LaunchVerb, phase: PhaseId, location: &str) -> CliError {
+    let verb = verb.label();
+    let padded = phase.padded();
+    CliError::Message(format!(
+        "{verb}: --reviews needs the phase's review file, \
+         .planning/phases/{padded}-*/{padded}-REVIEWS.md, {location}, and it is not there; \
+         run the review and commit its REVIEWS.md first, or {verb} without --reviews"
+    ))
 }
 
 /// D-03 (review codex-2, agy-6): refuse `verb` when the systemd user manager does not
@@ -854,6 +875,19 @@ fn start_reserved(
             driver.name()
         )));
     }
+
+    // D-04 (#250): a reviews pass incorporates the phase's REVIEWS.md, so it must be in the
+    // tree the run forks from. Probed on the RESOLVED base, as the CONTEXT.md check above
+    // is: a worktree, and a `--no-worktree` feature branch, carry the base's tree, not the
+    // primary checkout's.
+    if state.reviews_pass && !phase_artifact_on_base(project_root, phase, "-REVIEWS.md", base) {
+        return Err(reviews_file_refusal(
+            LaunchVerb::Start,
+            phase,
+            &format!("on `{base}`"),
+        ));
+    }
+
     if driver.interactivity_mode(Stage::Plan) == agents::InteractivityMode::RequiresExistingArtifact
         && !phase_artifact_on_base(project_root, phase, "-PLAN.md", base)
     {
