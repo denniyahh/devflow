@@ -1297,12 +1297,6 @@ mod tests {
         ),
         (
             "crates/devflow-core/src/gsd_reader.rs",
-            "(&launcher, std::fs::Permissions::from_mode(0o755))",
-            "the held-writer launcher fixture must hold a write descriptor at the fork to \
-             reproduce the text-busy spawn the reader retries",
-        ),
-        (
-            "crates/devflow-core/src/gsd_reader.rs",
             "(&launcher, std::fs::Permissions::from_mode(0o644))",
             "removes the exec bit to make the spawn fail; nothing executes the file",
         ),
@@ -1315,13 +1309,14 @@ mod tests {
 
     /// `path: line` for each non-comment line of `sources` that calls
     /// `set_permissions(` and no `kept` entry matches, then `stale kept entry: …`
-    /// for each `kept` entry that matched no line. A line whose trimmed text
+    /// for each `kept` entry that matched no line and `kept entry matched N lines, not
+    /// 1: …` for each that matched more than one (F16: an entry keeps one site). A line whose trimmed text
     /// starts with `//` is a comment.
     fn permission_setters(
         sources: &[(String, String)],
         kept: &[(&str, &str, &str)],
     ) -> Vec<String> {
-        let mut used = vec![false; kept.len()];
+        let mut used = vec![0_usize; kept.len()];
         let mut findings = Vec::new();
         for (path, source) in sources {
             for line in source.lines() {
@@ -1331,7 +1326,7 @@ mod tests {
                 match kept.iter().position(|(kept_path, fragment, _)| {
                     kept_path == path && line.contains(fragment)
                 }) {
-                    Some(index) => used[index] = true,
+                    Some(index) => used[index] += 1,
                     None => findings.push(format!("{path}: {}", line.trim())),
                 }
             }
@@ -1339,8 +1334,13 @@ mod tests {
         findings.extend(
             kept.iter()
                 .zip(&used)
-                .filter(|(_, used)| !**used)
-                .map(|((path, fragment, _), _)| format!("stale kept entry: {path}: {fragment}")),
+                .filter_map(|((path, fragment, _), matched)| match matched {
+                    0 => Some(format!("stale kept entry: {path}: {fragment}")),
+                    1 => None,
+                    n => Some(format!(
+                        "kept entry matched {n} lines, not 1: {path}: {fragment}"
+                    )),
+                }),
         );
         findings
     }

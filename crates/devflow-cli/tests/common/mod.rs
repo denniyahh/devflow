@@ -133,8 +133,10 @@ pub const FAKE_FAIL_NEXT: &str = "fail-next";
 /// records the command's pid as `U.pid`. Readiness is the command's `READY=1`, as for a
 /// `Type=notify` unit: before the launch the fake starts [`fake_notify_listener_entry`]
 /// (this test binary re-run) with the per-launch files `U.notify-<fake pid>.*` in its own
-/// dir. The listener binds `.sock` and creates `.listening`; the fake then sets
-/// `NOTIFY_SOCKET` to `.sock` on the command and writes the command's pid to `.launched`;
+/// dir, and a socket `n` in a short per-launch `mktemp -d` directory under `/tmp`
+/// (`sun_path` is 107 bytes), removed when the fake exits. The listener binds `n` and
+/// creates `.listening`; the fake then sets `NOTIFY_SOCKET` to `n` on the command and
+/// writes the command's pid to `.launched`;
 /// the listener writes its verdict to `.result`, its own output going to `.log`. On
 /// `ready` the fake exits 0; on `exited` (the command is gone with no `READY=1` queued)
 /// it prints `Job for U` and [`FAKE_START_FAILED`] and exits 1; on `timeout` (no
@@ -144,9 +146,10 @@ pub const FAKE_FAIL_NEXT: &str = "fail-next";
 /// descriptor of the command. A `fail-next` marker makes the launch print the marker's text and
 /// exit 1 instead. A `U.failed` marker (the fake `systemctl` reads the unit `failed`)
 /// makes it refuse as systemd refuses a unit still loaded: it prints that text and
-/// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@`, `@RM@` and `@TESTEXE@` (this test binary)
-/// are absolute paths written in when the fake is written, because the devflow child's
-/// `PATH` can be stub-only.
+/// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@`, `@RM@`, `@MKTEMP@` and `@TESTEXE@`
+/// (this test binary, single-quoted by [`sh_quote`]) are absolute paths written in when the
+/// fake is written, because the devflow child's `PATH` can be stub-only; both fakes read
+/// `/proc/PID/stat` through [`PROC_STATE_FN`].
 const FAKE_SYSTEMD_RUN_CALLS: &str = r#"@PROC_STATE_FN@
 all="$*"
 unit=""; wd=""
@@ -171,8 +174,10 @@ if [ -n "$unit" ] && [ -n "$wd" ] && [ "$#" -gt 0 ]; then
     exit 1
   fi
   note="$dir/$unit.notify-$$"
-  sock="$note.sock"
-  @RM@ -f "$note.listening" "$note.result" "$note.launched" "$sock"
+  sockdir=$(@MKTEMP@ -d /tmp/dfn.XXXXXX) || { echo "fake systemd-run: mktemp -d failed" >&2; exit 1; }
+  trap '@RM@ -rf "$sockdir"' EXIT
+  sock="$sockdir/n"
+  @RM@ -f "$note.listening" "$note.result" "$note.launched"
   echo_lines() {
     for file in "$@"; do
       [ -e "$file" ] || continue
@@ -234,19 +239,20 @@ fn resolve_on_path(program: &str) -> PathBuf {
 /// The POSIX sh function both fakes read a `/proc/PID/stat` state with: `proc_state FILE`
 /// prints the process state field, or nothing when FILE cannot be read (callers read
 /// that as gone).
+/// The command name between the parentheses may hold spaces, so the state is the first
+/// field after the line's last `) ` (F10).
 pub const PROC_STATE_FN: &str = r#"proc_state() {
-  s=""
-  { read -r p comm s rest <"$1"; } 2>/dev/null
-  echo "$s"
+  line=""
+  { IFS= read -r line <"$1"; } 2>/dev/null
+  rest=${line##*") "}
+  if [ "$rest" = "$line" ]; then echo ""; return; fi
+  echo "${rest%% *}"
 }"#;
 
-/// `path` as one shell word for the fake scripts.
+/// `path` as one shell word for the fake scripts: POSIX single quotes, each `'` written
+/// as `'\''` (F24), so no path needs refusing.
 pub fn sh_quote(path: &str) -> String {
-    assert!(
-        !path.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '$' | '`' | '\\')),
-        "the test binary's path is written double-quoted into the fake: {path}"
-    );
-    format!("\"{path}\"")
+    format!("'{}'", path.replace('\'', r"'\''"))
 }
 
 /// [`FAKE_SYSTEMD_RUN_CALLS`] with its tool paths and this test binary written in.
@@ -298,7 +304,7 @@ fn with_suffix(prefix: &OsStr, suffix: &str) -> PathBuf {
 }
 
 /// Whether a notify datagram has a line equal to `READY=1`.
-fn is_ready_datagram(datagram: &[u8]) -> bool {
+pub fn is_ready_datagram(datagram: &[u8]) -> bool {
     datagram
         .split(|byte| *byte == b'\n')
         .any(|line| line == b"READY=1")
@@ -335,6 +341,7 @@ fn listen_for_ready(files: &OsStr, socket: &Path) -> String {
         match listener.recv(&mut datagram) {
             Ok(len) if is_ready_datagram(&datagram[..len]) => return "ready".to_string(),
             Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 pid = pid.or_else(|| launched_pid(&launched));
                 if pid.is_some_and(|pid| !devflow_core::agent::agent_running(pid)) {
@@ -349,7 +356,7 @@ fn listen_for_ready(files: &OsStr, socket: &Path) -> String {
 
 /// After the launched pid is gone: `ready` if a `READY=1` it sent before it exited is
 /// still queued on `listener`, else `exited`.
-fn drained_verdict(listener: &std::os::unix::net::UnixDatagram, datagram: &mut [u8]) -> String {
+pub fn drained_verdict(listener: &std::os::unix::net::UnixDatagram, datagram: &mut [u8]) -> String {
     if let Err(err) = listener.set_nonblocking(true) {
         return format!("error: {err}");
     }
@@ -357,6 +364,7 @@ fn drained_verdict(listener: &std::os::unix::net::UnixDatagram, datagram: &mut [
         match listener.recv(datagram) {
             Ok(len) if is_ready_datagram(&datagram[..len]) => return "ready".to_string(),
             Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 return "exited".to_string();
             }
@@ -365,7 +373,8 @@ fn drained_verdict(listener: &std::os::unix::net::UnixDatagram, datagram: &mut [
     }
 }
 
-/// `calls` with `@SETSID@`, `@SLEEP@` and `@RM@` replaced by their absolute paths.
+/// `calls` with [`PROC_STATE_FN`] at `@PROC_STATE_FN@`, and `@SETSID@`, `@SLEEP@`, `@RM@`
+/// and `@MKTEMP@` replaced by their absolute paths.
 fn with_tool_paths(calls: &str) -> String {
     let path_of = |program: &str| {
         let path = resolve_on_path(program);
@@ -381,6 +390,7 @@ fn with_tool_paths(calls: &str) -> String {
         .replace("@SETSID@", &path_of("setsid"))
         .replace("@SLEEP@", &path_of("sleep"))
         .replace("@RM@", &path_of("rm"))
+        .replace("@MKTEMP@", &path_of("mktemp"))
 }
 
 /// What every [`HermeticHome::agent_guard`] fake prints, after `fake <name>`,
@@ -749,7 +759,8 @@ pub fn waiting_capture_agent_bin(logs: &Path) -> FakeBin {
 }
 
 /// The fake `codex` behind [`capture_agent_bin`]: answer `--version`, log
-/// argv and stdin under `logs`, then run the shell lines `tail`.
+/// argv and stdin under `logs`, then run the shell lines `tail`, with `@LOGS@` in it
+/// replaced by `logs`.
 pub fn capture_agent_bin_then(logs: &Path, tail: &str) -> FakeBin {
     let logs = logs.to_str().expect("a UTF-8 logs path");
     assert!(
@@ -762,7 +773,8 @@ pub fn capture_agent_bin_then(logs: &Path, tail: &str) -> FakeBin {
             "if [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.0.0-fake\"; exit 0; fi\n\
              for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >> '{logs}/{AGENT_ARGV_LOG}'\n\
              cat >> '{logs}/{AGENT_STDIN_LOG}'\n\
-             {tail}"
+             {tail}",
+            tail = tail.replace("@LOGS@", logs)
         ),
     )
 }

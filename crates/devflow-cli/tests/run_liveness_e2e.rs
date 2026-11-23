@@ -1237,13 +1237,6 @@ fn start_racing_discard_never_leaves_a_run_without_its_worktree() {
 /// How long the child a readiness test launches through the fake `systemd-run` lives.
 const LAUNCHED_CHILD_LIFETIME: Duration = Duration::from_secs(2);
 
-/// The project root [`other_phase_runner_lock_holder_entry`] takes phase 1's runner
-/// lock in.
-const OTHER_PHASE_HOLDER_ROOT_ENV: &str = "OTHER_PHASE_RUNNER_LOCK_HOLDER_ROOT";
-
-/// The test binary the cross-phase readiness test's launched shell `exec`s.
-const OTHER_PHASE_HOLDER_EXE_ENV: &str = "OTHER_PHASE_RUNNER_LOCK_HOLDER_EXE";
-
 /// The fake `systemd-run`, run directly, launching `/bin/sh -c script` in `project` as
 /// the runner of phase 7 (`__runner --phase 7`), with `env` set on its command.
 fn run_fake_launcher(
@@ -1281,10 +1274,11 @@ fn assert_no_proc_read_error(out: &Output) {
     );
 }
 
-/// D-14 (#296): a `.runner-07` record that names the launched pid while no lock is held
-/// is not readiness; the fake reports the start failed once the child exits.
+/// The fake reads readiness only from `READY=1` (#337, which superseded D-14's lock clause,
+/// 53.2-18-PLAN.md): a launched command that exits without sending it, here after writing
+/// a `.runner-07` record naming its pid, is a failed start.
 #[test]
-fn the_fake_launcher_does_not_take_an_unheld_runner_record_as_ready() {
+fn the_fake_launcher_reads_a_command_that_exits_without_ready_as_a_failed_start() {
     let home = common::HermeticHome::new();
     let project = project_with_devflow_dir();
     let script = format!(
@@ -1296,53 +1290,10 @@ fn the_fake_launcher_does_not_take_an_unheld_runner_record_as_ready() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success() && stderr.contains(common::FAKE_START_FAILED),
-        "the fake launcher took an unheld runner record as ready: status {}, stderr {stderr}",
+        "a command that exited without READY=1 was not a failed start: status {}, stderr {stderr}",
         out.status
     );
     assert_no_proc_read_error(&out);
-}
-
-/// D-14 (#296): a lock the launched pid holds on another phase's `.runner-01` is not
-/// readiness for phase 7; the fake reports the start failed once the child exits.
-#[test]
-fn the_fake_launcher_does_not_take_another_phases_held_runner_lock_as_ready() {
-    let home = common::HermeticHome::new();
-    let project = project_with_devflow_dir();
-    let exe = std::env::current_exe().expect("this test binary");
-    let script = format!(
-        "exec \"${OTHER_PHASE_HOLDER_EXE_ENV}\" --exact other_phase_runner_lock_holder_entry --ignored --quiet"
-    );
-
-    let out = run_fake_launcher(
-        &home,
-        project.path(),
-        &script,
-        &[
-            (OTHER_PHASE_HOLDER_EXE_ENV, exe.as_os_str()),
-            (OTHER_PHASE_HOLDER_ROOT_ENV, project.path().as_os_str()),
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !out.status.success() && stderr.contains(common::FAKE_START_FAILED),
-        "the fake launcher took another phase's runner lock as ready: status {}, stderr {stderr}",
-        out.status
-    );
-    assert_no_proc_read_error(&out);
-}
-
-/// Not a test of its own: the child the cross-phase readiness test launches. Holds
-/// phase 1's runner lock through `claim_runner_lock`, as a runner does, for
-/// [`LAUNCHED_CHILD_LIFETIME`]. Without the variable it does nothing.
-#[test]
-#[ignore = "the phase-1 runner-lock holder a readiness test launches, not a test"]
-fn other_phase_runner_lock_holder_entry() {
-    let Some(root) = std::env::var_os(OTHER_PHASE_HOLDER_ROOT_ENV) else {
-        return;
-    };
-    let _hold = liveness::claim_runner_lock(Path::new(&root), PhaseId::new(1))
-        .expect("hold phase 1's runner lock");
-    std::thread::sleep(LAUNCHED_CHILD_LIFETIME);
 }
 
 /// The project root [`fast_ready_runner_entry`] takes phase 7's runner lock in.
@@ -1459,4 +1410,37 @@ fn the_fakes_quote_a_path_with_a_space_and_a_quote() {
         path,
         "quoted as {quoted}"
     );
+}
+
+/// A datagram socket bound in a fresh tempdir with `datagrams` queued on it by an
+/// unbound sender.
+fn socket_with_queued(
+    datagrams: &[&[u8]],
+) -> (tempfile::TempDir, std::os::unix::net::UnixDatagram) {
+    use std::os::unix::net::UnixDatagram;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("n");
+    let listener = UnixDatagram::bind(&path).unwrap();
+    let sender = UnixDatagram::unbound().unwrap();
+    for datagram in datagrams {
+        sender.send_to(datagram, &path).unwrap();
+    }
+    (dir, listener)
+}
+
+/// F08: a `READY=1` the runner sent before it exited is still read as ready once the
+/// fake drains the queue.
+#[test]
+fn drained_verdict_reads_a_ready_queued_before_the_exit() {
+    let (_dir, listener) = socket_with_queued(&[b"STATUS=x", b"READY=1"]);
+    let mut buffer = [0u8; 4096];
+    assert_eq!(common::drained_verdict(&listener, &mut buffer), "ready");
+}
+
+/// F08 control: a queue with no `READY=1` drains to `exited`.
+#[test]
+fn drained_verdict_reads_exited_when_only_a_status_datagram_is_queued() {
+    let (_dir, listener) = socket_with_queued(&[b"STATUS=x"]);
+    let mut buffer = [0u8; 4096];
+    assert_eq!(common::drained_verdict(&listener, &mut buffer), "exited");
 }

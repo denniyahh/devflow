@@ -2,7 +2,9 @@
 //!
 //! Every test here that talks to a unit is `#[ignore]` and runs only under `scripts/check.sh
 //! service`, which needs a running systemd user manager; the container suite has none. The
-//! pure tests of [`settle_unit_reads`] run everywhere. Each host test's first assertion is that `systemctl --user show -p Version --value` succeeds, so a host with
+//! three pure tests of [`settle_unit_reads`] are not ignored, so they run in every `cargo
+//! test` and container run, and `scripts/check.sh service` (which runs only the ignored
+//! tests) does not count them. Each host test's first assertion is that `systemctl --user show -p Version --value` succeeds, so a host with
 //! no manager fails the test instead of skipping it.
 //!
 //! `systemctl` and `systemd-run` get the caller's real `XDG_RUNTIME_DIR` and
@@ -370,7 +372,6 @@ fn scripted(reads: Vec<UnitRead>) -> impl FnMut() -> UnitRead {
 }
 
 #[test]
-#[ignore = "service_e2e.rs is the host-only suite; run by scripts/check.sh service"]
 fn a_failed_read_before_inactive_is_reported_with_its_result() {
     let outcome = settle_unit_reads(
         Duration::from_secs(5),
@@ -392,7 +393,6 @@ fn a_failed_read_before_inactive_is_reported_with_its_result() {
 }
 
 #[test]
-#[ignore = "service_e2e.rs is the host-only suite; run by scripts/check.sh service"]
 fn an_inactive_read_after_deactivating_settles() {
     let outcome = settle_unit_reads(
         Duration::from_secs(5),
@@ -408,7 +408,6 @@ fn an_inactive_read_after_deactivating_settles() {
 }
 
 #[test]
-#[ignore = "service_e2e.rs is the host-only suite; run by scripts/check.sh service"]
 fn reads_that_never_settle_time_out_naming_the_last_read() {
     let outcome = settle_unit_reads(
         Duration::from_millis(100),
@@ -783,8 +782,10 @@ fn start_with_a_runner_path_that_no_longer_exists_fails_naming_the_unit_and_the_
     let copy = scratch.path().join("devflow");
     // A child copies the binary so this process never holds a write descriptor
     // on a file it then executes (#276's ETXTBSY window, as for the stubs).
-    let cp = "/bin/cp";
-    assert!(Path::new(cp).is_file(), "a real {cp}");
+    let cp = ["/usr/bin/cp", "/bin/cp"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("a real cp");
     let copied = Command::new(cp)
         .arg(common::devflow_bin())
         .arg(&copy)
@@ -1087,9 +1088,13 @@ fn a_hard_killed_runner_leaves_no_agent_and_the_unit_inactive() {
 }
 
 /// The stub agent's tail for the deactivating-unit scenarios: it leaves a child that
-/// ignores SIGTERM, so a stopped unit reads deactivating until the manager's SIGKILL.
-const STRAGGLER_TAIL: &str =
-    "setsid sh -c 'trap \"\" TERM; sleep 60' </dev/null >/dev/null 2>&1 &\nsleep 120";
+/// ignores SIGTERM, so a stopped unit reads deactivating until the manager's SIGKILL. The
+/// child creates [`STRAGGLER_READY`] in the stub's logs dir once its trap is set.
+const STRAGGLER_TAIL: &str = "setsid sh -c 'trap \"\" TERM; : >\"@LOGS@/straggler-ready\"; sleep 60' \
+     </dev/null >/dev/null 2>&1 &\nsleep 120";
+
+/// The file [`STRAGGLER_TAIL`]'s child creates once it ignores SIGTERM.
+const STRAGGLER_READY: &str = "straggler-ready";
 
 /// Start `fixture`'s run in a worktree and wait until its agent has started and left
 /// its straggler, returning the guard that stops the unit.
@@ -1109,7 +1114,12 @@ fn start_a_run_with_a_straggler(fixture: &StartFixture) -> UnitGuard {
         &guard.unit,
         "the agent never started",
     );
-    std::thread::sleep(Duration::from_millis(500));
+    let ready = fixture.logs.path().join(STRAGGLER_READY);
+    wait_until(
+        || ready.is_file(),
+        &guard.unit,
+        "the straggler never set its TERM trap",
+    );
     guard
 }
 

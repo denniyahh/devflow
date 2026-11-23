@@ -111,8 +111,10 @@ run_service() {
         exit 1
     fi
     # --no-tests=fail: a filter that matches nothing must not read as a pass.
-    echo "==> cargo nextest run -p devflow --test service_e2e --run-ignored only --no-tests=fail"
-    cargo nextest run -p devflow --test service_e2e --run-ignored only --no-tests=fail
+    # The no-op notify-listener entry every target compiles from tests/common is ignored
+    # too, but is not a test of this suite (F11).
+    echo "==> cargo nextest run -p devflow --test service_e2e --run-ignored only --no-tests=fail -E 'not test(=common::fake_notify_listener_entry)'"
+    cargo nextest run -p devflow --test service_e2e --run-ignored only --no-tests=fail -E 'not test(=common::fake_notify_listener_entry)'
 }
 
 case "$TARGET" in
