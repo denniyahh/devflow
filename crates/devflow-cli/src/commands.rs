@@ -3203,6 +3203,10 @@ pub(crate) use devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS;
 /// D-09a (review pi-9): a gate is offered approve and reject only while its waiter
 /// registration reads [`WaiterStatus::Live`] ([`Gates::waiter_status`]). A gate nothing
 /// waits on is debris naming `devflow discard`; a probe error offers no answer.
+///
+/// D-06 (#247): a live question gate is answered with `devflow gate answer`, so it is
+/// offered that verb with its option ids and `--text`, never approve or reject; a
+/// question that cannot be read offers no answer.
 fn render_pending_gate_banner(project_root: &Path, open: &[OpenGate], now: u64) -> Option<String> {
     if open.is_empty() {
         return None;
@@ -3238,10 +3242,24 @@ fn banner_answer_lines(project_root: &Path, gate: &OpenGate) -> String {
             Gates::waiter_status(project_root, phase, stage, &id).map_err(|e| e.to_string())
         });
     match waiter {
-        Ok(WaiterStatus::Live) => format!(
-            "  approve: devflow gate approve {phase} --stage {stage}\n  reject:  devflow gate \
-             reject {phase} --stage {stage} --note <reason>\n"
-        ),
+        Ok(WaiterStatus::Live) => match Gates::read_question(project_root, phase, stage) {
+            Ok(Some(question)) => {
+                let ids: Vec<&str> = question.options.iter().map(|o| o.id.as_str()).collect();
+                format!(
+                    "  answer:  devflow gate answer {phase} --gate-id {} (--option <{}> | --text \
+                     <answer>)\n",
+                    gate.gate_id,
+                    ids.join("|")
+                )
+            }
+            Ok(None) => format!(
+                "  approve: devflow gate approve {phase} --stage {stage}\n  reject:  devflow \
+                 gate reject {phase} --stage {stage} --note <reason>\n"
+            ),
+            Err(error) => format!(
+                "  error: the gate's question could not be read ({error}); no answer is offered\n"
+            ),
+        },
         Ok(WaiterStatus::Absent) => format!(
             "  debris: nothing waits on this gate, so an answer would reach no run; remove it \
              with `devflow discard --phase {phase}`\n"

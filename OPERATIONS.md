@@ -236,7 +236,7 @@ applies (`phase N: <word> — …`):
 
 | Answer | Meaning | Verb |
 |---|---|---|
-| `live` | The runner lock is held. The line gives the runner's pid when its record reads, and the stage; a run waiting at a gate says so | At a gate, `devflow gate approve N` or `devflow gate reject N --note <reason>`; otherwise watch it with `devflow logs --phase N -f`. End it with `devflow stop --phase N` |
+| `live` | The runner lock is held. The line gives the runner's pid when its record reads, and the stage; a run waiting at a gate says so | At a gate, `devflow gate approve N` or `devflow gate reject N --note <reason>`; at a question gate, `devflow gate answer N --gate-id <id> (--option <id> \| --text <answer>)`, with the ids `devflow status` prints; otherwise watch it with `devflow logs --phase N -f`. End it with `devflow stop --phase N` |
 | `live (stopping)` | The lock is free and the unit is not yet inactive: the runner is exiting | Wait for it to stop, or `devflow stop --phase N` |
 | `finished` | The run finished (its Validate passed) | Close the phase out, then remove the run with `devflow discard --phase N` |
 | `stopped` | The run recorded a stop | `devflow resume --phase N` (`--agent <other>` while its recorded delivery canary refuses the agent), or `devflow discard --phase N` |
