@@ -408,7 +408,9 @@ pub struct State {
     ///
     /// Set by `devflow start --reviews`. Read by the Plan prompt on every
     /// launch, a resume included, so a stopped reviews pass relaunches as one
-    /// with no resume flag. Cleared when the run enters another stage.
+    /// with no resume flag. Cleared when the run enters another stage and by
+    /// the `--until` halt after Plan, so a later gap-closure Plan renders its
+    /// gaps pass and a halted run carries no spent flag.
     ///
     /// `false` also means "the state was written by a binary predating this
     /// field".
