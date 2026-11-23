@@ -45,8 +45,10 @@ pub(crate) fn until_halt_reason(stage: Stage) -> String {
 /// during the capped stage leaves the same `stopped`, `stage` and `stop_until`; only
 /// the reason [`transition`] writes ([`until_halt_reason`]) tells the two apart.
 ///
-/// A fired cap resumes at [`Stage::next`] of the halted stage (999.251). The halt records
-/// no target, so a halt reached through a Plan->Validate transition also resumes at Code.
+/// A fired cap resumes at the stage the halted transition was moving to, which the halt
+/// records in [`State::until_halt_target`] (#281), so a halt reached through a
+/// Plan->Validate transition resumes at Validate. A state without it resumes at
+/// [`Stage::next`] of the halted stage (999.251).
 pub(crate) fn until_cap_fired(state: &State) -> bool {
     state.stopped
         && state.stop_until == Some(state.stage)
@@ -94,6 +96,8 @@ pub(crate) fn transition(
         commit(state, |s| {
             s.stopped = true;
             s.stop_reason = Some(until_halt_reason(from));
+            // #281 (D-09): the resume launches the stage this move was going to.
+            s.until_halt_target = Some(to);
             // T-20-03b / doctor gap (D-09): clear gate_pending so doctor does
             // not misreport this intentional stop as a gate with no waiter.
             s.gate_pending = false;
@@ -159,6 +163,9 @@ pub(crate) fn enter_stage(state: &mut State, from: Stage, to: Stage) {
     }
     state.infra_failures = 0;
     state.gate_pending = false;
+    // #281: entering a stage spends an `--until` halt's target, so no later resume
+    // reuses it.
+    state.until_halt_target = None;
     // D-09: a fix type lives exactly as long as its Code pass, so a later
     // plain Code pass never replays a stale one. Its note goes with it.
     state.code_fix = None;
