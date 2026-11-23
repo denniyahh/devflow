@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.2"
 current_phase_name: wsx/UDE first-use and dogfood remediation
 status: executing
-stopped_at: Completed 53.2-10-PLAN.md
-last_updated: "2026-11-23T06:31:05.886Z"
+stopped_at: Completed 53.2-11-PLAN.md
+last_updated: "2026-11-23T06:36:25.161Z"
 last_activity: 2026-11-22
 last_activity_desc: Phase 53.2 execution started
-state_head: c76a8c75e9bde3bca554c2f61e5702d190c61b58
+state_head: 431f93d4817838f5ad73a761f8eee8ef2bd1bba4
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 105
-  completed_plans: 98
+  completed_plans: 99
   percent: 13
 ---
 
@@ -179,7 +179,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.2 (wsx/UDE first-use and dogfood remediation) — EXECUTING
-Plan: 11 of 17
+Plan: 12 of 17
 Status: Ready to execute
 Last activity: 2026-11-22 — Phase 53.2 execution started
 
@@ -1072,6 +1072,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.2]: 53.2-08: no phase7_cli caller expects a helper timeout, so all seven wait helpers panic on the shared poll budget
 - [Phase 53.2]: 53.2-09: #310 left open per D-16; base and after loops both 0/40 target failures, so the post-release read waits are by construction
 - [Phase 53.2]: 53.2-10: StageIntent::PlanReviews is declared last on the enum so semver-checks reports only the planned variant addition, not discriminant shifts
+- [Phase 53.2]: 53.2-11: #178 measured with TMPDIR outside the checkout; zero leak, closed with no code change; project_root walk-up defect filed as #335
 
 ## Roadmap Evolution
 
@@ -1281,11 +1282,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.2 P08 | 7 min | 3 tasks | 7 files |
 | Phase 53.2 P09 | 27min | 2 tasks | 1 files |
 | Phase 53.2 P10 | 13min | 2 tasks | 2 files |
+| Phase 53.2 P11 | unrecorded | 3 tasks | 0 files |
 
 ## Session
 
-**Last session:** 2026-11-23T06:31:03.822Z
-**Stopped at:** Completed 53.2-10-PLAN.md
+**Last session:** 2026-11-23T06:36:23.196Z
+**Stopped at:** Completed 53.2-11-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

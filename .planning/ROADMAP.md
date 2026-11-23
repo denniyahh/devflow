@@ -397,7 +397,7 @@ Run conventions: discuss `--auto` in session, then `devflow start --phase 53.2 -
 --until plan`, external review (Tier B), close-out with `scripts/cut-pr-branch.sh`.
 **Requirements**: no REQ IDs; the issues above
 **Depends on:** Phase 53.1
-**Plans:** 10/17 plans executed
+**Plans:** 11/17 plans executed
 
 Plans:
 **Wave 1**
@@ -415,7 +415,7 @@ Plans:
 - [x] 53.2-10-PLAN.md — #250 StageIntent::PlanReviews and the planned semver break (wave 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
-- [ ] 53.2-11-PLAN.md — #178 measure the leak; close #273 and #308 with evidence (wave 3)
+- [x] 53.2-11-PLAN.md — #178 measure the leak; close #273 and #308 with evidence (wave 3)
 - [ ] 53.2-12-PLAN.md — #285 start warns on unignored GSD files; #258 keep a progressed run (wave 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
@@ -675,7 +675,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
-| 53.2. wsx/UDE first-use and dogfood remediation | 10/17 | In Progress | - |
+| 53.2. wsx/UDE first-use and dogfood remediation | 11/17 | In Progress | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
