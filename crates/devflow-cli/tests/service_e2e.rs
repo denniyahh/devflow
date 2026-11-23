@@ -370,6 +370,7 @@ fn scripted(reads: Vec<UnitRead>) -> impl FnMut() -> UnitRead {
 }
 
 #[test]
+#[ignore = "service_e2e.rs is the host-only suite; run by scripts/check.sh service"]
 fn a_failed_read_before_inactive_is_reported_with_its_result() {
     let outcome = settle_unit_reads(
         Duration::from_secs(5),
@@ -391,6 +392,7 @@ fn a_failed_read_before_inactive_is_reported_with_its_result() {
 }
 
 #[test]
+#[ignore = "service_e2e.rs is the host-only suite; run by scripts/check.sh service"]
 fn an_inactive_read_after_deactivating_settles() {
     let outcome = settle_unit_reads(
         Duration::from_secs(5),
@@ -406,6 +408,7 @@ fn an_inactive_read_after_deactivating_settles() {
 }
 
 #[test]
+#[ignore = "service_e2e.rs is the host-only suite; run by scripts/check.sh service"]
 fn reads_that_never_settle_time_out_naming_the_last_read() {
     let outcome = settle_unit_reads(
         Duration::from_millis(100),
