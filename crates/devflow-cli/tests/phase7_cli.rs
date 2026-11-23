@@ -1141,6 +1141,66 @@ fn start_dry_run_lists_exactly_plan_code_validate() {
     );
 }
 
+/// `devflow start --dry-run --phase 1 --mode supervise` plus `extra` on a fixture repo whose
+/// phase 1 has a `01-REVIEWS.md`. Returns the dry run's Plan line and its whole stdout,
+/// after asserting it exits 0.
+fn dry_run_plan_line_with_reviews_file(extra: &[&str]) -> (String, String) {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase_dir = root.join(".planning/phases/01-x");
+    std::fs::create_dir_all(&phase_dir).unwrap();
+    std::fs::write(phase_dir.join("01-REVIEWS.md"), "# reviews\n").unwrap();
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = common::hermetic_devflow(&home)
+        .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
+        .args(extra)
+        .arg(root)
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "dry-run must not fail\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan_line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("plan "))
+        .unwrap_or_else(|| panic!("the dry run printed no Plan line: {stdout}"))
+        .to_string();
+    (plan_line, stdout)
+}
+
+/// D-04 (#250): `start --reviews` shows, before launching, that Plan runs as a reviews pass.
+#[test]
+fn dry_run_with_reviews_shows_plan_phase_reviews() {
+    let (plan_line, stdout) = dry_run_plan_line_with_reviews_file(&["--reviews"]);
+    assert!(
+        plan_line.contains("/gsd-plan-phase 1 --reviews"),
+        "the dry run's Plan line lacks --reviews: {stdout}"
+    );
+}
+
+/// D-04 control: without `--reviews` the Plan line is the plain plan-phase command, even
+/// with a REVIEWS.md present (no auto-detection).
+#[test]
+fn dry_run_without_reviews_shows_plain_plan_phase() {
+    let (plan_line, stdout) = dry_run_plan_line_with_reviews_file(&[]);
+    assert!(
+        plan_line.contains("/gsd-plan-phase 1"),
+        "the dry run's Plan line lacks the plan-phase command: {stdout}"
+    );
+    assert!(
+        !plan_line.contains("--reviews"),
+        "the dry run's Plan line shows --reviews without the flag: {stdout}"
+    );
+}
+
 /// The `.gitignore` lines GSD's derived files need, as the #285 warning names them.
 const GSD_IGNORE_LINES: &[&str] = &[".planning/state.json", ".planning/milestone.lock", ".gsd/"];
 
