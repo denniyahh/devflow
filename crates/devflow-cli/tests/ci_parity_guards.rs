@@ -1080,3 +1080,75 @@ fn ci_workflow_calls_the_cpu_pin_decider_instead_of_echoing() {
          `echo`s that always exit 0. Documenting a gate is not implementing one."
     );
 }
+
+/// The code lines of devcontainer.yml's `runCmd: |` block, as [`code_lines`] trims them.
+fn runcmd_code_lines(workflow: &str) -> Vec<&str> {
+    let mut lines = workflow.lines();
+    let Some(header) = lines.by_ref().find(|l| l.trim_start() == "runCmd: |") else {
+        return Vec::new();
+    };
+    let block_indent = header.len() - header.trim_start().len();
+    lines
+        .filter(|l| !l.trim().is_empty())
+        .take_while(|l| l.len() - l.trim_start().len() > block_indent)
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect()
+}
+
+/// Whether runCmd exports `DEVFLOW_E2E_POLL_BUDGET_SECS` before it runs `scripts/check.sh all`.
+fn devcontainer_sets_poll_budget(workflow: &str) -> bool {
+    let lines = runcmd_code_lines(workflow);
+    let export = lines
+        .iter()
+        .position(|l| l.starts_with("export DEVFLOW_E2E_POLL_BUDGET_SECS="));
+    let check = lines
+        .iter()
+        .position(|l| l.contains("scripts/check.sh all"));
+    matches!((export, check), (Some(export), Some(check)) if export < check)
+}
+
+/// Whether the container gate's run passes `-e DEVFLOW_E2E_POLL_BUDGET_SECS=`.
+fn container_gate_passes_poll_budget(script: &str) -> bool {
+    code_lines(script)
+        .iter()
+        .any(|l| l.starts_with("-e DEVFLOW_E2E_POLL_BUDGET_SECS="))
+}
+
+/// The devcontainer job's runCmd before #301's budget was added.
+const RUNCMD_WITHOUT_BUDGET: &str = "          runCmd: |
+            set -e
+            git config --global --add safe.directory \"$PWD\"
+            scripts/check.sh all
+";
+
+/// check-in-container.sh's run before #301's budget was added.
+const CONTAINER_RUN_WITHOUT_BUDGET: &str = "exec \"${DOCKER[@]}\" run --rm -t \\
+    -w /workspace \\
+    -e CARGO_TARGET_DIR=/ctarget \\
+    -e CARGO_TERM_COLOR=always \\
+    \"$IMAGE\" \\
+    \"${CPU_PIN[@]}\" scripts/check.sh \"$TARGET\"
+";
+
+/// #301: the devcontainer job and the local container gate see no `CI`, so both set
+/// phase7_cli's polling budget explicitly.
+#[test]
+fn both_container_gates_set_the_e2e_poll_budget() {
+    let root = repo_root();
+    let workflow = read(&root.join(".github/workflows/devcontainer.yml"));
+    let script = read(&root.join("scripts/check-in-container.sh"));
+    assert!(
+        devcontainer_sets_poll_budget(&workflow),
+        "the devcontainer job does not set the e2e poll budget"
+    );
+    assert!(
+        container_gate_passes_poll_budget(&script),
+        "the container gate does not pass the e2e poll budget"
+    );
+    assert!(
+        !devcontainer_sets_poll_budget(RUNCMD_WITHOUT_BUDGET)
+            && !container_gate_passes_poll_budget(CONTAINER_RUN_WITHOUT_BUDGET),
+        "planted control: a gate without the budget passed the check"
+    );
+}
