@@ -981,7 +981,9 @@ fn start_reviews_with_the_reviews_file_only_in_the_primary_checkout_is_refused()
 }
 
 /// D-04 control: a REVIEWS.md committed on the base is accepted even when the primary
-/// checkout's working tree lacks it, and the run records the reviews pass.
+/// checkout's working tree lacks it, and the run's Plan reaches the agent as the reviews
+/// pass. Asserted on the agent's argv, not the state: the flag is spent once Plan
+/// completes, which the stub agent does at once.
 #[test]
 fn start_reviews_with_the_reviews_file_only_on_the_base_is_accepted() {
     let home = common::HermeticHome::new();
@@ -1002,19 +1004,31 @@ fn start_reviews_with_the_reviews_file_only_on_the_base_is_accepted() {
         "premise: the primary checkout lacks the REVIEWS.md"
     );
 
-    let (out, _reaper) = start_phase(&home, root, &["--reviews"]);
+    let agents = tempfile::tempdir().unwrap();
+    let argv_file = agents.path().join("codex-argv");
+    write_executable(
+        &agents.path().join("codex"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n{}",
+            argv_file.display(),
+            SUCCESS_AGENT.trim_start_matches("#!/bin/sh\n")
+        ),
+    );
+    let parent = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", agents.path().display(), parent.to_string_lossy());
+
+    let (out, _reaper) = start_phase_on_path(&home, root, &["--reviews"], path.as_ref(), &[]);
     let text = combined(&out);
     assert!(
         out.status.success() && !text.contains(REVIEWS_REFUSAL),
         "start --reviews refused a REVIEWS.md that is on the base: {text}"
     );
-    let state = devflow_core::workflow::load_state(root, PhaseId::new(PHASE))
-        .expect("the run's state loads");
-    assert!(
-        state.reviews_pass,
-        "start --reviews did not record the reviews pass: {text}"
-    );
     wait_for_settled(root);
+    let argv = fs::read_to_string(&argv_file).unwrap_or_default();
+    assert!(
+        argv.contains(&format!("plan-phase.md for phase {PHASE} --reviews")),
+        "start --reviews did not run Plan as a reviews pass: {argv}"
+    );
 }
 
 /// D-04, 52.1 D-27: the dry run probes no base tree, so with `--reviews` it names the
