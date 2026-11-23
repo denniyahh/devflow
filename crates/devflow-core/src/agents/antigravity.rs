@@ -177,13 +177,7 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"DEVF
             argv_file.display(),
             turn_file.display(),
         );
-        std::fs::write(bin_dir.join("agy"), stub).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin_dir.join("agy"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
+        crate::test_support::write_executable(&bin_dir.join("agy"), &stub);
 
         let (program, args) = AntigravityDriver.build_command(PhaseId::new(0), "x", &[]);
         let out = std::process::Command::new(program)
@@ -229,6 +223,29 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"DEVF
             "first turn must be event-key: {turn}"
         );
         assert!(!turn.contains("\"type\":"), "no type key allowed: {turn}");
+    }
+
+    #[test]
+    fn a_marker_less_or_init_only_stream_is_not_a_success() {
+        // The stage-turn output of the retired `agy` e2e stub: its quiet
+        // mode printed nothing, its init-only mode printed init and a step
+        // update with no result. Neither carries a marker, so neither may
+        // classify as Success.
+        let quiet = "";
+        let init_only = concat!(
+            "{\"event\":\"init\",\"model\":\"stub\",\"inputFormat\":\"stream-json\",\"outputFormat\":\"stream-json\"}\n",
+            "{\"event\":\"step_update\",\"index\":0,\"text_delta\":\"working\"}\n",
+        );
+        for (name, stream) in [("quiet", quiet), ("init-only", init_only)] {
+            let status = AntigravityDriver
+                .parse_completion(stream)
+                .map(|result| result.status);
+            assert_ne!(
+                status,
+                Some(AgentStatus::Success),
+                "the {name} stream must not be a Success"
+            );
+        }
     }
 
     #[test]

@@ -18,6 +18,8 @@ mod pipeline_outcomes;
 
 mod pipeline_gate;
 
+mod ask_server;
+
 mod phase_worktree;
 
 mod service;
@@ -70,12 +72,16 @@ enum Command {
         /// before Code).
         #[arg(long)]
         until: Option<Stage>,
+        /// Run the Plan stage as a reviews pass: `/gsd-plan-phase N --reviews`,
+        /// incorporating the phase's REVIEWS.md; refused without that file.
+        #[arg(long)]
+        reviews: bool,
         /// A second agent that takes over the Code stage once if the agent is
         /// rate-limited there (D-01, `51-CONTEXT.md`). Failover happens only at
         /// Code; at any other stage a rate limit waits at the stage's gate.
         ///
         /// Persisted in the run state (`state-NN.json`) before the first
-        /// supervisor spawns, and checked here as far as launch can tell: it
+        /// runner launches, and checked here as far as launch can tell: it
         /// must differ from `--agent`, its binary must be installed and its
         /// driver healthy, and in `--mode auto` it must be `claude` or
         /// `antigravity` (the unattended launch shape). The full preflight runs
@@ -103,6 +109,33 @@ enum Command {
         #[arg(long)]
         phase: PhaseId,
     },
+    /// Internal: the stdio MCP server an agent DevFlow launched spawns (D-03).
+    ///
+    /// Speaks newline-delimited JSON-RPC on stdin and stdout and offers one tool,
+    /// `devflow_ask`, whose call opens a question gate and returns the operator's
+    /// `gate answer`. Hidden: an agent's MCP registration runs it, never an operator.
+    #[command(name = "__ask", hide = true)]
+    Ask {
+        /// Project root of the launching run.
+        #[arg(long)]
+        project: PathBuf,
+        /// Phase of the launching run.
+        #[arg(long)]
+        phase: PhaseId,
+        /// Stage whose gate a question opens.
+        #[arg(long)]
+        stage: Stage,
+        /// How long a question waits for its answer, in seconds.
+        #[arg(long)]
+        timeout_secs: u64,
+        /// The launching run's `started_at`.
+        #[arg(long)]
+        run_started_at: String,
+        /// The longest one call is held, in seconds, before it replies
+        /// `pending`; absent holds a call until its question ends.
+        #[arg(long)]
+        hold_cap_secs: Option<u64>,
+    },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
     /// Unlike `start`, this loads the persisted per-phase state and
@@ -119,7 +152,7 @@ enum Command {
         /// Re-arm the run's one-hop fallback for the Code stage (D-01,
         /// `51-CONTEXT.md`): sets it to this agent and clears a spent mark, so a
         /// run whose fallback was used can fail over once more. Accepted on a run
-        /// that is not live (stopped, or whose supervisor has ended);
+        /// that is not live (stopped, or whose runner has ended);
         /// refused over a live run like any resume.
         ///
         /// Checked as on `devflow start`: it must differ from the agent the run
@@ -129,6 +162,12 @@ enum Command {
         /// `devflow.toml` key; only `start` does.
         #[arg(long)]
         fallback_agent: Option<AgentKind>,
+        /// Rerun Plan as a reviews pass, `/gsd-plan-phase N --reviews`, on a run its
+        /// `--until plan` cap halted after Plan; the cap still holds, so the run halts
+        /// again after Plan. Refused in any other state and without the phase's
+        /// NN-REVIEWS.md.
+        #[arg(long)]
+        reviews: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -293,6 +332,36 @@ enum GateCmd {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// Answer a question gate with one of the options it offers, or with free
+    /// text. Approve and reject are refused on a question gate; abort still
+    /// ends the run.
+    #[command(group(
+        clap::ArgGroup::new("choice")
+            .required(true)
+            .multiple(false)
+            .args(["option", "text"])
+    ))]
+    Answer {
+        /// Phase whose question gate to answer.
+        phase: PhaseId,
+        /// Stage of the gate (auto-resolved when the phase has exactly one
+        /// open gate).
+        #[arg(long = "stage")]
+        stage: Option<Stage>,
+        /// The gate id `gate list` showed: one answer decides only the gate
+        /// it names.
+        #[arg(long = "gate-id")]
+        gate_id: String,
+        /// The id of the chosen option, matched exactly.
+        #[arg(long)]
+        option: Option<String>,
+        /// A free-text answer; an empty text is an answer.
+        #[arg(long)]
+        text: Option<String>,
+        /// Project root.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Print an open gate's full, untruncated context (21a) — `gate list`
     /// truncates context to 300 chars, as the gate banner does; this reads it in
     /// full, control-char sanitized.
@@ -309,7 +378,7 @@ enum GateCmd {
     },
     /// Answer or report aged, unattended gates across every registered root
     /// (23b) — bounds an abandoned run's lifetime without `kill(1)` and
-    /// without a supervisor. On-demand only: nothing schedules this for you.
+    /// without a live runner. On-demand only: nothing schedules this for you.
     Sweep {
         /// Age threshold in seconds — a gate older than this is reaped.
         /// Defaults to `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` (three days,
@@ -414,6 +483,7 @@ fn run() -> Result<(), CliError> {
             no_worktree,
             dry_run,
             until,
+            reviews,
             fallback_agent,
             project,
         } => {
@@ -427,6 +497,7 @@ fn run() -> Result<(), CliError> {
                 worktree,
                 dry_run,
                 until,
+                reviews,
                 commands::FallbackSource::FlagOrConfig(fallback_agent),
             )
         }
@@ -440,12 +511,39 @@ fn run() -> Result<(), CliError> {
                 }
             }
         }
+        Command::Ask {
+            project,
+            phase,
+            stage,
+            timeout_secs,
+            run_started_at,
+            hold_cap_secs,
+        } => {
+            let code = ask_server::serve(ask_server::AskArgs {
+                project,
+                phase,
+                stage,
+                timeout_secs,
+                run_started_at,
+                hold_cap_secs,
+            });
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code)
+        }
         Command::Resume {
             phase,
             agent,
             fallback_agent,
+            reviews,
             project,
-        } => resume_with_fallback(&project_root(project)?, phase, agent, fallback_agent),
+        } => resume_with_fallback(
+            &project_root(project)?,
+            phase,
+            agent,
+            fallback_agent,
+            reviews,
+        ),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {
@@ -489,6 +587,20 @@ fn run() -> Result<(), CliError> {
                 GateAnswerKind::Abort,
                 note,
                 gate_id,
+            ),
+            GateCmd::Answer {
+                phase,
+                stage,
+                gate_id,
+                option,
+                text,
+                project,
+            } => commands::gate_answer(
+                &project_root(project)?,
+                phase,
+                stage,
+                &gate_id,
+                &answer_choice(option, text)?,
             ),
             GateCmd::Show {
                 phase,
@@ -551,6 +663,22 @@ fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
     }
 }
 
+/// The choice `gate answer`'s `--option` / `--text` group names. The group
+/// requires exactly one, so the last arm only guards a parser change.
+fn answer_choice(
+    option: Option<String>,
+    text: Option<String>,
+) -> Result<devflow_core::question::QuestionChoice, CliError> {
+    use devflow_core::question::QuestionChoice;
+    match (option, text) {
+        (Some(option_id), None) => Ok(QuestionChoice::Option { option_id }),
+        (None, Some(text)) => Ok(QuestionChoice::Text { text }),
+        _ => Err(CliError::Message(
+            "`gate answer` takes exactly one of `--option <id>` or `--text <answer>`".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +693,29 @@ mod tests {
         let dirty = version_label("4.0.0", commit, "true");
         assert_eq!(dirty, format!("4.0.0 ({commit}, dirty)"));
         assert!(dirty.ends_with(", dirty)"));
+    }
+
+    /// D-10: `gate answer` takes exactly one of `--option` and `--text`; an
+    /// empty text is an answer.
+    #[test]
+    fn gate_answer_requires_exactly_one_of_option_and_text() {
+        let parse = |extra: &[&'static str]| {
+            let mut args = vec!["devflow", "gate", "answer", "1", "--gate-id", "g"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).map(|_| ())
+        };
+        assert_eq!(
+            parse(&[]).expect_err("neither is refused").kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            parse(&["--option", "a", "--text", "b"])
+                .expect_err("both are refused")
+                .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert!(parse(&["--option", "a"]).is_ok(), "an option alone parses");
+        assert!(parse(&["--text", ""]).is_ok(), "an empty text alone parses");
     }
 
     #[test]

@@ -26,6 +26,7 @@
 
 use crate::liveness;
 use crate::phase_id::PhaseId;
+use crate::question::{QuestionChoice, QuestionSpec};
 use crate::stage::Stage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -155,9 +156,10 @@ pub enum GateKind {
     RateLimit,
     /// The gate for a failed preflight check before a stage launches (D-39; 52-22).
     Preflight,
-    /// The gate for a human-only checkpoint declaration at Code that was not
-    /// approved (D-39; 52-22).
-    CheckpointDeclaration,
+    /// A question an agent asked through `devflow_ask` (Phase 53, D-09). Its
+    /// file carries the question's spec, and only `devflow gate answer` answers
+    /// it; an abort still ends the run.
+    Question,
 }
 
 /// The human's response to a gate.
@@ -668,6 +670,7 @@ impl Gates {
             &GateId::new(),
             label.into(),
             context,
+            None,
         )
     }
 
@@ -713,13 +716,14 @@ impl Gates {
         let gate_id = GateId::new();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
         before_publish();
-        let opened = match Self::open_gate_as(project_root, phase, stage, &gate_id, kind, context) {
-            Ok(opened) => opened,
-            Err(error) => {
-                registration.finish();
-                return Err(error);
-            }
-        };
+        let opened =
+            match Self::open_gate_as(project_root, phase, stage, &gate_id, kind, context, None) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    registration.finish();
+                    return Err(error);
+                }
+            };
         after_publish();
         Ok((opened, registration))
     }
@@ -744,6 +748,7 @@ impl Gates {
             &gate_id,
             GateKind::StageFailure.into(),
             context,
+            None,
         )?;
         after_publish();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
@@ -752,7 +757,7 @@ impl Gates {
 
     /// [`open_gate`](Self::open_gate) under the id the caller chose. The disposal
     /// never touches a `.waiter` file: the registration for the gate being opened may
-    /// already exist.
+    /// already exist. A `question` is published in the gate file's own write.
     fn open_gate_as(
         project_root: &Path,
         phase: PhaseId,
@@ -760,14 +765,109 @@ impl Gates {
         gate_id: &GateId,
         kind: GateLabel,
         context: &str,
+        question: Option<&QuestionSpec>,
     ) -> Result<OpenedGate, GateError> {
         let _lock = gate_lock(project_root, phase)?;
         let (_, _, disposal) =
             Self::set_aside_stage_answers(project_root, phase, stage, &mut |_| {});
         disposal?;
-        let opened = Self::write_gate_file(project_root, phase, stage, gate_id, kind, context)?;
+        let opened =
+            Self::write_gate_file(project_root, phase, stage, gate_id, kind, context, question)?;
         consume_preanswer(project_root, phase, stage, gate_id)?;
         Ok(opened)
+    }
+
+    /// Open a question gate for `spec` and register its waiter, as
+    /// [`open_registered`](Self::open_registered) does. The gate file also
+    /// carries the spec under a top-level `question` key, published in the same
+    /// atomic write.
+    pub fn open_question_registered(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        spec: &QuestionSpec,
+    ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
+        let gate_id = GateId::new();
+        let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
+        let context = crate::question::render_question_context(spec);
+        let opened = match Self::open_gate_as(
+            project_root,
+            phase,
+            stage,
+            &gate_id,
+            GateKind::Question.into(),
+            &context,
+            Some(spec),
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                registration.finish();
+                return Err(error);
+            }
+        };
+        Ok((opened, registration))
+    }
+
+    /// The question spec the stage's gate file carries, or `None` when there is
+    /// no gate file or the gate carries no question.
+    pub fn read_question(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> Result<Option<QuestionSpec>, GateError> {
+        match std::fs::read_to_string(Self::gate_path(project_root, phase, stage)) {
+            Ok(contents) => Ok(serde_json::from_str::<QuestionKey>(&contents)?.question),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Answer the question gate the caller observed with `choice`: the same
+    /// approving [`GateAnswer`] body [`answer`](Self::answer) publishes, plus a
+    /// top-level `choice` key, exactly once.
+    pub fn answer_question(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+        choice: &QuestionChoice,
+        responded_by: &str,
+    ) -> Result<PathBuf, GateError> {
+        let response = GateResponse {
+            approved: true,
+            abort: false,
+            note: None,
+            responded_by: Some(responded_by.to_string()),
+        };
+        Self::publish_answer_with_hook(
+            project_root,
+            phase,
+            stage,
+            observed,
+            &response,
+            Some(choice),
+            || {},
+        )
+    }
+
+    /// The choice in `gate`'s answer slot, or `None` when the slot holds no
+    /// answer bound to `gate` or the answer carries no choice. Only reads.
+    pub fn read_question_choice(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> Result<Option<QuestionChoice>, GateError> {
+        let path = Self::answer_path(project_root, phase, stage, gate);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if classify_answer(&bytes, gate.as_str()).is_err() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice::<ChoiceKey>(&bytes)?.choice)
     }
 
     /// Register as `gate`'s waiter by taking a lock on its `.waiter` file, held until
@@ -1026,6 +1126,29 @@ impl Gates {
     ) -> Result<CloseReport, GateError> {
         let (report, result) = Self::close_with_partial_result(project_root, phase, stage);
         result.map(|()| report)
+    }
+
+    /// Close the stage's gate, as [`close`](Self::close) does, only while its
+    /// gate file still names `gate`: the check and the close are one gate-lock
+    /// critical section. `Ok(None)` when the stage has no gate file or its file
+    /// names another gate; then nothing is touched, so a waiter cleaning up late
+    /// never removes the gate that replaced its own, nor that gate's answers.
+    pub fn close_if_current(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> Result<Option<CloseReport>, GateError> {
+        if !Self::dir(project_root).is_dir() {
+            return Ok(None);
+        }
+        let lock = gate_lock(project_root, phase)?;
+        if Self::current_gate_id(project_root, phase, stage)?.as_deref() != Some(gate.as_str()) {
+            return Ok(None);
+        }
+        let (report, result) =
+            Self::close_stage_locked(project_root, phase, stage, &lock, &mut |_| {});
+        result.map(|()| Some(report))
     }
 
     /// [`close`](Self::close), retaining what happened before an error.
@@ -1334,6 +1457,28 @@ impl Gates {
         response: &GateResponse,
         before_publish: impl FnOnce(),
     ) -> Result<PathBuf, GateError> {
+        Self::publish_answer_with_hook(
+            project_root,
+            phase,
+            stage,
+            observed,
+            response,
+            None,
+            before_publish,
+        )
+    }
+
+    /// [`answer_with_hook`](Self::answer_with_hook), with a question's `choice`
+    /// under its own top-level key of the published body when there is one.
+    fn publish_answer_with_hook(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+        response: &GateResponse,
+        choice: Option<&QuestionChoice>,
+        before_publish: impl FnOnce(),
+    ) -> Result<PathBuf, GateError> {
         if response.approved && response.abort {
             return Err(GateError::ApprovedAndAborted { phase, stage });
         }
@@ -1352,7 +1497,11 @@ impl Gates {
             gate_id: observed.to_string(),
             response: response.clone(),
         };
-        publish_response_exclusive(&path, &serde_json::to_string_pretty(&answer)?, phase, stage)?;
+        let body = WithChoice {
+            answer: &answer,
+            choice,
+        };
+        publish_response_exclusive(&path, &serde_json::to_string_pretty(&body)?, phase, stage)?;
         info!(
             "gate answer written for phase {phase} {stage} gate {observed}: approved={}",
             response.approved
@@ -1595,7 +1744,8 @@ impl Gates {
         Self::open_gate(project_root, phase, stage, kind, context).map(|gate| gate.path)
     }
 
-    /// Write a gate file under `gate_id`. Disposes of nothing.
+    /// Write a gate file under `gate_id`, with `question` under its own top-level
+    /// key when there is one. Disposes of nothing.
     fn write_gate_file(
         project_root: &Path,
         phase: PhaseId,
@@ -1603,6 +1753,7 @@ impl Gates {
         gate_id: &GateId,
         label: GateLabel,
         context: &str,
+        question: Option<&QuestionSpec>,
     ) -> Result<OpenedGate, GateError> {
         let gate = GateFile {
             phase,
@@ -1616,7 +1767,11 @@ impl Gates {
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
-        write_atomic(&path, &serde_json::to_string_pretty(&gate)?)?;
+        let body = WithQuestion {
+            gate: &gate,
+            question,
+        };
+        write_atomic(&path, &serde_json::to_string_pretty(&body)?)?;
         Ok(OpenedGate {
             gate_id: gate_id.clone(),
             path,
@@ -1760,8 +1915,8 @@ fn backoff_wait<T>(
 /// Fire the operator-configured gate notify hook, if any.
 ///
 /// Reads `DEVFLOW_GATE_NOTIFY_CMD`; if unset or empty, this is a silent no-op
-/// (no notify command configured). Otherwise delegates to
-/// [`run_notify_command`]. `unexpected` marks a gate fired on a stage the
+/// (no notify command configured). Otherwise runs the hook as
+/// [`run_notify_command_to`] does. `unexpected` marks a gate fired on a stage the
 /// active [`crate::mode::Mode`] would not normally gate (e.g. a Plan/Code
 /// failure in Auto mode) — a never-silent gate per WR-11.
 ///
@@ -1782,11 +1937,40 @@ pub fn fire_gate_notify_with_fallback(
     unexpected: bool,
     fallback_cmd: Option<&str>,
 ) {
+    fire_gate_notify_with_fallback_cancellable(
+        phase,
+        stage,
+        context,
+        unexpected,
+        fallback_cmd,
+        &|| false,
+    );
+}
+
+/// [`fire_gate_notify_with_fallback`], whose hook run is also killed as soon
+/// as `cancel` answers `true`. Every run is bounded by [`NOTIFY_HOOK_TIMEOUT`].
+pub fn fire_gate_notify_with_fallback_cancellable(
+    phase: PhaseId,
+    stage: Stage,
+    context: &str,
+    unexpected: bool,
+    fallback_cmd: Option<&str>,
+    cancel: &dyn Fn() -> bool,
+) {
     let env = std::env::var_os(GATE_NOTIFY_CMD_ENV);
     let Some(cmd) = resolve_gate_notify_cmd(env.as_deref(), fallback_cmd) else {
         return;
     };
-    run_notify_command(&cmd, phase, stage, context, unexpected);
+    run_notify_command_to(
+        &cmd,
+        phase,
+        stage,
+        context,
+        unexpected,
+        NOTIFY_HOOK_TIMEOUT,
+        cancel,
+        &mut std::io::stderr(),
+    );
 }
 
 /// The environment variable that configures the gate notify hook.
@@ -1887,7 +2071,9 @@ pub fn resolve_gate_notify_cmd(
 /// [`GATE_CONTEXT_DISPLAY_CHARS`] characters (GATE-04, Pitfall 6): the gate
 /// file keeps the whole context, the notification only its start. Fail-soft: a non-zero exit or spawn error is logged via
 /// `warn!` and otherwise ignored — this must never propagate an error that
-/// could abort `run_gate`.
+/// could abort `run_gate`. Tests call it; DevFlow runs hooks through
+/// [`fire_gate_notify_with_fallback_cancellable`].
+#[cfg(test)]
 fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, unexpected: bool) {
     run_notify_command_to(
         cmd,
@@ -1895,21 +2081,37 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
         stage,
         context,
         unexpected,
+        NOTIFY_HOOK_TIMEOUT,
+        &|| false,
         &mut std::io::stderr(),
     );
 }
 
+/// How long one run of the gate notify hook may take before DevFlow kills its
+/// process group: no hook can hold up a gate or a question.
+pub const NOTIFY_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// [`run_notify_command`], writing the line for a failed hook to `err`: a
 /// failing hook is the operator's notification channel going quiet.
+///
+/// The hook runs bounded: `sh -c cmd` in its own process group, stdin and
+/// stdout to null, stderr drained on a thread so a chatty hook cannot fill the
+/// pipe. At `timeout`, or as soon as `cancel` answers `true`, the whole group is
+/// killed and the shell reaped, and the line on `err` names the bound or the
+/// cancel. So no hook, nor anything it backgrounds, can hold up a gate.
+#[allow(clippy::too_many_arguments)]
 fn run_notify_command_to(
     cmd: &str,
     phase: PhaseId,
     stage: Stage,
     context: &str,
     unexpected: bool,
+    timeout: Duration,
+    cancel: &dyn Fn() -> bool,
     err: &mut dyn std::io::Write,
 ) {
-    let output = Command::new("sh")
+    use std::os::unix::process::CommandExt;
+    let spawned = Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .env("DEVFLOW_GATE_PHASE", phase.to_string())
@@ -1922,17 +2124,40 @@ fn run_notify_command_to(
             "DEVFLOW_NON_SILENT_GATE",
             if unexpected { "1" } else { "0" },
         )
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            warn!("gate notify hook could not be spawned: {error}");
+            return;
+        }
+    };
+    let (stderr_sent, stderr_read) = std::sync::mpsc::channel::<Vec<u8>>();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            let _ = stderr_sent.send(bytes);
+        });
+    }
+    let started = std::time::Instant::now();
+    let end = await_hook(&mut child, &stderr_read, started, timeout, cancel);
+    if !matches!(end, HookEnd::Exited(..)) {
+        kill_hook_group(&mut child);
+    }
+    match end {
+        HookEnd::Exited(status, _) if status.success() => {
             debug!("gate notify hook ran successfully");
         }
-        Ok(out) => {
-            let status = out
-                .status
+        HookEnd::Exited(status, hook_stderr) => {
+            let status = status
                 .code()
                 .map_or_else(|| "a signal".to_string(), |code| code.to_string());
-            let hook_stderr = String::from_utf8_lossy(&out.stderr);
+            let hook_stderr = String::from_utf8_lossy(&hook_stderr);
             warn!("gate notify hook exited with status {status}: {hook_stderr}");
             let _ = writeln!(
                 err,
@@ -1940,8 +2165,96 @@ fn run_notify_command_to(
                 hook_stderr.trim()
             );
         }
-        Err(err) => warn!("gate notify hook could not be spawned: {err}"),
+        HookEnd::TimedOut => {
+            warn!("gate notify hook did not finish within {timeout:?}; killed");
+            let _ = writeln!(
+                err,
+                "warning: the gate notify hook did not finish within {} s \
+                 (NOTIFY_HOOK_TIMEOUT); its process group was killed",
+                timeout.as_secs()
+            );
+        }
+        HookEnd::Cancelled => {
+            warn!("gate notify hook cancelled; killed");
+            let _ = writeln!(
+                err,
+                "warning: the gate notify hook was killed on a cancel: the wait it \
+                 notified for ended first"
+            );
+        }
+        HookEnd::WaitFailed(error) => {
+            warn!("gate notify hook could not be waited for: {error}; killed");
+            let _ = writeln!(
+                err,
+                "warning: the gate notify hook could not be waited for ({error}); its \
+                 process group was killed"
+            );
+        }
     }
+}
+
+/// How a bounded notify hook run ended.
+enum HookEnd {
+    /// The shell exited and its stderr reached end of file.
+    Exited(std::process::ExitStatus, Vec<u8>),
+    /// The bound ran out first.
+    TimedOut,
+    /// The cancel answered `true` first.
+    Cancelled,
+    /// Waiting for the shell failed.
+    WaitFailed(std::io::Error),
+}
+
+/// How often a bounded notify hook is polled for its exit and its cancel.
+const NOTIFY_HOOK_POLL: Duration = Duration::from_millis(100);
+
+/// Poll `child` until it has exited and its stderr has ended, the bound runs
+/// out, or `cancel` answers `true`. A shell that exited while something it
+/// backgrounded still holds its stderr is waited for under the same bound.
+fn await_hook(
+    child: &mut std::process::Child,
+    stderr: &std::sync::mpsc::Receiver<Vec<u8>>,
+    started: std::time::Instant,
+    timeout: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> HookEnd {
+    let mut exited = None;
+    loop {
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(status) => exited = status,
+                Err(error) => return HookEnd::WaitFailed(error),
+            }
+        }
+        if let Some(status) = exited {
+            match stderr.try_recv() {
+                Ok(bytes) => return HookEnd::Exited(status, bytes),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return HookEnd::Exited(status, Vec::new());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if cancel() {
+            return HookEnd::Cancelled;
+        }
+        let waited = started.elapsed();
+        if waited >= timeout {
+            return HookEnd::TimedOut;
+        }
+        std::thread::sleep(NOTIFY_HOOK_POLL.min(timeout - waited));
+    }
+}
+
+/// Kill a notify hook's whole process group and reap its shell.
+fn kill_hook_group(child: &mut std::process::Child) {
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: killpg has no memory preconditions. The group is the hook's
+        // own (`process_group(0)` made the shell its leader), and the shell is
+        // not reaped yet, so the id cannot name another group.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+    let _ = child.wait();
 }
 
 /// The point inside a close's disposal that a kill-point fixture stops at.
@@ -2230,6 +2543,40 @@ const REASON_LEGACY_UNKEYED: &str = "legacy_unkeyed";
 /// The label of a quarantined body that names no usable gate id.
 const NO_GATE_ID_LABEL: &str = "noid";
 
+/// A gate file as written: the [`GateFile`], plus a question gate's spec under
+/// its own key. A reader of [`GateFile`] ignores the extra key.
+#[derive(Serialize)]
+struct WithQuestion<'a> {
+    #[serde(flatten)]
+    gate: &'a GateFile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question: Option<&'a QuestionSpec>,
+}
+
+/// The `question` key of a gate file, read on its own.
+#[derive(Deserialize)]
+struct QuestionKey {
+    #[serde(default)]
+    question: Option<QuestionSpec>,
+}
+
+/// An answer body as published: the [`GateAnswer`], plus a question's choice
+/// under its own key. A reader of [`GateAnswer`] ignores the extra key.
+#[derive(Serialize)]
+struct WithChoice<'a> {
+    #[serde(flatten)]
+    answer: &'a GateAnswer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice: Option<&'a QuestionChoice>,
+}
+
+/// The `choice` key of an answer body, read on its own.
+#[derive(Deserialize)]
+struct ChoiceKey {
+    #[serde(default)]
+    choice: Option<QuestionChoice>,
+}
+
 /// Whether a file in the answer slot of gate `slot_id` binds to that gate: its body
 /// parses as a [`GateAnswer`] naming `slot_id`. Otherwise, why not.
 fn classify_answer(bytes: &[u8], slot_id: &str) -> Result<GateAnswer, &'static str> {
@@ -2293,6 +2640,91 @@ mod tests {
     /// `remove_var` are process-wide and `cargo test` runs in parallel by
     /// default) so they don't race each other.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Phase 53: a question gate publishes its spec under the `question` key,
+    /// and the spec survives the answer and the claim, neither of which
+    /// rewrites the gate file. The choice is read back from the answer slot.
+    /// Control: a gate opened without a question carries none.
+    #[test]
+    fn a_question_gate_keeps_its_spec_through_answer_and_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5301);
+        let stage = Stage::Code;
+        let option = |id: &str, label: &str| crate::question::QuestionOption {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: None,
+        };
+        let spec = QuestionSpec {
+            question_id: crate::question::new_question_id(),
+            question: "Pick a budget".to_string(),
+            options: vec![
+                option("budget-30", "30 s"),
+                option("budget-120", "120 s"),
+                option("budget-300", "300 s"),
+            ],
+            context: Some("the probe needs a bound".to_string()),
+            kind: crate::question::QuestionKind::Decision,
+            recommended: Some("budget-120".to_string()),
+        };
+
+        let (opened, registration) =
+            Gates::open_question_registered(root, phase, stage, &spec).unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gate_kind"], "question", "{text}");
+        assert_eq!(
+            Gates::read_question(root, phase, stage).unwrap(),
+            Some(spec.clone()),
+            "the gate file publishes the spec under its `question` key: {text}"
+        );
+
+        let choice = QuestionChoice::Option {
+            option_id: "budget-120".to_string(),
+        };
+        Gates::answer_question(root, phase, stage, &opened.gate_id, &choice, "operator").unwrap();
+        assert_eq!(
+            Gates::read_question_choice(root, phase, stage, &opened.gate_id).unwrap(),
+            Some(choice),
+            "the chosen option is read back from the gate's answer slot"
+        );
+        match Gates::read_answer(root, phase, stage, &opened.gate_id) {
+            AnswerRead::Bound(answer) => {
+                assert!(
+                    answer.response.approved && !answer.response.abort,
+                    "{answer:?}"
+                );
+            }
+            other => panic!("the question's answer must bind as a gate answer: {other:?}"),
+        }
+        assert_eq!(
+            Gates::read_question(root, phase, stage).unwrap(),
+            Some(spec.clone()),
+            "the spec survives the answer"
+        );
+        assert_eq!(
+            Gates::claim(root, phase, stage, &opened.gate_id).unwrap(),
+            Claim::Claimed
+        );
+        assert_eq!(
+            Gates::read_question(root, phase, stage).unwrap(),
+            Some(spec),
+            "the spec survives the claim"
+        );
+        registration.finish();
+
+        let control = PhaseId::new(5302);
+        let (_, control_registration) =
+            Gates::open_registered(root, control, stage, GateKind::StageFailure, "a failure")
+                .unwrap();
+        assert_eq!(
+            Gates::read_question(root, control, stage).unwrap(),
+            None,
+            "a gate opened without a question carries no `question` key"
+        );
+        control_registration.finish();
+    }
 
     /// 52-22: a gate's kind is a structured field of its file. A gate opened
     /// with a kind reads back with it and its file holds the snake_case name. The
@@ -3386,6 +3818,8 @@ mod tests {
             Stage::Validate,
             "ctx",
             false,
+            NOTIFY_HOOK_TIMEOUT,
+            &|| false,
             &mut sink,
         );
         let text = String::from_utf8(sink).unwrap();
@@ -3406,9 +3840,179 @@ mod tests {
             Stage::Validate,
             "ctx",
             false,
+            NOTIFY_HOOK_TIMEOUT,
+            &|| false,
             &mut sink,
         );
         assert!(sink.is_empty());
+    }
+
+    /// A hook that backgrounds a `sleep` and waits on it, recording the
+    /// sleep's pid in `pidfile`.
+    fn never_exiting_hook(pidfile: &Path) -> String {
+        format!("sleep 600 & echo $! > '{}'; wait", pidfile.display())
+    }
+
+    /// Run `hook` with `timeout` and `cancel` on a thread, returning what it
+    /// wrote to its error sink, or `None` when it has not returned within
+    /// `within`. On `None` the backgrounded sleep in `pidfile` is killed, so a
+    /// failing run does not leave it behind.
+    fn run_hook_within(
+        hook: String,
+        timeout: Duration,
+        cancel: impl Fn() -> bool + Send + 'static,
+        within: Duration,
+        pidfile: &Path,
+    ) -> Option<String> {
+        let (sent, returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            run_notify_command_to(
+                &hook,
+                PhaseId::new(11),
+                Stage::Code,
+                "ctx",
+                false,
+                timeout,
+                &cancel,
+                &mut sink,
+            );
+            let _ = sent.send(String::from_utf8(sink).unwrap());
+        });
+        let text = returned.recv_timeout(within).ok();
+        if text.is_none()
+            && let Some(pid) = read_pid(pidfile)
+        {
+            // SAFETY: kill has no memory preconditions; the pid is the
+            // test's own backgrounded sleep.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        text
+    }
+
+    fn read_pid(pidfile: &Path) -> Option<i32> {
+        std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()
+    }
+
+    /// Whether `pid` is gone or a zombie: a CI job container's PID 1 never
+    /// reaps, so a killed orphan may stay as `Z`.
+    fn gone_or_zombie(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    #[test]
+    fn a_notify_hook_that_never_exits_is_killed_at_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("sleep.pid");
+        let text = run_hook_within(
+            never_exiting_hook(&pidfile),
+            Duration::from_secs(1),
+            || false,
+            Duration::from_secs(3),
+            &pidfile,
+        )
+        .expect("the hook runner returned within 3 s of a 1 s bound");
+        assert!(
+            text.contains("did not finish within 1 s"),
+            "the failure line names the timeout: {text:?}"
+        );
+        let pid = read_pid(&pidfile).expect("the hook recorded its sleep's pid");
+        let started = std::time::Instant::now();
+        while !gone_or_zombie(pid) && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            gone_or_zombie(pid),
+            "the hook's backgrounded sleep {pid} is still alive"
+        );
+
+        // Control: a hook that exits at once, under the same bound.
+        let started = std::time::Instant::now();
+        let control = run_hook_within(
+            "true".to_string(),
+            Duration::from_secs(1),
+            || false,
+            Duration::from_secs(3),
+            &pidfile,
+        )
+        .expect("a hook that exits returns");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "a hook that exits returns at once, not at the bound"
+        );
+        assert!(control.is_empty(), "no failure line: {control:?}");
+    }
+
+    #[test]
+    fn a_cancelled_notify_hook_is_killed_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("sleep.pid");
+        let started = std::time::Instant::now();
+        let text = run_hook_within(
+            never_exiting_hook(&pidfile),
+            Duration::from_secs(30),
+            move || started.elapsed() >= Duration::from_millis(500),
+            Duration::from_secs(2),
+            &pidfile,
+        )
+        .expect("a cancelled hook runner returned within 2 s");
+        assert!(
+            text.contains("cancel"),
+            "the line names the cancel: {text:?}"
+        );
+    }
+
+    #[test]
+    fn close_if_current_leaves_a_replacement_gate_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase, stage) = (dir.path(), PhaseId::new(5307), Stage::Code);
+        let spec = QuestionSpec::from_arguments(&serde_json::json!({
+            "question": "Pick a budget",
+            "options": [{ "id": "budget-30", "label": "30 s" }],
+            "kind": "decision",
+        }))
+        .unwrap();
+        let (question, question_waiter) =
+            Gates::open_question_registered(root, phase, stage, &spec).unwrap();
+        let (failure, failure_waiter) =
+            Gates::open_registered(root, phase, stage, GateKind::StageFailure, "stage failed")
+                .unwrap();
+        let gate_file = Gates::gate_path(root, phase, stage);
+        let waiter_file = Gates::waiter_path(root, phase, stage, &failure.gate_id);
+
+        let stale = Gates::close_if_current(root, phase, stage, &question.gate_id).unwrap();
+        assert_eq!(
+            stale, None,
+            "a close naming the replaced gate closes nothing"
+        );
+        assert_eq!(
+            Gates::current_gate_id(root, phase, stage)
+                .unwrap()
+                .as_deref(),
+            Some(failure.gate_id.as_str()),
+            "the replacement gate's file is untouched"
+        );
+        assert!(
+            waiter_file.exists(),
+            "the replacement's waiter file is untouched"
+        );
+        question_waiter.finish();
+
+        // Control: the current gate's own id closes it.
+        let current = Gates::close_if_current(root, phase, stage, &failure.gate_id).unwrap();
+        assert!(current.is_some(), "the current gate closes");
+        assert!(!gate_file.exists(), "its gate file is removed");
+        failure_waiter.finish();
+    }
+
+    #[test]
+    fn the_notify_hook_bound_is_thirty_seconds() {
+        assert_eq!(NOTIFY_HOOK_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]

@@ -197,6 +197,31 @@ pub fn has_event_for_phase(project_root: &Path, phase: PhaseId, event: &str) -> 
     last_event_of_kind_for_phase(project_root, phase, event).is_some()
 }
 
+/// Question-channel event contract (D-15). The ask server emits these three
+/// events; `devflow history` pairs them by `question_id`. Every line also
+/// carries the envelope `emit` stamps (`v`, `ts`, `phase`, `event`); `ts` is
+/// when the question was asked, answered or closed.
+///
+/// - `question_asked`: `stage`, `question_id`, `gate_id`, `kind`
+///   (`decision` | `blocking-human` | `discuss`), `question`, `options`
+///   (array of `{id, label, description?}` in payload order), `context`
+///   (string or null), `recommended` (option id or null).
+/// - `question_answered`: `stage`, `question_id`, `gate_id`, `answer`
+///   (`{option_id}` or `{text}`), `policy`
+///   ([`ANSWERING_POLICY_OPERATOR_VIA_GATE`]), `answered_by`.
+/// - `question_closed`: `stage`, `question_id`, `gate_id`, `reason` (one of
+///   `cancelled_by_client`, `client_disconnected`, `terminated`,
+///   `run_stopped`, `runner_gone`, `timed_out`, `aborted_by_operator`,
+///   `agent_exited`, `closed_on_resume`), `closed_by` (string or null).
+pub const QUESTION_ASKED: &str = "question_asked";
+/// A question was answered; fields under [`QUESTION_ASKED`].
+pub const QUESTION_ANSWERED: &str = "question_answered";
+/// A question ended without an answer; fields under [`QUESTION_ASKED`].
+pub const QUESTION_CLOSED: &str = "question_closed";
+/// The `policy` value of a `question_answered` event: the operator answered
+/// the question gate.
+pub const ANSWERING_POLICY_OPERATOR_VIA_GATE: &str = "operator_via_gate";
+
 /// Render an event as a short human-readable summary ("gate_fired (ship)").
 pub fn describe(event: &serde_json::Value) -> String {
     let kind = event
@@ -564,6 +589,26 @@ mod tests {
             "workflow_finished"
         );
         assert_eq!(describe(&serde_json::json!({})), "unknown");
+    }
+
+    #[test]
+    fn describe_names_a_question_event_by_its_stage() {
+        assert_eq!(
+            describe(&serde_json::json!({
+                "event": QUESTION_ASKED,
+                "stage": "code",
+                "question_id": "q-1",
+            })),
+            "question_asked (code)"
+        );
+        assert_eq!(QUESTION_ANSWERED, "question_answered");
+        assert_eq!(QUESTION_CLOSED, "question_closed");
+        assert_eq!(ANSWERING_POLICY_OPERATOR_VIA_GATE, "operator_via_gate");
+        // Control: a gate event still describes by its stage.
+        assert_eq!(
+            describe(&serde_json::json!({"event": "gate_fired", "stage": "validate"})),
+            "gate_fired (validate)"
+        );
     }
 
     #[test]

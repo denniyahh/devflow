@@ -2272,6 +2272,16 @@ const REMOVED_SURFACE_TOKENS: &[&str] = &[
     concat!("DEVFLOW_FOREGROUND_GATE", "_TIMEOUT_SECS"),
     concat!("DEVFLOW_CHECKOUT_LOCK", "_TIMEOUT_SECS"),
     concat!("shi", "p_evidence"),
+    concat!("relaunch_checkpoint", "_session"),
+    concat!("checkpoint_auto_decide", "_prompt"),
+    concat!("exec_resume", "_command"),
+    concat!("GATE_RESOLUTION", "_RULE"),
+    concat!("MAX_CHECKPOINT", "_RESUMES"),
+    concat!("checkpoint", "_resumes"),
+    concat!("RecordCheckpoint", "Set"),
+    concat!("phase_has_blocking_human", "_checkpoint"),
+    concat!("blocking_human_checkpoint", "_reported"),
+    concat!("checkpoint_auto", "_decided"),
 ];
 
 /// Removed stage names, matched in Rust only as a whole string literal (and in
@@ -2405,9 +2415,10 @@ fn whole_literal_lines<'a>(code: &str, values: &[&'a str]) -> Vec<(usize, &'a st
     found
 }
 
-/// One real line per token, copied from the b8df457 tree with the token
-/// replaced by `@`, in the order of `REMOVED_SURFACE_TOKENS` then
-/// `REMOVED_STAGE_LITERALS`.
+/// One real line per token, copied with the token replaced by `@`, in the
+/// order of `REMOVED_SURFACE_TOKENS` then `REMOVED_STAGE_LITERALS`: the v3
+/// surface's lines from the b8df457 tree, the checkpoint relaunch surface's
+/// (53-03, 53-06, 53-10) from the ec413ef `origin/develop` tree.
 const PLANTED_REMOVED_LINES: &[&str] = &[
     r#".expect("the cron arm wrote @-5148.json");"#,
     "if instructions.@.schedule.is_empty() {",
@@ -2436,6 +2447,16 @@ const PLANTED_REMOVED_LINES: &[&str] = &[
     r#"parse_foreground_gate_timeout(std::env::var("@").ok())"#,
     r#"parse_checkout_lock_timeout(std::env::var("@").ok())"#,
     "use devflow_core::@;",
+    "return @(&mut state, &session_id);",
+    "let instruction = prompt::@(state.phase);",
+    "agents::ClaudeDriver::@(session_id, &instruction)",
+    "pub const @: &str = gate_resolution_rule!();",
+    "pub const @: u32 = 3;",
+    "persisted.@ = 1;",
+    r#"StatusLessStep::@ => "record_checkpoint_set","#,
+    "&& verify::@(execution_root, phase)",
+    "pub fn @(stdout: &str) -> bool {",
+    r#""@","#,
     r#"assert_eq!(stage.as_deref(), Some("@"));"#,
     r#"serde_json::json!({"stage": "@", "gate_id": gate_id, "status": "live"})"#,
 ];
@@ -2483,7 +2504,11 @@ fn no_removed_surface_literal_remains() {
         .chain(REMOVED_STAGE_LITERALS)
         .copied()
         .collect();
-    assert_eq!(values.len(), 29, "the token list is the 29 the plan names");
+    assert_eq!(
+        values.len(),
+        39,
+        "the token list is the 29 the 52-18 plan names and the 10 the 53-11 plan names"
+    );
     assert_eq!(PLANTED_REMOVED_LINES.len(), values.len());
     for ((value, shown), template) in values.iter().zip(&tokens).zip(PLANTED_REMOVED_LINES) {
         let line = template.replace('@', value);

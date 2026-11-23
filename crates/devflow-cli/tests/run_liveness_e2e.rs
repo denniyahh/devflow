@@ -367,6 +367,64 @@ fn discard_waits_for_a_deactivating_unit_before_removing_anything() {
     );
 }
 
+/// D-14 (#296): with the runner lock free and the unit `active` (the process the fake
+/// recorded for it is alive), discard waits and removes nothing until that process is
+/// gone; then it completes.
+#[test]
+fn discard_waits_for_an_active_unit_whose_runner_released_its_lock() {
+    let case = Case::finished(PhaseId::new(93));
+    let service_bin = case.home.service_bin();
+    let unit = case.unit();
+    let unit_process = ChildGuard(Some(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn the unit's lock-free process"),
+    ));
+    let pid = unit_process.0.as_ref().expect("the child is owned").id();
+    fs::write(service_bin.join(format!("{unit}.pid")), format!("{pid}\n")).unwrap();
+    let stubs = tempfile::tempdir().unwrap();
+    let mut discard = ChildGuard(Some(
+        case.devflow(
+            &["discard", "--phase", &case.phase.to_string()],
+            stubs.path(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn devflow discard"),
+    ));
+
+    let reads = service_bin.join(format!("{unit}.active-reads"));
+    devflow_core::test_support::wait_until(
+        Duration::from_secs(30),
+        "discard never read the unit active",
+        || fs::read_to_string(&reads).is_ok_and(|text| text.lines().any(|line| line == "active")),
+    );
+    let still_waiting = discard.child().try_wait().expect("poll discard").is_none();
+    assert!(
+        case.worktree_and_state_remain(),
+        "discard removed a run whose unit still read active"
+    );
+    assert!(
+        still_waiting,
+        "discard exited while the unit still read active"
+    );
+
+    drop(unit_process);
+    let out = discard.output_within(Duration::from_secs(30));
+    assert!(
+        out.status.success(),
+        "discard completes once the unit's process is gone:\n{}",
+        text(&out)
+    );
+    assert!(
+        !case.worktree().exists() && !case.state_file().exists(),
+        "discard removed the worktree and the state after the wait:\n{}",
+        text(&out)
+    );
+}
+
 /// D-07a: a unit that never reads inactive makes discard refuse after its bound,
 /// naming the unit and its state, with nothing removed.
 #[test]
@@ -1174,4 +1232,215 @@ fn start_racing_discard_never_leaves_a_run_without_its_worktree() {
         "holder pid missing from the refusal:\n{}",
         text(&out)
     );
+}
+
+/// How long the child a readiness test launches through the fake `systemd-run` lives.
+const LAUNCHED_CHILD_LIFETIME: Duration = Duration::from_secs(2);
+
+/// The fake `systemd-run`, run directly, launching `/bin/sh -c script` in `project` as
+/// the runner of phase 7 (`__runner --phase 7`), with `env` set on its command.
+fn run_fake_launcher(
+    home: &common::HermeticHome,
+    project: &Path,
+    script: &str,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> Output {
+    let mut command = std::process::Command::new(home.service_bin().join("systemd-run"));
+    command
+        .arg("--unit=readiness-probe.service")
+        .arg(format!("--working-directory={}", project.display()))
+        .args(["--", "/bin/sh", "-c", script, "__runner", "--phase", "7"])
+        .stdin(Stdio::null());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().expect("run the fake systemd-run")
+}
+
+/// A project dir with an empty `.devflow/`.
+fn project_with_devflow_dir() -> tempfile::TempDir {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join(".devflow")).unwrap();
+    project
+}
+
+/// The fake launcher's stderr holds no error from a `/proc` read that raced a
+/// descriptor closing.
+fn assert_no_proc_read_error(out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("No such file") && !stderr.contains("cannot open"),
+        "the fake launcher's readiness probe leaked a /proc read error: {stderr}"
+    );
+}
+
+/// The fake reads readiness only from `READY=1` (#337, which superseded D-14's lock clause,
+/// 53.2-18-PLAN.md): a launched command that exits without sending it, here after writing
+/// a `.runner-07` record naming its pid, is a failed start.
+#[test]
+fn the_fake_launcher_reads_a_command_that_exits_without_ready_as_a_failed_start() {
+    let home = common::HermeticHome::new();
+    let project = project_with_devflow_dir();
+    let script = format!(
+        "echo \"$$ unheld\" >.devflow/.runner-07; exec sleep {}",
+        LAUNCHED_CHILD_LIFETIME.as_secs()
+    );
+
+    let out = run_fake_launcher(&home, project.path(), &script, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains(common::FAKE_START_FAILED),
+        "a command that exited without READY=1 was not a failed start: status {}, stderr {stderr}",
+        out.status
+    );
+    assert_no_proc_read_error(&out);
+}
+
+/// The project root [`fast_ready_runner_entry`] takes phase 7's runner lock in.
+const FAST_READY_RUNNER_ROOT_ENV: &str = "FAST_READY_RUNNER_ROOT";
+
+/// The test binary the fast-runner readiness test's launched shell `exec`s.
+const FAST_READY_RUNNER_EXE_ENV: &str = "FAST_READY_RUNNER_EXE";
+
+/// #337: a runner that takes its lock, sends `READY=1` and exits at once, well inside
+/// one of the fake's polls, is a start, as systemd reads a `Type=notify` unit.
+#[test]
+fn the_fake_launcher_reads_a_runner_that_sent_ready_and_exited_at_once_as_started() {
+    let home = common::HermeticHome::new();
+    let project = project_with_devflow_dir();
+    let exe = std::env::current_exe().expect("this test binary");
+    let script = format!(
+        "exec \"${FAST_READY_RUNNER_EXE_ENV}\" --exact fast_ready_runner_entry --ignored --quiet"
+    );
+
+    let out = run_fake_launcher(
+        &home,
+        project.path(),
+        &script,
+        &[
+            (FAST_READY_RUNNER_EXE_ENV, exe.as_os_str()),
+            (FAST_READY_RUNNER_ROOT_ENV, project.path().as_os_str()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !stderr.contains(common::FAKE_START_FAILED),
+        "the fake launcher read a runner that sent READY=1 and exited at once as failed: status {}, stderr {stderr}",
+        out.status
+    );
+}
+
+/// Not a test of its own: the child the fast-runner readiness test launches. Does what
+/// `run_runner` does before its work, in the same order (take phase 7's runner lock,
+/// send `READY=1`), then exits at once. Without the variable it does nothing.
+#[test]
+#[ignore = "the fast runner a readiness test launches, not a test"]
+fn fast_ready_runner_entry() {
+    let Some(root) = std::env::var_os(FAST_READY_RUNNER_ROOT_ENV) else {
+        return;
+    };
+    let hold = liveness::claim_runner_lock(Path::new(&root), PhaseId::new(7))
+        .expect("hold phase 7's runner lock");
+    send_ready_to_notify_socket();
+    drop(hold);
+}
+
+/// Send `READY=1` to `NOTIFY_SOCKET` as `service::notify_ready` does: an `@` prefix is
+/// an abstract name, any other value a path; a no-op when the variable is unset.
+fn send_ready_to_notify_socket() {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let Some(target) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(target.as_os_str());
+    let addr = match bytes.strip_prefix(b"@") {
+        Some(name) => SocketAddr::from_abstract_name(name),
+        None => SocketAddr::from_pathname(Path::new(&target)),
+    }
+    .expect("a NOTIFY_SOCKET address");
+    UnixDatagram::unbound()
+        .expect("an unbound datagram socket")
+        .send_to_addr(b"READY=1", &addr)
+        .expect("send READY=1 to NOTIFY_SOCKET");
+}
+
+/// The process state [`common::PROC_STATE_FN`] prints for a `/proc/PID/stat` holding
+/// `stat_line`.
+fn proc_state_of(stat_line: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let stat = dir.path().join("stat");
+    fs::write(&stat, stat_line).unwrap();
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{}\nproc_state \"$1\"", common::PROC_STATE_FN))
+        .arg("sh")
+        .arg(&stat)
+        .output()
+        .expect("run /bin/sh");
+    assert!(out.status.success(), "proc_state failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+}
+
+/// F10: the fakes read the state field after the command name, which may hold spaces.
+/// Control: a name with none, in state Z.
+#[test]
+fn the_fakes_read_the_proc_state_after_a_command_name_with_spaces() {
+    assert_eq!(
+        proc_state_of("4242 (a b) S 1 2 3\n"),
+        "S",
+        "a command name with a space shifted the state field"
+    );
+    assert_eq!(proc_state_of("4242 (ab) Z 1\n"), "Z");
+}
+
+/// F24: the fakes write the test binary's path as one shell word whatever it holds; a
+/// path with a space and a single quote reaches `printf` unchanged.
+#[test]
+fn the_fakes_quote_a_path_with_a_space_and_a_quote() {
+    let path = "/x/a b/it's";
+    let quoted = common::sh_quote(path);
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("printf %s {quoted}"))
+        .output()
+        .expect("run /bin/sh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        path,
+        "quoted as {quoted}"
+    );
+}
+
+/// A datagram socket bound in a fresh tempdir with `datagrams` queued on it by an
+/// unbound sender.
+fn socket_with_queued(
+    datagrams: &[&[u8]],
+) -> (tempfile::TempDir, std::os::unix::net::UnixDatagram) {
+    use std::os::unix::net::UnixDatagram;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("n");
+    let listener = UnixDatagram::bind(&path).unwrap();
+    let sender = UnixDatagram::unbound().unwrap();
+    for datagram in datagrams {
+        sender.send_to(datagram, &path).unwrap();
+    }
+    (dir, listener)
+}
+
+/// F08: a `READY=1` the runner sent before it exited is still read as ready once the
+/// fake drains the queue.
+#[test]
+fn drained_verdict_reads_a_ready_queued_before_the_exit() {
+    let (_dir, listener) = socket_with_queued(&[b"STATUS=x", b"READY=1"]);
+    let mut buffer = [0u8; 4096];
+    assert_eq!(common::drained_verdict(&listener, &mut buffer), "ready");
+}
+
+/// F08 control: a queue with no `READY=1` drains to `exited`.
+#[test]
+fn drained_verdict_reads_exited_when_only_a_status_datagram_is_queued() {
+    let (_dir, listener) = socket_with_queued(&[b"STATUS=x"]);
+    let mut buffer = [0u8; 4096];
+    assert_eq!(common::drained_verdict(&listener, &mut buffer), "exited");
 }

@@ -369,6 +369,10 @@ pub const GSD_STUB_VERSION: &str = "0.0.0-stub";
 /// an error and exits 97, so a test that reads more often than it scripted sees
 /// a reader failure, never a repeated answer.
 ///
+/// A reply whose first line is `!exit <code>` scripts a failing GSD call: the
+/// stub prints the reply's remaining lines to stderr and exits `<code>`, as
+/// GSD's `--json-errors` refusals do.
+///
 /// The script uses shell builtins only, so it runs under an agent-free `PATH`.
 pub fn plant_gsd_run_stub(home: &std::path::Path, responses: &[&str], logs: &std::path::Path) {
     std::fs::create_dir_all(logs).expect("create the GSD stub's logs dir");
@@ -406,7 +410,18 @@ if [ ! -f "$logs/gsd-response-$n" ]; then
   exit 97
 fi
 printf '%s\n' "$((n + 1))" > "$logs/gsd-next"
-while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done < "$logs/gsd-response-$n"
+{{
+  IFS= read -r first || [ -n "$first" ]
+  case "$first" in
+    '!exit '*)
+      code=${{first#!exit }}
+      while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line" >&2; done
+      exit "$code"
+      ;;
+  esac
+  printf '%s\n' "$first"
+  while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done
+}} < "$logs/gsd-response-$n"
 "#
     );
     write_executable(&launcher, &script);
@@ -1258,6 +1273,179 @@ mod tests {
             std::fs::read_to_string(&stub).expect("read the stub back"),
             STUB_SCRIPT,
             "the stub holds exactly the contents it was given"
+        );
+    }
+
+    /// The call a raw stub writer makes, split so this file's own text does not
+    /// contain it outside the kept sites.
+    const PERMISSION_SETTER: &str = concat!("set_", "permissions(");
+
+    /// The sites that may set a mode directly: (path from the workspace root, a
+    /// fixed fragment of the line, why the site cannot go through `write_executable`).
+    const KEPT_PERMISSION_SETTERS: &[(&str, &str, &str)] = &[
+        (
+            "crates/devflow-core/src/test_support.rs",
+            "(path, std::fs::Permissions::from_mode(0o755))",
+            "write_executable's own chmod: it runs after the writing shell exits, so this \
+             process never holds a write descriptor on the file",
+        ),
+        (
+            "crates/devflow-core/src/test_support.rs",
+            "(&stub, std::fs::Permissions::from_mode(0o755))",
+            "the ETXTBSY control writes the stub in-process on purpose, so a held fork \
+             makes it text-busy",
+        ),
+        (
+            "crates/devflow-core/src/gsd_reader.rs",
+            "(&launcher, std::fs::Permissions::from_mode(0o644))",
+            "removes the exec bit to make the spawn fail; nothing executes the file",
+        ),
+        (
+            "crates/devflow-core/src/registry.rs",
+            "(dir, std::fs::Permissions::from_mode(0o700))",
+            "production code setting a directory's mode; nothing is executed",
+        ),
+    ];
+
+    /// `path: line` for each non-comment line of `sources` that calls
+    /// `set_permissions(` and no `kept` entry matches, then `stale kept entry: …`
+    /// for each `kept` entry that matched no line and `kept entry matched N lines, not
+    /// 1: …` for each that matched more than one (F16: an entry keeps one site). A line whose trimmed text
+    /// starts with `//` is a comment.
+    fn permission_setters(
+        sources: &[(String, String)],
+        kept: &[(&str, &str, &str)],
+    ) -> Vec<String> {
+        let mut used = vec![0_usize; kept.len()];
+        let mut findings = Vec::new();
+        for (path, source) in sources {
+            for line in source.lines() {
+                if line.trim_start().starts_with("//") || !line.contains(PERMISSION_SETTER) {
+                    continue;
+                }
+                match kept.iter().position(|(kept_path, fragment, _)| {
+                    kept_path == path && line.contains(fragment)
+                }) {
+                    Some(index) => used[index] += 1,
+                    None => findings.push(format!("{path}: {}", line.trim())),
+                }
+            }
+        }
+        findings.extend(
+            kept.iter()
+                .zip(&used)
+                .filter_map(|((path, fragment, _), matched)| match matched {
+                    0 => Some(format!("stale kept entry: {path}: {fragment}")),
+                    1 => None,
+                    n => Some(format!(
+                        "kept entry matched {n} lines, not 1: {path}: {fragment}"
+                    )),
+                }),
+        );
+        findings
+    }
+
+    /// Every `.rs` file under both crates' `src/` and `tests/`, as (path from the
+    /// workspace root, text).
+    fn both_crates_sources() -> Vec<(String, String)> {
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = core
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root");
+        let mut pending: Vec<std::path::PathBuf> = ["src", "tests"]
+            .iter()
+            .flat_map(|dir| [core.join(dir), core.join("../devflow-cli").join(dir)])
+            .collect();
+        let mut sources = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+            {
+                let path = entry.expect("a source entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_none_or(|name| name != "target") {
+                        pending.push(path);
+                    }
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                    let relative = path
+                        .canonicalize()
+                        .expect("a source path")
+                        .strip_prefix(&workspace)
+                        .expect("a source inside the workspace")
+                        .display()
+                        .to_string();
+                    sources.push((relative, text));
+                }
+            }
+        }
+        sources.sort();
+        assert!(
+            sources.len() > 40
+                && sources
+                    .iter()
+                    .any(|(path, _)| path == "crates/devflow-cli/src/commands.rs")
+                && sources
+                    .iter()
+                    .any(|(path, _)| path.starts_with("crates/devflow-cli/tests/")),
+            "the scan read too few sources: {:?}",
+            sources.iter().map(|(path, _)| path).collect::<Vec<_>>()
+        );
+        sources
+    }
+
+    /// F16: a kept entry is one site, so an entry matching two lines is a finding naming
+    /// the entry and the count. Control: the same entry matching one line is none.
+    #[test]
+    fn permission_setters_flag_a_kept_entry_that_matches_two_lines() {
+        let line = format!("    std::fs::{PERMISSION_SETTER}&stub, perms).unwrap();");
+        let kept = [("planted.rs", "(&stub, perms)", "a kept site")];
+        let planted = |text: String| vec![("planted.rs".to_string(), text)];
+        assert_eq!(
+            permission_setters(&planted(format!("{line}\n{line}\n")), &kept),
+            vec!["kept entry matched 2 lines, not 1: planted.rs: (&stub, perms)".to_string()],
+        );
+        assert_eq!(
+            permission_setters(&planted(format!("{line}\n")), &kept),
+            Vec::<String>::new(),
+            "one matching line is the kept site"
+        );
+    }
+
+    /// No source of either crate sets a mode directly outside the kept sites, so
+    /// every test stub goes through `write_executable`. Controls: a planted raw
+    /// writer counts, the same line as a comment does not, and a kept entry that
+    /// matches no line is reported stale.
+    #[test]
+    fn no_test_writes_an_executable_stub_outside_write_executable() {
+        let planted = format!("    std::fs::{PERMISSION_SETTER}&stub, perms).unwrap();");
+        let planted_source = |text: &str| vec![("planted.rs".to_string(), text.to_string())];
+        assert_eq!(
+            permission_setters(&planted_source(&planted), &[]).len(),
+            1,
+            "planted control: a raw writer line counts"
+        );
+        assert_eq!(
+            permission_setters(&planted_source(&format!("// {planted}")), &[]),
+            Vec::<String>::new(),
+            "planted control: a comment does not count"
+        );
+        assert_eq!(
+            permission_setters(
+                &planted_source("fn f() {}"),
+                &[("planted.rs", "(&stub, perms)", "a kept site")]
+            ),
+            vec!["stale kept entry: planted.rs: (&stub, perms)".to_string()],
+            "planted control: a kept entry matching no line is stale"
+        );
+
+        let findings = permission_setters(&both_crates_sources(), KEPT_PERMISSION_SETTERS);
+        assert!(
+            findings.is_empty(),
+            "raw executable-stub writers outside write_executable (use \
+             test_support::write_executable, or keep the site with its reason): {findings:#?}"
         );
     }
 }

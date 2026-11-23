@@ -5,7 +5,6 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::workflow::load_state;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -78,10 +77,7 @@ fn fake_bin_dir(scripts: &[(&str, &str)]) -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
     for (name, script) in scripts {
         let path = dir.path().join(name);
-        fs::write(&path, script).unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
+        devflow_core::test_support::write_executable(&path, script);
     }
     let path = dir.path().to_path_buf();
     FakeBin { _dir: dir, path }
@@ -119,14 +115,113 @@ fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: 
     output
 }
 
-fn wait_for(path: &Path) {
-    for _ in 0..200 {
-        if path.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+/// The polling budget of this file's wait helpers off CI.
+const POLL_BUDGET_DEFAULT: Duration = Duration::from_secs(10);
+/// The polling budget under CI, where a loaded runner is slower (#301).
+const POLL_BUDGET_UNDER_CI: Duration = Duration::from_secs(30);
+
+/// The polling budget of this file's wait helpers, from the values of `CI`
+/// and `DEVFLOW_E2E_POLL_BUDGET_SECS` (#301). `CI` counts as set when it is
+/// non-empty and neither `0` nor `false`; the override, in whole seconds,
+/// beats it.
+///
+/// # Panics
+/// Naming the variable and value, when the override is not whole seconds or
+/// is `0` (a 0 s budget would time every wait out at once).
+fn poll_budget_from(ci: Option<&str>, override_secs: Option<&str>) -> Duration {
+    if let Some(value) = override_secs {
+        let secs: u64 = value.parse().unwrap_or_else(|_| {
+            panic!("DEVFLOW_E2E_POLL_BUDGET_SECS must be whole seconds, got {value:?}")
+        });
+        assert!(
+            secs > 0,
+            "DEVFLOW_E2E_POLL_BUDGET_SECS must be at least 1 second, got {value:?}"
+        );
+        return Duration::from_secs(secs);
     }
-    panic!("timed out waiting for {}", path.display());
+    let under_ci = ci.is_some_and(|value| {
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    });
+    if under_ci {
+        POLL_BUDGET_UNDER_CI
+    } else {
+        POLL_BUDGET_DEFAULT
+    }
+}
+
+/// The polling budget of this file's wait helpers, read from the environment.
+fn poll_budget() -> Duration {
+    let ci = std::env::var("CI").ok();
+    let override_secs = std::env::var("DEVFLOW_E2E_POLL_BUDGET_SECS").ok();
+    poll_budget_from(ci.as_deref(), override_secs.as_deref())
+}
+
+/// Poll `predicate` until it holds, panicking with the budget and `what` once
+/// `budget` has passed.
+fn poll_until(budget: Duration, what: &str, predicate: impl FnMut() -> bool) {
+    devflow_core::test_support::wait_until(budget, what, predicate);
+}
+
+/// The panic text of `f`, which must panic.
+fn panic_text(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+    let payload = std::panic::catch_unwind(f).expect_err("expected a panic");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .expect("a string panic payload")
+}
+
+#[test]
+fn poll_budget_is_longer_under_ci_and_overridable() {
+    let default = Duration::from_secs(10);
+    let under_ci = Duration::from_secs(30);
+    assert_eq!(poll_budget_from(None, None), default, "no CI");
+    assert_eq!(poll_budget_from(Some("true"), None), under_ci, "CI=true");
+    assert_eq!(poll_budget_from(Some("1"), None), under_ci, "CI=1");
+    assert_eq!(poll_budget_from(Some("false"), None), default, "CI=false");
+    assert_eq!(poll_budget_from(Some(""), None), default, "CI empty");
+    assert_eq!(poll_budget_from(Some("0"), None), default, "CI=0");
+    assert_eq!(
+        poll_budget_from(Some("true"), Some("5")),
+        Duration::from_secs(5),
+        "an override beats CI"
+    );
+}
+
+#[test]
+fn an_unparsable_poll_budget_override_panics_naming_it() {
+    let text = panic_text(|| {
+        poll_budget_from(None, Some("ten"));
+    });
+    assert!(text.contains("DEVFLOW_E2E_POLL_BUDGET_SECS"), "{text}");
+    assert!(text.contains("ten"), "{text}");
+}
+
+#[test]
+fn a_zero_poll_budget_override_panics() {
+    let text = panic_text(|| {
+        poll_budget_from(None, Some("0"));
+    });
+    assert!(text.contains("DEVFLOW_E2E_POLL_BUDGET_SECS"), "{text}");
+    assert!(text.contains("at least 1"), "{text}");
+}
+
+#[test]
+fn a_poll_helper_that_times_out_names_its_budget() {
+    let text = panic_text(|| {
+        poll_until(
+            Duration::from_millis(50),
+            "a condition that never holds",
+            || false,
+        )
+    });
+    assert!(text.contains("50ms"), "{text}");
+    assert!(text.contains("a condition that never holds"), "{text}");
+}
+
+fn wait_for(path: &Path) {
+    poll_until(poll_budget(), &path.display().to_string(), || path.exists());
 }
 
 /// Wait until a monitor-written pid file exists AND holds a parseable pid,
@@ -135,15 +230,18 @@ fn wait_for(path: &Path) {
 /// the next monitor recreates it, so a read can land in the gap and hit
 /// NotFound even though the pipeline is healthy.
 fn wait_for_pid(path: &Path) -> u32 {
-    for _ in 0..200 {
-        if let Ok(contents) = fs::read_to_string(path)
-            && let Ok(pid) = contents.trim().parse::<u32>()
-        {
-            return pid;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for a pid in {}", path.display());
+    let mut pid = None;
+    poll_until(
+        poll_budget(),
+        &format!("a pid in {}", path.display()),
+        || {
+            pid = fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<u32>().ok());
+            pid.is_some()
+        },
+    );
+    pid.expect("poll_until returned, so a pid was read")
 }
 
 /// The launch line of an agent stub that records its own pid in `pid_path` and
@@ -159,40 +257,49 @@ fn recording_sleeper(pid_path: &Path) -> String {
 /// that call `cleanup` must first wait for the phase to actually finish,
 /// the same way a real operator would.
 fn wait_for_state_cleared(root: &Path, phase: PhaseId) {
-    for _ in 0..400 {
-        if devflow_core::workflow::load_state(root, phase).is_err() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase} state to clear (pipeline never finished)");
+    poll_until(
+        poll_budget(),
+        &format!("phase {phase} state to clear (pipeline never finished)"),
+        || devflow_core::workflow::load_state(root, phase).is_err(),
+    );
 }
 
 /// Wait until no process holds a phase's runner lock: the runner has exited.
 fn wait_for_runner_lock_free(root: &Path, phase: PhaseId) {
     let lock = devflow_core::liveness::runner_lock_path(root, phase);
-    for _ in 0..400 {
-        if devflow_core::liveness::probe(&lock).unwrap() != devflow_core::liveness::Held::Live {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase}'s runner to let go of its runner lock");
+    poll_until(
+        poll_budget(),
+        &format!("phase {phase}'s runner to let go of its runner lock"),
+        || devflow_core::liveness::probe(&lock).unwrap() != devflow_core::liveness::Held::Live,
+    );
 }
 
 /// Wait until a phase's persisted state has `stopped == true` (20c: a
 /// `--until`-halted phase). Polls rather than reading once, since the fake
 /// agent + monitor chain advances asynchronously.
 fn wait_for_stopped(root: &Path, phase: PhaseId) -> devflow_core::state::State {
-    for _ in 0..400 {
-        if let Ok(state) = devflow_core::workflow::load_state(root, phase)
-            && state.stopped
-        {
-            return state;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase} state to report stopped == true");
+    wait_for_state(
+        root,
+        phase,
+        &format!("phase {phase} state to report stopped == true"),
+        |state| state.stopped,
+    )
+}
+
+/// Poll a phase's persisted state until `accept` holds for it, returning that
+/// state; `what` names the awaited state in the timeout panic.
+fn wait_for_state(
+    root: &Path,
+    phase: PhaseId,
+    what: &str,
+    accept: impl Fn(&devflow_core::state::State) -> bool,
+) -> devflow_core::state::State {
+    let mut accepted = None;
+    poll_until(poll_budget(), what, || {
+        accepted = load_state(root, phase).ok().filter(|state| accept(state));
+        accepted.is_some()
+    });
+    accepted.expect("poll_until returned, so an accepted state was read")
 }
 
 fn seed_feature_branch(root: &Path, phase: PhaseId) {
@@ -1034,6 +1141,196 @@ fn start_dry_run_lists_exactly_plan_code_validate() {
     );
 }
 
+/// `devflow start --dry-run --phase 1 --mode supervise` plus `extra` on a fixture repo whose
+/// phase 1 has a `01-REVIEWS.md`. Returns the dry run's Plan line and its whole stdout,
+/// after asserting it exits 0.
+fn dry_run_plan_line_with_reviews_file(extra: &[&str]) -> (String, String) {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase_dir = root.join(".planning/phases/01-x");
+    std::fs::create_dir_all(&phase_dir).unwrap();
+    std::fs::write(phase_dir.join("01-REVIEWS.md"), "# reviews\n").unwrap();
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = common::hermetic_devflow(&home)
+        .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
+        .args(extra)
+        .arg(root)
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "dry-run must not fail\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan_line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("plan "))
+        .unwrap_or_else(|| panic!("the dry run printed no Plan line: {stdout}"))
+        .to_string();
+    (plan_line, stdout)
+}
+
+/// D-04 (#250): `start --reviews` shows, before launching, that Plan runs as a reviews pass.
+#[test]
+fn dry_run_with_reviews_shows_plan_phase_reviews() {
+    let (plan_line, stdout) = dry_run_plan_line_with_reviews_file(&["--reviews"]);
+    assert!(
+        plan_line.contains("/gsd-plan-phase 1 --reviews"),
+        "the dry run's Plan line lacks --reviews: {stdout}"
+    );
+}
+
+/// D-04 control: without `--reviews` the Plan line is the plain plan-phase command, even
+/// with a REVIEWS.md present (no auto-detection).
+#[test]
+fn dry_run_without_reviews_shows_plain_plan_phase() {
+    let (plan_line, stdout) = dry_run_plan_line_with_reviews_file(&[]);
+    assert!(
+        plan_line.contains("/gsd-plan-phase 1"),
+        "the dry run's Plan line lacks the plan-phase command: {stdout}"
+    );
+    assert!(
+        !plan_line.contains("--reviews"),
+        "the dry run's Plan line shows --reviews without the flag: {stdout}"
+    );
+}
+
+/// The `.gitignore` lines GSD's derived files need, as the #285 warning names them.
+const GSD_IGNORE_LINES: &[&str] = &[".planning/state.json", ".planning/milestone.lock", ".gsd/"];
+
+/// `devflow start --dry-run --phase 1 --mode supervise` on `root`. Returns the child's
+/// stderr, after asserting the dry run exits 0.
+fn start_dry_run_stderr(root: &Path) -> String {
+    let home = common::HermeticHome::new();
+    let fake_bin = fake_bin_dir(&[]);
+    let output = common::hermetic_devflow(&home)
+        .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
+        .arg(root)
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "dry-run must not fail\nstderr: {stderr}"
+    );
+    stderr
+}
+
+/// #285 (D-13): a project whose `.gitignore` lacks GSD's derived files hears, at start,
+/// which lines to add; the dry run still succeeds, since the check never refuses.
+#[test]
+fn start_dry_run_warns_when_gsd_derived_files_are_not_ignored() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+
+    let stderr = start_dry_run_stderr(root);
+
+    let to_add: Vec<&str> = stderr
+        .lines()
+        .skip_while(|line| !line.contains(".gitignore"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        to_add, GSD_IGNORE_LINES,
+        "start did not warn about unignored GSD derived files: {stderr}"
+    );
+    assert!(
+        !stderr.contains("untrack it:"),
+        "start told to untrack a GSD derived file git does not track: {stderr}"
+    );
+}
+
+/// Control for the test above: with those lines committed in `.gitignore`, the dry run
+/// prints no `.gitignore` warning.
+#[test]
+fn start_dry_run_is_silent_when_gsd_derived_files_are_ignored() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".gitignore"),
+        format!("{}\n", GSD_IGNORE_LINES.join("\n")),
+    )
+    .unwrap();
+    git(root, &["add", ".gitignore"]);
+    git(root, &["commit", "-q", "-m", "ignore GSD derived files"]);
+
+    let stderr = start_dry_run_stderr(root);
+
+    assert!(
+        !stderr.contains(".gitignore"),
+        "start warned about GSD derived files that are ignored: {stderr}"
+    );
+}
+
+/// #338 WR-02 (D-13): a GSD derived file the project committed is told to be untracked,
+/// since an ignore rule does not apply to a tracked file, and is not told to add a
+/// `.gitignore` line `.gitignore` already has.
+#[test]
+fn start_dry_run_tells_to_untrack_a_tracked_gsd_derived_file() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".gitignore"),
+        format!("{}\n", GSD_IGNORE_LINES.join("\n")),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".planning")).unwrap();
+    fs::write(root.join(".planning/state.json"), "{}").unwrap();
+    git(root, &["add", ".gitignore"]);
+    git(root, &["add", "-f", ".planning/state.json"]);
+    git(root, &["commit", "-q", "-m", "commit a GSD derived file"]);
+
+    let stderr = start_dry_run_stderr(root);
+
+    assert!(
+        stderr.contains("untrack it: git rm --cached .planning/state.json"),
+        "start did not tell to untrack a tracked GSD derived file: {stderr}"
+    );
+    assert!(
+        !stderr.contains(".gitignore"),
+        "start named a .gitignore line for a tracked file .gitignore already lists: {stderr}"
+    );
+}
+
+/// D-13 (F04): `.gsd/` is a directory GSD writes several files into, so every tracked
+/// file under it is told to be untracked, not only the sentinel the ignore check probes.
+#[test]
+fn start_dry_run_tells_to_untrack_any_tracked_file_under_gsd() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".gitignore"),
+        format!("{}\n", GSD_IGNORE_LINES.join("\n")),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".gsd")).unwrap();
+    fs::write(root.join(".gsd/other.json"), "{}").unwrap();
+    git(root, &["add", ".gitignore"]);
+    git(root, &["add", "-f", ".gsd/other.json"]);
+    git(root, &["commit", "-q", "-m", "commit a file under .gsd"]);
+
+    let stderr = start_dry_run_stderr(root);
+
+    assert!(
+        stderr.contains("untrack it: git rm --cached .gsd/other.json"),
+        "start did not tell to untrack a tracked file under .gsd/: {stderr}"
+    );
+}
+
 const EXTERNAL_VERIFY_WARNING_PREFIX: &str = "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=";
 const EXTERNAL_VERIFY_YES_WARNING: &str =
     "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=\"yes\" is not true or false";
@@ -1767,21 +2064,11 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         String::from_utf8_lossy(&second.stderr)
     );
 }
-/// A `pi` stub that answers the preflight health check (`pi auth check` →
-/// `{"status":"ready"}`) and the capability probe (`pi list` → the vetted
-/// `@bacnh85/pi-subagent` package), then runs `launch` for the real
-/// `pi -p --no-approve` stage launch. The health check probes the provider in
-/// the real `~/.pi/agent/settings.json`, so the stub must classify as `ready`
-/// or preflight gates and the stage never runs.
-fn pi_stub(launch: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-         case \"$1\" in\n\
-           auth) printf '{{\"status\":\"ready\"}}\\n'; exit 0 ;;\n\
-           list) printf 'npm:@bacnh85/pi-subagent (user)\\n'; exit 0 ;;\n\
-         esac\n\
-         {launch}\n"
-    )
+/// A `codex` stub that runs `launch` for the stage launch. Built like the
+/// file's other codex start stubs: codex's launch makes no probe a stub must
+/// answer, so the script is the launch body alone.
+fn codex_stub(launch: &str) -> String {
+    format!("#!/bin/sh\n{launch}\n")
 }
 
 /// Wait until a phase's persisted state reports `gate_pending == true` — the
@@ -1792,40 +2079,37 @@ fn pi_stub(launch: &str) -> String {
 /// either the never-silent gate fired (`gate_pending`) or the machine
 /// stopped (`--until` / completion). Returns that state.
 fn wait_for_settled(root: &Path, phase: PhaseId) -> devflow_core::state::State {
-    for _ in 0..400 {
-        if let Ok(state) = load_state(root, phase)
-            && (state.gate_pending || state.stopped)
-        {
-            return state;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase} to settle (gate or stop)");
+    wait_for_state(
+        root,
+        phase,
+        &format!("phase {phase} to settle (gate or stop)"),
+        |state| state.gate_pending || state.stopped,
+    )
 }
 
 fn wait_for_gate(root: &Path, phase: PhaseId) -> devflow_core::state::State {
-    for _ in 0..400 {
-        if let Ok(state) = load_state(root, phase)
-            && state.gate_pending
-        {
-            return state;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for phase {phase} to report gate_pending");
+    wait_for_state(
+        root,
+        phase,
+        &format!("phase {phase} to report gate_pending"),
+        |state| state.gate_pending,
+    )
 }
 
-/// A Pi run that exits 0 without emitting a DEVFLOW_RESULT marker must not
+/// A codex run that exits 0 without emitting a DEVFLOW_RESULT marker must not
 /// advance a commit-gated stage. Plan, the first stage and commit-gated,
 /// runs the marker-less stub, which produces no commits and no marker, so it
 /// is `Failed` and gates instead of advancing to Code.
 #[test]
-fn pi_marker_less_run_does_not_advance() {
+fn codex_marker_less_run_does_not_advance() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("printf 'fake pi, no marker\\n'\nexit 0\n"))]);
+    let fake_bin = fake_bin_dir(&[(
+        "codex",
+        &codex_stub("printf 'fake codex, no marker\\n'\nexit 0\n"),
+    )]);
 
     run_devflow(
         &home,
@@ -1836,7 +2120,7 @@ fn pi_marker_less_run_does_not_advance() {
             "--phase",
             "07",
             "--agent",
-            "pi",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -1852,15 +2136,18 @@ fn pi_marker_less_run_does_not_advance() {
     assert!(state.gate_pending, "the never-silent gate must have fired");
 }
 
-/// A Pi run that exits non-zero must not advance its stage: the failed exit is
+/// A codex run that exits non-zero must not advance its stage: the failed exit is
 /// not Success, so the pipeline gates instead of advancing.
 #[test]
-fn pi_nonzero_exit_does_not_advance() {
+fn codex_nonzero_exit_does_not_advance() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("printf 'fake pi, no marker\\n'\nexit 1\n"))]);
+    let fake_bin = fake_bin_dir(&[(
+        "codex",
+        &codex_stub("printf 'fake codex, no marker\\n'\nexit 1\n"),
+    )]);
 
     run_devflow(
         &home,
@@ -1871,7 +2158,7 @@ fn pi_nonzero_exit_does_not_advance() {
             "--phase",
             "07",
             "--agent",
-            "pi",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -1887,18 +2174,18 @@ fn pi_nonzero_exit_does_not_advance() {
     assert!(state.gate_pending, "the never-silent gate must have fired");
 }
 
-/// A hung Pi process (never exits) is surfaced as alive by monitor liveness —
+/// A hung codex process (never exits) is surfaced as alive by monitor liveness —
 /// the stage never advances while it runs (no false Success) — and once killed,
 /// the monitor reaps it and gates (never a silent advance).
 #[test]
-fn pi_hung_process_is_detected_not_left_running() {
+fn codex_hung_process_is_detected_not_left_running() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let aux = tempfile::tempdir().unwrap();
     let pid_path = aux.path().join("agent.pid");
-    let fake_bin = fake_bin_dir(&[("pi", &pi_stub(&recording_sleeper(&pid_path)))]);
+    let fake_bin = fake_bin_dir(&[("codex", &codex_stub(&recording_sleeper(&pid_path)))]);
 
     let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
     run_devflow(
@@ -1910,7 +2197,7 @@ fn pi_hung_process_is_detected_not_left_running() {
             "--phase",
             "07",
             "--agent",
-            "pi",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -1927,13 +2214,13 @@ fn pi_hung_process_is_detected_not_left_running() {
             .status()
             .unwrap()
             .success(),
-        "the hung pi process must still be alive"
+        "the hung codex process must still be alive"
     );
     let state = load_state(root, PhaseId::new(7)).expect("load state");
     assert_eq!(
         state.stage,
         Stage::Plan,
-        "the stage must not advance while pi is hung"
+        "the stage must not advance while codex is hung"
     );
 
     // Kill the hung process; the monitor reaps it and gates — never advances.
@@ -1943,349 +2230,13 @@ fn pi_hung_process_is_detected_not_left_running() {
             .status()
             .unwrap()
             .success(),
-        "should be able to kill the hung pi process"
+        "should be able to kill the hung codex process"
     );
     let gated = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         gated.stage,
         Stage::Plan,
         "a hung-then-killed run must not advance its stage"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Phase 41 Task 8 (ANTG-03, F4, codex-3, antigravity notice (a)): the
-// Antigravity transport, end to end through `devflow start --agent
-// antigravity` with a stubbed `agy` on PATH. The canary-aware stub answers
-// the `DEVFLOW_DELIVERY_CANARY_` turn (AntigravityCanaryLauncher at Plan),
-// schema-checks every turn (codex-3), and then behaves per mode.
-// ---------------------------------------------------------------------------
-
-/// The canary-aware `agy` stub (F4).
-///
-/// Three behaviours, selected by `mode`. EVERY variant first answers a
-/// `*DEVFLOW_DELIVERY_CANARY_*` turn (the common prefix; the enum is named
-/// without it) by echoing the token inside an antigravity-shaped
-/// `event:result.response`, so `run_delivery_canary` reaches `Confirmed` at
-/// Plan; then:
-/// - `MarkerStream`: emits a marker stream for real stage turns — the happy
-///   path.
-/// - `Quiet`: exits 0 with NO events — the marker-less control (ANTG-03).
-/// - `InitOnly`: emits `init` + `step_update` but NO `result` — the
-///   discrimination control (transport alone never advances a commit-gated
-///   stage).
-///
-/// Schema check (codex-3): EVERY turn must parse as an event-key user line
-/// (`"event":"user"`); a Claude `type`-form turn exits 92 with a diagnostic —
-/// an implementation that left the monitor's writer on `user_turn_line`
-/// FAILS here, not just in the unit helper.
-fn antigravity_stub(mode: StubMode) -> String {
-    const SCHEMA_AND_CANARY: &str = r#"#!/bin/sh
-IFS= read -r turn || exit 91
-printf '%s' "$turn" | grep -q '"event":"user"' || { echo 'NON_EVENT_KEY_TURN' >&2; exit 92; }
-case "$turn" in
-  *DEVFLOW_DELIVERY_CANARY_*)
-    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
-    printf '%s\n' '{"event":"init","model":"stub"}'
-    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"canary: '"$token"'\nDEVFLOW_RESULT: {\"status\":\"success\"}"}}'
-    exit 0 ;;
-esac
-"#;
-    let body = match mode {
-        StubMode::MarkerStream => {
-            r#"printf '%s\n' '{"event":"init","model":"stub","inputFormat":"stream-json","outputFormat":"stream-json"}'
-printf '%s\n' '{"event":"step_update","index":0,"text_delta":"working"}'
-printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"DEVFLOW_RESULT: {\"status\":\"success\"}"}}'
-exit 0
-"#
-        }
-        StubMode::Quiet => "exit 0\n",
-        StubMode::InitOnly => {
-            r#"printf '%s\n' '{"event":"init","model":"stub","inputFormat":"stream-json","outputFormat":"stream-json"}'
-printf '%s\n' '{"event":"step_update","index":0,"text_delta":"working"}'
-exit 0
-"#
-        }
-    };
-    format!("{SCHEMA_AND_CANARY}{body}")
-}
-
-#[derive(Clone, Copy)]
-enum StubMode {
-    MarkerStream,
-    Quiet,
-    InitOnly,
-}
-
-/// ANTG-03: a stubbed `agy` that exits 0 with no stream events must not
-/// advance a COMMIT-GATED stage. Plan — a commit-gated stage — produces no
-/// marker and no commits, so it gates instead of advancing to Code.
-#[test]
-fn marker_less_antigravity_never_advances() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::Quiet))]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "antigravity",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "a marker-less antigravity run must not advance past the commit-gated Plan stage"
-    );
-    assert!(state.gate_pending, "the never-silent gate must have fired");
-}
-
-/// The happy path: a stubbed `agy` emitting ANTIGRAVITY-shaped events with
-/// the `DEVFLOW_RESULT` marker inside `event:result.response` advances past
-/// the commit gate. `--until plan` halts right after Plan completes, so the
-/// assertion is: Plan RAN (the commit gate passed) and the machine is
-/// stopped, NOT gated.
-#[test]
-fn antigravity_parses_devflow_result_from_stream() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::MarkerStream))]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "antigravity",
-            "--mode",
-            "supervise",
-            "--until",
-            "plan",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_stopped(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "the persisted stage must be the COMPLETED target (Plan), proving Plan ran"
-    );
-    assert!(
-        !state.gate_pending,
-        "a marker-bearing antigravity stream must pass the commit gate, not gate"
-    );
-}
-
-/// Discrimination control: a stream that emits `init` + `step_update` but NO
-/// `result`/marker must still gate at Plan — the TRANSPORT alone never
-/// advances a commit-gated stage, only the marker does (ANTG-03).
-#[test]
-fn antigravity_init_without_marker_gates_at_plan() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::InitOnly))]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "antigravity",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "a stream with events but no marker must not advance past Plan"
-    );
-    assert!(state.gate_pending);
-}
-
-// ---------------------------------------------------------------------------
-// Phase 42 Task 4 (HRMS-03, D-03): Hermes transport integration tests.
-// ---------------------------------------------------------------------------
-
-fn hermes_stub(launch: &str) -> String {
-    format!(
-        r#"#!/bin/sh
-if [ "$1" = "--version" ]; then
-    printf 'hermes 0.5.0\n'
-    exit 0
-fi
-if [ "$1" = "tools" ] && [ "$2" = "list" ]; then
-    printf 'Available Toolsets:\n  ✓ enabled delegation 👥 Task Delegation\n  ✓ enabled terminal 💻 Terminal Execution\n'
-    exit 0
-fi
-{launch}
-"#
-    )
-}
-
-/// HRMS-03: a stubbed `hermes` that exits 0 with no marker must not advance a
-/// commit-gated stage: Plan gates.
-#[test]
-fn hermes_marker_less_run_does_not_advance() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[(
-        "hermes",
-        &hermes_stub("printf 'fake hermes, no marker\\n'\nexit 0\n"),
-    )]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "hermes",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "a marker-less hermes run must not advance past the commit-gated Plan stage"
-    );
-    assert!(state.gate_pending, "the never-silent gate must have fired");
-}
-
-/// HRMS-03: a Hermes run that exits non-zero must not advance its stage.
-#[test]
-fn hermes_nonzero_exit_does_not_advance() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[(
-        "hermes",
-        &hermes_stub("printf 'fake hermes error\\n'\nexit 1\n"),
-    )]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "hermes",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "a non-zero-exit hermes run must not advance its stage"
-    );
-    assert!(state.gate_pending, "the never-silent gate must have fired");
-}
-
-/// HRMS-03: a hung Hermes process is detected as alive by monitor liveness,
-/// does not falsely advance, and gates when killed.
-#[test]
-fn hermes_hung_process_is_detected_not_left_running() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let aux = tempfile::tempdir().unwrap();
-    let pid_path = aux.path().join("agent.pid");
-    let fake_bin = fake_bin_dir(&[("hermes", &hermes_stub(&recording_sleeper(&pid_path)))]);
-
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "hermes",
-            "--mode",
-            "supervise",
-        ],
-    );
-
-    let pid = wait_for_pid(&pid_path);
-
-    assert!(
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .unwrap()
-            .success(),
-        "the hung hermes process must still be alive"
-    );
-    let state = load_state(root, PhaseId::new(7)).expect("load state");
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "the stage must not advance while hermes is hung"
-    );
-
-    assert!(
-        Command::new("kill")
-            .arg(pid.to_string())
-            .status()
-            .unwrap()
-            .success(),
-        "should be able to kill the hung hermes process"
-    );
-    let gated = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        gated.stage,
-        Stage::Plan,
-        "a hung-then-killed hermes run must not advance its stage"
     );
 }
 
