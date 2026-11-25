@@ -28,8 +28,8 @@ use devflow_core::agents;
 use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{
-    GateError, GateFile, GateId, GateKind, GateResponse, Gates, OpenGate, QuarantinedAnswer,
-    WaiterStatus, is_gate_id,
+    AnswerRead, GateError, GateFile, GateId, GateKind, GateResponse, Gates, OpenGate,
+    QuarantinedAnswer, WaiterStatus, is_gate_id,
 };
 use devflow_core::git::{GitFlow, git_command};
 use devflow_core::history;
@@ -3931,6 +3931,28 @@ pub(crate) fn gate_respond_report(
     note: Option<String>,
     observed_gate_id: Option<String>,
 ) -> Result<String, CliError> {
+    gate_respond_report_by(
+        project_root,
+        phase,
+        stage,
+        kind,
+        note,
+        observed_gate_id,
+        answerer(),
+    )
+}
+
+/// [`gate_respond_report`] answering as `answerer`, the resolver's result: a
+/// refused answerer is returned before anything is written.
+fn gate_respond_report_by(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    kind: GateAnswerKind,
+    note: Option<String>,
+    observed_gate_id: Option<String>,
+    answerer: Result<String, CliError>,
+) -> Result<String, CliError> {
     // A malformed id is refused before anything is read, so it can never name a
     // path (T-50.1-42).
     let given_gate_id = observed_gate_id.as_deref().map(GateId::parse).transpose()?;
@@ -3945,7 +3967,7 @@ pub(crate) fn gate_respond_report(
     };
     require_gate_file_names(project_root, phase, stage, &observed)?;
     refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
-    let responded_by = answerer()?;
+    let responded_by = answerer?;
     let response = GateResponse {
         approved: kind == GateAnswerKind::Approve,
         abort: kind == GateAnswerKind::Abort,
@@ -4049,6 +4071,19 @@ pub(crate) fn gate_answer_report(
     gate_id: &str,
     choice: &QuestionChoice,
 ) -> Result<String, CliError> {
+    gate_answer_report_by(project_root, phase, stage, gate_id, choice, answerer())
+}
+
+/// [`gate_answer_report`] answering as `answerer`, the resolver's result: a
+/// refused answerer is returned before anything is written.
+fn gate_answer_report_by(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    gate_id: &str,
+    choice: &QuestionChoice,
+    answerer: Result<String, CliError>,
+) -> Result<String, CliError> {
     let observed = GateId::parse(gate_id)?;
     let open = Gates::list_open(project_root);
     let stage = match stage {
@@ -4057,7 +4092,7 @@ pub(crate) fn gate_answer_report(
     };
     require_gate_file_names(project_root, phase, stage, &observed)?;
     refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
-    let responded_by = answerer()?;
+    let responded_by = answerer?;
     let gate =
         crate::pipeline_gate::read_gate_file(project_root, phase, stage).ok_or_else(|| {
             CliError::Message(format!(
@@ -4832,22 +4867,79 @@ pub(crate) fn gate_show(
     phase: PhaseId,
     stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    println!("{}", gate_show_report(project_root, phase, stage)?);
+    Ok(())
+}
+
+/// [`gate_show`]'s work, returning what it prints. A gate whose answer is
+/// written but not yet claimed is hidden by `Gates::list_open`, so it is read
+/// from its gate file and answer slot and shown with who answered it (#343).
+fn gate_show_report(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+) -> Result<String, CliError> {
     let open = Gates::list_open(project_root);
+    let answered = answered_unclaimed_gates(project_root, phase);
     let stage = match stage {
         Some(stage) => stage,
-        None => resolve_single_open_gate_stage(&open, phase)?,
+        None => {
+            let mut shown: Vec<OpenGate> = open.clone();
+            shown.extend(answered.iter().map(|(gate, _)| gate.clone()));
+            resolve_single_open_gate_stage(&shown, phase)?
+        }
     };
-    let gate = open
-        .into_iter()
-        .find(|g| g.phase == phase && g.stage == stage)
-        .ok_or_else(|| {
-            CliError::Message(format!(
-                "no open gate for phase {phase} stage {stage} — see `devflow gate list`"
-            ))
-        })?;
+    let at_stage = |gate: &OpenGate| gate.phase == phase && gate.stage == stage;
+    let (gate, answered_by) = match open.into_iter().find(at_stage) {
+        Some(gate) => (gate, None),
+        None => answered
+            .into_iter()
+            .find(|(gate, _)| at_stage(gate))
+            .map(|(gate, by)| (gate, Some(by)))
+            .ok_or_else(|| {
+                CliError::Message(format!(
+                    "no open gate for phase {phase} stage {stage} — see `devflow gate list`"
+                ))
+            })?,
+    };
     let question = Gates::read_question(project_root, phase, stage)?;
-    println!("{}", render_gate_show(&gate, question.as_ref()));
-    Ok(())
+    let mut report = render_gate_show(&gate, question.as_ref());
+    if let Some(by) = answered_by {
+        report.push_str(&format!(
+            "\nanswered by {} (waiting to be claimed)",
+            render_gate_context(&by, usize::MAX)
+        ));
+    }
+    Ok(report)
+}
+
+/// `phase`'s gates whose slot holds a bound answer not yet claimed, each with
+/// the answer's `responded_by` (`unknown` when the answer names none).
+fn answered_unclaimed_gates(project_root: &Path, phase: PhaseId) -> Vec<(OpenGate, String)> {
+    std::iter::successors(Some(Stage::Plan), |stage| stage.next())
+        .filter_map(|stage| {
+            let file = crate::pipeline_gate::read_gate_file(project_root, phase, stage)?;
+            let gate_id = GateId::parse(&file.gate_id).ok()?;
+            let AnswerRead::Bound(answer) =
+                Gates::read_answer(project_root, phase, stage, &gate_id)
+            else {
+                return None;
+            };
+            let by = answer
+                .response
+                .responded_by
+                .unwrap_or_else(|| "unknown".to_string());
+            let gate = OpenGate {
+                phase: file.phase,
+                stage: file.stage,
+                context: file.context,
+                timestamp: file.timestamp,
+                gate_id: file.gate_id,
+                not_before: file.not_before,
+            };
+            Some((gate, by))
+        })
+        .collect()
 }
 
 /// Pure render for `gate_show`'s output block — the FULL context via
@@ -9176,6 +9268,138 @@ mod tests {
             ),
             "the abort is written for the question gate's id"
         );
+        registration.finish();
+    }
+
+    /// #343: no shell verb may record an answer as triage's, and a refused
+    /// answerer writes no answer.
+    #[test]
+    fn the_cli_cannot_claim_triage() {
+        let refused = answerer_from(Some("triage:jev".into()), Some("op".into()))
+            .expect_err("a triage marker is refused")
+            .to_string();
+        assert!(refused.contains("only DevFlow's triage"), "{refused}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(54), Stage::Plan);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+        let err = gate_answer_report_by(
+            root,
+            phase,
+            Some(stage),
+            opened.gate_id.as_str(),
+            &QuestionChoice::Option {
+                option_id: "budget-30".into(),
+            },
+            answerer_from(Some("triage:jev".into()), Some("op".into())),
+        )
+        .expect_err("an answer given as triage is refused")
+        .to_string();
+
+        assert!(err.contains("only DevFlow's triage"), "{err}");
+        assert_eq!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::None
+        );
+        registration.finish();
+    }
+
+    #[test]
+    fn an_empty_answerer_marker_is_refused() {
+        let err = answerer_from(Some("".into()), Some("op".into()))
+            .expect_err("an empty marker is refused")
+            .to_string();
+        assert!(err.contains("DEVFLOW_ANSWERED_BY"), "{err}");
+        assert!(err.contains("agent:<name>"), "{err}");
+    }
+
+    #[test]
+    fn an_agent_marker_must_name_the_agent() {
+        for refused in ["agent:", "agent:Claude"] {
+            let err = answerer_from(Some(refused.into()), Some("op".into()))
+                .expect_err("a malformed agent marker is refused")
+                .to_string();
+            assert!(err.contains("agent:<name>"), "{refused:?}: {err}");
+        }
+        assert_eq!(
+            answerer_from(Some("agent:claude-2".into()), Some("op".into())).unwrap(),
+            "agent:claude-2"
+        );
+    }
+
+    /// #343: `gate show` names who answered a gate whose answer is written
+    /// but not yet claimed, which `Gates::list_open` hides.
+    #[test]
+    fn gate_show_names_who_answered_an_unclaimed_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(54), Stage::Plan);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+        let unanswered = gate_show_report(root, phase, Some(stage)).unwrap();
+        assert!(!unanswered.contains("answered by"), "{unanswered}");
+
+        gate_answer_report_by(
+            root,
+            phase,
+            Some(stage),
+            opened.gate_id.as_str(),
+            &QuestionChoice::Option {
+                option_id: "budget-30".into(),
+            },
+            Ok("agent:claude".into()),
+        )
+        .unwrap();
+
+        for given in [Some(stage), None] {
+            let shown = gate_show_report(root, phase, given).unwrap();
+            assert!(
+                shown
+                    .lines()
+                    .any(|line| line.contains("answered by agent:claude")),
+                "{given:?}: {shown}"
+            );
+        }
+        registration.finish();
+
+        let empty = tempfile::tempdir().unwrap();
+        let err = gate_show_report(empty.path(), phase, None)
+            .expect_err("a phase with no gate is refused")
+            .to_string();
+        assert!(err.contains("no open gate for phase 54"), "{err}");
+    }
+
+    /// #343: the stage-gate verbs record the resolved answerer too.
+    #[test]
+    fn an_agent_marked_approval_records_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(54), Stage::Plan);
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
+
+        gate_respond_report_by(
+            root,
+            phase,
+            Some(stage),
+            GateAnswerKind::Approve,
+            None,
+            Some(opened.gate_id.to_string()),
+            answerer_from(Some("agent:pi".into()), Some("op".into())),
+        )
+        .unwrap();
+
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &opened.gate_id)
+        else {
+            panic!("the approval is written for the gate's id");
+        };
+        assert_eq!(answer.response.responded_by.as_deref(), Some("agent:pi"));
         registration.finish();
     }
 

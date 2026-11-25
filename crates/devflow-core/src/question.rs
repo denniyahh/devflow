@@ -339,7 +339,15 @@ pub enum AnswererKind {
 /// triage, `unknown` or blank is unknown, and every other name is the operator.
 #[must_use]
 pub fn answerer_kind(answered_by: &str) -> AnswererKind {
-    AnswererKind::Operator
+    if answered_by.starts_with("agent:") {
+        AnswererKind::Agent
+    } else if answered_by.starts_with("triage:") {
+        AnswererKind::Triage
+    } else if answered_by.trim().is_empty() || answered_by == "unknown" {
+        AnswererKind::Unknown
+    } else {
+        AnswererKind::Operator
+    }
 }
 
 /// A fresh question id: 16 lowercase hex digits, built as a launch id is.
