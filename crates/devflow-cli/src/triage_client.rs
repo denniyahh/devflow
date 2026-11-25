@@ -11,6 +11,9 @@
 
 use std::time::Duration;
 
+/// Jev's one inference route, appended to the base URL.
+const SYSTEMONE_PATH: &str = "/v1/systemone";
+
 /// Where and how to reach Jev.
 #[derive(Clone)]
 pub(crate) struct JevEndpoint {
@@ -32,16 +35,37 @@ impl std::fmt::Debug for JevEndpoint {
 /// Why a Jev call produced no answer.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum TransportFailure {
+    #[error("the endpoint could not be reached")]
+    Unreachable,
     #[error("the endpoint's reply was not JSON")]
     NotJson,
 }
 
 /// POST `body` to `<base_url>/v1/systemone` and return the endpoint's JSON.
+///
+/// One attempt, no retry: a held question does not wait to try again (D-19).
+/// The endpoint's timeout budgets the whole call, body included. The body is
+/// sent as bytes, so it carries a `Content-Length`.
 pub(crate) fn post_systemone(
-    _endpoint: &JevEndpoint,
-    _body: &serde_json::Value,
+    endpoint: &JevEndpoint,
+    body: &serde_json::Value,
 ) -> Result<serde_json::Value, TransportFailure> {
-    Ok(serde_json::Value::Null)
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(endpoint.timeout))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut response = agent
+        .post(format!("{}{SYSTEMONE_PATH}", endpoint.base_url))
+        .header("Authorization", format!("Bearer {}", endpoint.api_key))
+        .header("Content-Type", "application/json")
+        .send(body.to_string().into_bytes())
+        .map_err(|_| TransportFailure::Unreachable)?;
+    let bytes = response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|_| TransportFailure::Unreachable)?;
+    serde_json::from_slice(&bytes).map_err(|_| TransportFailure::NotJson)
 }
 
 #[cfg(test)]
