@@ -5192,6 +5192,28 @@ pub(crate) fn ledger_report(
         .map_err(|error| CliError::Message(format!("could not render the ledger as JSON: {error}")))
 }
 
+/// Append a `question_overridden` event with `fields` through `events::try_emit`.
+fn record_override(
+    project_root: &Path,
+    phase: PhaseId,
+    fields: serde_json::Value,
+) -> std::io::Result<()> {
+    events::try_emit(project_root, phase, events::QUESTION_OVERRIDDEN, fields)
+}
+
+/// `devflow ledger override`'s work, answering as `answerer` and appending the
+/// override through `record`.
+fn ledger_override_report_by(
+    _project_root: &Path,
+    _phase: PhaseId,
+    _question_id: &str,
+    _choice: &QuestionChoice,
+    _answerer: Result<String, CliError>,
+    _record: impl FnOnce(&Path, PhaseId, serde_json::Value) -> std::io::Result<()>,
+) -> Result<String, CliError> {
+    Err(CliError::Message("ledger override is not built".into()))
+}
+
 /// Detect capture-file rollover for `logs --follow` (14-CR-03): a file
 /// shorter than the follower's offset was deleted and recreated by the next
 /// stage's monitor, so following must restart from 0. A missing file (the
@@ -6984,6 +7006,127 @@ mod tests {
             Some(1),
             "{json}"
         );
+    }
+
+    /// The phase-54 events in the fixture's log of kind `kind`, in log order.
+    fn logged_events_of(root: &Path, kind: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == kind)
+            .collect()
+    }
+
+    fn option(option_id: &str) -> QuestionChoice {
+        QuestionChoice::Option {
+            option_id: option_id.into(),
+        }
+    }
+
+    /// [`ledger_override_report_by`] as the operator `op`, recording through
+    /// `events::try_emit`.
+    fn override_as_op(
+        root: &Path,
+        question_id: &str,
+        choice: &QuestionChoice,
+    ) -> Result<String, CliError> {
+        ledger_override_report_by(
+            root,
+            PhaseId::new(54),
+            question_id,
+            choice,
+            Ok("op".into()),
+            record_override,
+        )
+    }
+
+    /// Criterion 3 / D-15: an override of a triage-decided question is one
+    /// `question_overridden` event, and the ledger lists it beside the
+    /// original answer.
+    #[test]
+    fn an_override_is_listed_beside_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+
+        let reply = override_as_op(dir.path(), "q-decided", &option("drop"))
+            .unwrap_or_else(|error| panic!("the override was refused: {error}"));
+        assert!(reply.contains("q-decided"), "{reply}");
+
+        let overrides = logged_events_of(dir.path(), events::QUESTION_OVERRIDDEN);
+        assert_eq!(overrides.len(), 1, "{overrides:?}");
+        let event = &overrides[0];
+        assert_eq!(event["question_id"], "q-decided", "{event}");
+        assert_eq!(
+            event["answer"],
+            serde_json::json!({"option_id": "drop"}),
+            "{event}"
+        );
+        assert_eq!(
+            event["was"],
+            serde_json::json!({"option_id": "keep"}),
+            "{event}"
+        );
+        assert_eq!(event["overridden_by"], "op", "{event}");
+        assert_eq!(event["run_started_at"], "100", "{event}");
+        assert!(
+            event["override_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{event}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&ledger_report(dir.path(), PhaseId::new(54), true).unwrap())
+                .unwrap();
+        let entry = &json["decided"][0];
+        assert_eq!(
+            entry["answer"],
+            serde_json::json!({"option_id": "keep"}),
+            "{json}"
+        );
+        assert_eq!(
+            entry["overrides"].as_array().map(Vec::len),
+            Some(1),
+            "{json}"
+        );
+        assert_eq!(
+            entry["effective_answer"],
+            serde_json::json!({"option_id": "drop"}),
+            "{json}"
+        );
+    }
+
+    /// T-54-35: when the append fails the override is refused and nothing is
+    /// acknowledged. The log becomes a directory once the ledger was read.
+    /// Control: the same override on a writable log is acknowledged.
+    #[test]
+    fn an_override_that_cannot_be_recorded_acknowledges_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        let log = devflow_core::events::events_path(dir.path());
+        let error = ledger_override_report_by(
+            dir.path(),
+            PhaseId::new(54),
+            "q-decided",
+            &option("drop"),
+            Ok("op".into()),
+            |root, phase, fields| {
+                std::fs::remove_file(&log).unwrap();
+                std::fs::create_dir(&log).unwrap();
+                record_override(root, phase, fields)
+            },
+        )
+        .expect_err("an override the log could not take was acknowledged");
+        let error = error.to_string();
+        assert!(error.contains("the override was not recorded"), "{error}");
+        assert!(error.contains("nothing was acknowledged"), "{error}");
+
+        let control = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(control.path());
+        let reply = override_as_op(control.path(), "q-decided", &option("drop"))
+            .unwrap_or_else(|error| panic!("control: the override was refused: {error}"));
+        assert!(reply.contains("overridden"), "{reply}");
     }
 
     /// #285: outside a git work tree the ignore check says nothing, so no
