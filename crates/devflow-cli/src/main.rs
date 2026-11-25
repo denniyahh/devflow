@@ -204,6 +204,18 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// List a phase's questions from the event log: those triage decided, and
+    /// those escalated to the operator with the reason, answered or not.
+    Ledger {
+        /// Phase to list.
+        phase: PhaseId,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove what is safe to remove: a finished run, a dead start's reservation, or
     /// a worktree with no run state, once its branch is merged into the base, its
     /// worktree is clean and no run is live. Says why it keeps the rest, and names
@@ -622,6 +634,12 @@ fn run() -> Result<(), CliError> {
             project,
         } => logs(&project_root(project)?, phase, follow, stderr),
         Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
+        Command::Ledger {
+            phase,
+            project,
+            json,
+        } => commands::ledger_report(&project_root(project)?, phase, json)
+            .map(|report| println!("{report}")),
         Command::Cleanup { project } => cleanup(&project_root(project)?),
         Command::Discard {
             phase,

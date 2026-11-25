@@ -5180,11 +5180,16 @@ pub(crate) fn history_cmd(project_root: &Path, phase: Option<PhaseId>) -> Result
 /// `devflow ledger <phase>`: the phase's decided and escalated questions,
 /// as text or, with `json`, as the [`history::Ledger`] JSON.
 pub(crate) fn ledger_report(
-    _project_root: &Path,
-    _phase: PhaseId,
-    _json: bool,
+    project_root: &Path,
+    phase: PhaseId,
+    json: bool,
 ) -> Result<String, CliError> {
-    Ok(String::new())
+    let ledger = history::ledger(project_root, phase);
+    if !json {
+        return Ok(history::render_ledger(&ledger));
+    }
+    serde_json::to_string_pretty(&ledger)
+        .map_err(|error| CliError::Message(format!("could not render the ledger as JSON: {error}")))
 }
 
 /// Detect capture-file rollover for `logs --follow` (14-CR-03): a file
