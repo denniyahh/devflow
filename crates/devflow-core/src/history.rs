@@ -988,6 +988,66 @@ mod tests {
         assert!(json.get("answer").is_none(), "{json}");
     }
 
+    #[test]
+    fn history_shows_an_override_a_fallback_and_a_discard() {
+        let rendered = render_events(&[
+            serde_json::json!({
+                "v": 1, "ts": 9, "phase": 53, "event": events::TRIAGE_FALLBACK,
+                "question_id": "q-1", "run_started_at": "100",
+                "reason": "timeout", "detail": "no answer in 5s",
+            }),
+            triaged(10, "q-1", "decided", None),
+            triage_answered(11, "q-1"),
+            overridden(12, "q-1", "drop", "keep"),
+            serde_json::json!({
+                "v": 1, "ts": 13, "phase": 53, "event": events::OVERRIDES_DELIVERED,
+                "run_started_at": "100", "override_ids": ["o-12", "o-99"],
+            }),
+            serde_json::json!({
+                "v": 1, "ts": 14, "phase": 53, "event": events::RUN_DISCARDED,
+                "started_at": "100",
+            }),
+        ]);
+
+        assert!(
+            rendered.contains("  override q-1: option drop (was option keep) by operator"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  overrides delivered to the launch: 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  triage fell back for q-1: timeout"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  run discarded: started at 100"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("ignored"), "{rendered}");
+    }
+
+    #[test]
+    fn a_triage_decided_question_shows_its_scores() {
+        let rendered = render_events(&[
+            triaged(10, "q-1", "decided", None),
+            triage_answered(11, "q-1"),
+        ]);
+
+        let triage_row = rendered
+            .lines()
+            .find(|line| line.starts_with("  triage: decided keep"))
+            .unwrap_or_else(|| panic!("no triage row in {rendered}"));
+        assert!(triage_row.contains("pre-check 0.93"), "{triage_row}");
+        assert!(triage_row.contains("top probability 0.91"), "{triage_row}");
+        assert!(
+            rendered.contains("  answer q-1: option keep by triage:jev via triage"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("ignored"), "{rendered}");
+    }
+
     const QUESTION_ROW_PREFIXES: [&str; 7] = [
         "  question ",
         "  options: ",
