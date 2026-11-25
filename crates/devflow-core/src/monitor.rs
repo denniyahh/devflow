@@ -52,14 +52,16 @@ pub enum MonitorError {
     NotReady(String),
 }
 
-/// Claude's idle-timeout default in seconds, used when `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS`
-/// is unset or unparseable ([`idle_timeout_setting_for`]).
+/// The idle-timeout default in seconds for Claude and Antigravity, used when the
+/// agent's variable is unset or unparseable ([`idle_timeout_setting_for`]).
 ///
 /// Raised from the 120s floor to 900s as a stopgap for #352. A tool call inside a
 /// subagent writes nothing to the parent's stream; a 197s subagent Bash call was
 /// measured fully silent. The per-stage extension budget
 /// ([`MAX_IDLE_EXTENSIONS_WITH_TASKS_OPEN`]) was spent by four such calls in the
-/// Phase 54 Code stage, and the next one was killed. The floor itself is unchanged:
+/// Phase 54 Code stage, and the next one was killed. Antigravity is silent for the
+/// whole of a tool call (201s for a 200s shell command, antigravity-cli 1.5.16) and
+/// opens no task, so it gets no extension at all. The floor itself is unchanged:
 /// a configured value may still be as low as [`IDLE_TIMEOUT_FLOOR_SECS`].
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 
@@ -252,12 +254,10 @@ pub fn parse_idle_timeout_secs(raw: Option<String>) -> IdleTimeoutSetting {
 /// to an unmeasured agent would be a behaviour prediction. The decision is
 /// therefore per-agent and explicit, never a silent inheritance:
 ///
-/// - Claude reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS`; unset or unparseable, it
-///   gets [`DEFAULT_IDLE_TIMEOUT_SECS`] rather than the floor (#352).
-/// - Antigravity reads `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` with the same
-///   120s floor as a DECIDED starting point (documented in the variable's
-///   OPERATIONS.md row), to be revisited after the first real cadence
-///   measurement.
+/// - Claude reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS`, Antigravity
+///   `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS`; neither reads the other's.
+/// - Unset or unparseable, either gets [`DEFAULT_IDLE_TIMEOUT_SECS`] rather
+///   than the floor (#352).
 ///
 /// Both literals are spelled out here so `doc_check` keeps every variable
 /// visible to the operator-doc parity gate (same rule as the single-variable
@@ -272,7 +272,7 @@ pub fn idle_timeout_setting_for(agent: AgentKind) -> IdleTimeoutSetting {
         setting.resolution,
         IdleTimeoutResolution::Default | IdleTimeoutResolution::Unparseable { .. }
     );
-    if unchosen && !matches!(agent, AgentKind::Antigravity) {
+    if unchosen {
         setting.timeout = Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
     }
     setting
@@ -1401,10 +1401,8 @@ fn abandon_agent(child: &mut std::process::Child) {
 /// Claude's stream cadence (a fixed 30.00s `tool_progress` keepalive). The
 /// per-agent resolution is explicit, not inherited (round-3 D-08):
 /// [`idle_timeout_setting_for`] reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` for
-/// Claude unchanged and `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` for
-/// Antigravity with the same floor as a DECIDED starting point — revisited
-/// after the first real cadence measurement, never a silent application of an
-/// unmeasured policy (the thing constraint 1 forbids).
+/// Claude and `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` for Antigravity, each
+/// with [`DEFAULT_IDLE_TIMEOUT_SECS`] when unset (#352).
 ///
 /// Every step is best-effort and none can abort the sequence. A failure to
 /// enumerate, write, or log must still leave the child terminated and the
@@ -3929,7 +3927,7 @@ sleep 120
         static ENV_MUTEX: Mutex<()> = Mutex::new(());
         let _lock = ENV_MUTEX.lock().unwrap();
 
-        // Baseline: nothing set -> Claude gets its 900s default, Antigravity the floor.
+        // Baseline: nothing set -> both agents get the 900s default.
         unsafe {
             std::env::remove_var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS");
             std::env::remove_var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS");
@@ -3942,9 +3940,7 @@ sleep 120
         );
         assert_eq!(
             antg_default.timeout,
-            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS),
-            "the antigravity default is the DECIDED 120s floor (D-08), not inherited \
-             silently — the decision is explicit and documented"
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
         );
 
         // Claude's variable moves Claude, NOT Antigravity.
@@ -3958,7 +3954,7 @@ sleep 120
         );
         assert_eq!(
             idle_timeout_setting_for(AgentKind::Antigravity).timeout,
-            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS),
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             "Claude's variable must not move Antigravity"
         );
 
@@ -3988,7 +3984,7 @@ sleep 120
         );
         assert_eq!(
             idle_timeout_setting_for(AgentKind::Antigravity).timeout,
-            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS)
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
         );
         // A configured value below the default but at the floor still holds.
         unsafe {
