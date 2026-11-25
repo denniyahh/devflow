@@ -2222,9 +2222,42 @@ pub(crate) fn discard(
     print_discard_listing(phase, &items, &debris);
     refuse_discard_of_a_checked_out_branch(phase, &items)?;
     refuse_discard_of_branch(phase, &items, delete_unmerged_branch)?;
+    let recorded = record_run_discarded(project_root, phase, &existing)?;
     let removed = remove_discarded(project_root, phase, &git, &items);
     let debris_removed = remove_discarded_debris(project_root, phase, &debris);
-    removed.and(debris_removed)
+    let result = removed.and(debris_removed);
+    if !recorded {
+        return result;
+    }
+    result.map_err(|error| {
+        CliError::Message(format!(
+            "{error}. The discard is recorded in .devflow/events.jsonl; rerun `devflow discard \
+             --phase {phase}` to finish it"
+        ))
+    })
+}
+
+/// Write-ahead for discard (D-16): append `run_discarded` with the saved run's
+/// `started_at` before anything is removed, so a removed run always has its
+/// record. Whether one was written; a failed append refuses the discard. The
+/// event log itself is never removed, so the ledger outlives the run.
+fn record_run_discarded(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+) -> Result<bool, CliError> {
+    let workflow::Existing::Loaded(state) = existing else {
+        return Ok(false);
+    };
+    let fields = serde_json::json!({ "started_at": state.started_at });
+    events::try_emit(project_root, phase, events::RUN_DISCARDED, fields).map_err(|error| {
+        CliError::Message(format!(
+            "discard refused: the run_discarded record could not be written to {} ({error}); \
+             nothing was removed",
+            events::events_path(project_root).display()
+        ))
+    })?;
+    Ok(true)
 }
 
 /// The suffix of a gate's waiter registration, `NN-{stage}.{gate_id}.waiter`: the
@@ -5251,6 +5284,7 @@ fn ledger_override_report_by(
                  written. `devflow ledger {phase}` lists its questions"
             ))
         })?;
+    refuse_an_override_of_a_discarded_run(project_root, phase, entry)?;
     let previous = overridable_answer(phase, entry)?;
     refuse_an_unusable_override(phase, entry, choice)?;
     let answer = serde_json::to_value(choice)
@@ -5291,6 +5325,37 @@ fn ledger_override_report_by(
         choice_text(&answer),
         choice_text(&previous),
     ))
+}
+
+/// Refuse an override of a question whose run `devflow discard` removed: its
+/// `run_started_at` is the `started_at` of a `run_discarded` event of the phase.
+/// An entry with no `run_started_at` cannot be matched and is not refused.
+fn refuse_an_override_of_a_discarded_run(
+    project_root: &Path,
+    phase: PhaseId,
+    entry: &history::LedgerEntry,
+) -> Result<(), CliError> {
+    let Some(started_at) = &entry.run_started_at else {
+        return Ok(());
+    };
+    let log = std::fs::read_to_string(events::events_path(project_root)).unwrap_or_default();
+    let discarded = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|event| {
+            event.get("v").and_then(|v| v.as_u64()) == Some(1)
+                && phase.matches_json(event.get("phase"))
+                && event.get("event").and_then(|kind| kind.as_str()) == Some(events::RUN_DISCARDED)
+                && event.get("started_at").and_then(|at| at.as_str()) == Some(started_at)
+        });
+    if !discarded {
+        return Ok(());
+    }
+    Err(CliError::Message(format!(
+        "question {} belongs to the run started at {started_at}, which `devflow discard` \
+         removed; nothing was written",
+        entry.question_id
+    )))
 }
 
 /// The answer an override of `entry` replaces: refused for a question still
