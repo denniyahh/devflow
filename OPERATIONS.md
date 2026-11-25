@@ -66,6 +66,19 @@ tool, `devflow_ask`. A call opens a `question` gate at the stage's
 `.devflow/gates/NN-<stage>.json` and returns once the operator answers it with
 `devflow gate answer`. Never run it by hand.)
 
+(`devflow score` is internal and registered as the hidden `__triage-score`
+subcommand: `devflow __triage-score --project <name>=<path> [--project …]
+[--exclude <name>:<phase> …] [--model <id>]` measures Jev on the operator's
+own past answers. It mines each named project's event log and DISCUSSION-LOG
+files, prints the mining counts per project, then, only when
+`TYPESAFE_API_KEY` is set, scores each question against its own project's
+other answers and writes `corpus.jsonl`, `scores.jsonl` and `report.md` under
+`triage/` in the user data dir: `DEVFLOW_DATA_DIR`, else
+`$XDG_DATA_HOME/devflow`, else `~/.local/share/devflow`. The directory is
+mode 0700 and each file 0600. The corpus and the scores hold question and
+answer text and never belong in a repository; the report holds counts and
+scores only.)
+
 ## How a stage agent reaches `devflow_ask`
 
 Every stage launch (Plan, Code, Validate) of claude, codex or pi registers the

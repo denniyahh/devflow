@@ -9,7 +9,8 @@
 //! do, and every target that writes the fake has its own binary.
 //!
 //! The rule it exists for: an e2e child that runs the `devflow` binary gets a
-//! tempdir `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME` and `DEVFLOW_CACHE_DIR`
+//! tempdir `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and
+//! `DEVFLOW_CACHE_DIR`
 //! and has the repo-local `GIT_*` variables removed, so its registry entries
 //! (and, from 50-11, its sockets) never land in the operator's real
 //! `~/.cache/devflow`. Spawn `devflow` through [`hermetic_devflow`] only;
@@ -686,6 +687,7 @@ fn scrubbed(mut command: Command, home: &HermeticHome) -> Command {
         .env("HOME", home.home())
         .env("XDG_CACHE_HOME", home.home().join(".cache"))
         .env("XDG_CONFIG_HOME", home.config_dir())
+        .env("XDG_DATA_HOME", home.home().join(".local").join("share"))
         .env("DEVFLOW_CACHE_DIR", home.cache_dir());
     for name in devflow_core::test_support::REPO_LOCAL_GIT_VARS
         .iter()

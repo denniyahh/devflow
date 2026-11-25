@@ -1384,16 +1384,8 @@ fn score_question(
 /// A transport failure as its fallback; the failure's text never carries the
 /// key or the endpoint's reply.
 fn transport_fallback(failure: &TransportFailure) -> TriageOutcome {
-    let reason = match failure {
-        TransportFailure::NoApiKey => FallbackReason::NoApiKey,
-        TransportFailure::EndpointRefused => FallbackReason::EndpointRefused,
-        TransportFailure::Unreachable => FallbackReason::Unreachable,
-        TransportFailure::Timeout => FallbackReason::Timeout,
-        TransportFailure::HttpStatus { .. } => FallbackReason::HttpStatus,
-        TransportFailure::NotJson => FallbackReason::Unparsable,
-    };
     TriageOutcome::Fallback {
-        reason,
+        reason: failure.fallback_reason(),
         detail: failure.to_string(),
     }
 }

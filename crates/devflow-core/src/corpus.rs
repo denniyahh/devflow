@@ -10,7 +10,7 @@
 //! This module is pure apart from reading the project's files: the run-time
 //! call ([`precedents_for`]) and the scoring tool both use it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,8 @@ use crate::events;
 use crate::phase_id::PhaseId;
 use crate::question::{AnswererKind, QuestionKind, QuestionOption, QuestionSpec, answerer_kind};
 use crate::triage::{
-    Precedent, PrecedentAnswer, TriageConfig, precedent_state, strip_recommended_marker,
+    self, JevScores, Precedent, PrecedentAnswer, TriageConfig, precedent_state,
+    strip_recommended_marker,
 };
 
 /// The most precedents one question is sent with (Pitfall 9).
@@ -763,6 +764,19 @@ pub fn select_precedents(
     spec: &QuestionSpec,
     exclude_entry_id: Option<&str>,
 ) -> Vec<Precedent> {
+    select_precedent_entries(entries, spec, exclude_entry_id)
+        .into_iter()
+        .map(CorpusEntry::precedent)
+        .collect()
+}
+
+/// The entries [`select_precedents`] makes its precedents from, in the same
+/// order, so a caller can record which entries a request carried.
+pub fn select_precedent_entries<'a>(
+    entries: &'a [CorpusEntry],
+    spec: &QuestionSpec,
+    exclude_entry_id: Option<&str>,
+) -> Vec<&'a CorpusEntry> {
     let target = question_words(&spec.question, &spec.options);
     let mut ranked: Vec<(f64, &CorpusEntry)> = entries
         .iter()
@@ -784,19 +798,28 @@ pub fn select_precedents(
     let mut kept = Vec::new();
     let mut used = 0;
     for (_, entry) in ranked.into_iter().take(MAX_PRECEDENTS) {
-        let precedent = Precedent {
-            question: entry.question.clone(),
-            options: entry.options.clone(),
-            answer: entry.answer.clone(),
-        };
-        let chars = precedent_state(&precedent).to_string().chars().count();
+        let chars = precedent_state(&entry.precedent())
+            .to_string()
+            .chars()
+            .count();
         if used + chars > PRECEDENT_CHAR_BUDGET {
             break;
         }
         used += chars;
-        kept.push(precedent);
+        kept.push(entry);
     }
     kept
+}
+
+impl CorpusEntry {
+    /// This entry as a precedent: its question, options and answer.
+    pub fn precedent(&self) -> Precedent {
+        Precedent {
+            question: self.question.clone(),
+            options: self.options.clone(),
+            answer: self.answer.clone(),
+        }
+    }
 }
 
 /// Event-log entries rank before log entries on equal similarity.
@@ -835,6 +858,575 @@ pub fn precedents_for(
 ) -> Vec<Precedent> {
     let report = mine_project(project_root, "", &config.exclude_label_phases);
     select_precedents(&report.entries, spec, None)
+}
+
+/// The fewest answered questions a threshold may be chosen on (D-07).
+pub const MIN_ANSWERED: usize = 20;
+
+/// The agreement, in percent, the questions a threshold answers must reach
+/// (D-07). Decided in integers: `hits * 100 >= MIN_AGREEMENT_PERCENT * n`.
+pub const MIN_AGREEMENT_PERCENT: usize = 95;
+
+/// Calibration buckets per score: tenths of `[0, 1]`.
+const CALIBRATION_BUCKETS: u8 = 10;
+
+impl ExclusionCounts {
+    /// Every count with its field name, in declaration order.
+    pub fn by_reason(&self) -> Vec<(String, usize)> {
+        let Ok(Value::Object(fields)) = serde_json::to_value(self) else {
+            return Vec::new();
+        };
+        fields
+            .into_iter()
+            .map(|(name, count)| {
+                let count = count.as_u64().map_or(0, |count| count as usize);
+                (name, count)
+            })
+            .collect()
+    }
+}
+
+/// One corpus entry as the scoring tool scored it: one `scores.jsonl` line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ScoredEntry {
+    /// The [`CorpusEntry::id`] scored.
+    pub entry_id: String,
+    /// The project it was mined from.
+    pub project: String,
+    /// Its kind.
+    pub kind: QuestionKind,
+    /// The ids of the entries the request carried as precedents (D-06).
+    pub precedent_ids: Vec<String>,
+    /// Jev's `accept` probability, when scored.
+    pub accept: Option<f64>,
+    /// The option Jev picked, when scored.
+    pub top_option: Option<String>,
+    /// The picked option's probability, when scored.
+    pub top_probability: Option<f64>,
+    /// The operator's answer: an option id or their own words.
+    pub operator_answer: PrecedentAnswer,
+    /// Whether Jev's pick is the option the operator chose (D-11: own words
+    /// never are).
+    pub hit: bool,
+    /// Whether the agent's recommended option is known (D-10).
+    pub recommended_known: bool,
+    /// Whether the operator chose the recommended option.
+    pub picked_recommended: bool,
+    /// Why the request gave no scores, when it failed.
+    pub error: Option<String>,
+    /// The input tokens the response reported, if any.
+    pub input_tokens: Option<u64>,
+}
+
+impl ScoredEntry {
+    /// `entry` scored `scores` by a request carrying `precedent_ids`.
+    pub fn scored(
+        entry: &CorpusEntry,
+        precedent_ids: Vec<String>,
+        scores: &JevScores,
+        input_tokens: Option<u64>,
+    ) -> Self {
+        Self {
+            accept: Some(scores.accept),
+            top_option: Some(scores.top_option.clone()),
+            top_probability: Some(scores.top_probability),
+            hit: picked(&entry.answer, Some(&scores.top_option)),
+            input_tokens,
+            ..Self::unscored(entry, precedent_ids, None)
+        }
+    }
+
+    /// `entry`'s request, carrying `precedent_ids`, gave no scores for
+    /// `reason`.
+    pub fn failed(entry: &CorpusEntry, precedent_ids: Vec<String>, reason: &str) -> Self {
+        Self::unscored(entry, precedent_ids, Some(reason.to_string()))
+    }
+
+    /// A `blocking-human` `entry`, never sent to Jev (D-08).
+    pub fn skipped(entry: &CorpusEntry) -> Self {
+        Self::unscored(entry, Vec::new(), None)
+    }
+
+    fn unscored(entry: &CorpusEntry, precedent_ids: Vec<String>, error: Option<String>) -> Self {
+        Self {
+            entry_id: entry.id.clone(),
+            project: entry.project.clone(),
+            kind: entry.kind,
+            precedent_ids,
+            accept: None,
+            top_option: None,
+            top_probability: None,
+            operator_answer: entry.answer.clone(),
+            hit: false,
+            recommended_known: entry.recommended.is_some(),
+            picked_recommended: picked(&entry.answer, entry.recommended.as_deref()),
+            error,
+            input_tokens: None,
+        }
+    }
+
+    /// Whether the operator chose an offered option: the pre-check's
+    /// positive (D-11 calls own-words answers, the other class, its
+    /// positives: the class that should escalate).
+    pub fn answered_with_option(&self) -> bool {
+        matches!(self.operator_answer, PrecedentAnswer::Option { .. })
+    }
+
+    /// Whether the operator chose Jev's pick, read from the answer itself so
+    /// an own-words answer is always a miss (D-11).
+    fn option_hit(&self) -> bool {
+        picked(&self.operator_answer, self.top_option.as_deref())
+    }
+
+    /// The scores a threshold counts, or `None` for a `blocking-human`
+    /// entry (D-08) or a failed request.
+    fn scores(&self) -> Option<(f64, f64)> {
+        if self.kind == QuestionKind::BlockingHuman || self.error.is_some() {
+            return None;
+        }
+        Some((self.accept?, self.top_probability?))
+    }
+
+    /// Whether both thresholds would answer this entry (D-24's `>=`).
+    fn answered_at(&self, pre_check: f64, option: f64) -> bool {
+        self.scores().is_some_and(|(accept, top)| {
+            triage::reaches(accept, pre_check) && triage::reaches(top, option)
+        })
+    }
+}
+
+/// Whether `answer` is the option `option`.
+fn picked(answer: &PrecedentAnswer, option: Option<&str>) -> bool {
+    matches!(
+        (answer, option),
+        (PrecedentAnswer::Option { option_id }, Some(option)) if option_id == option
+    )
+}
+
+/// What a threshold rule found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum ThresholdChoice {
+    /// Not computed: the pre-check found no threshold, so the option rule
+    /// has nothing to run on (D-24 order).
+    NotComputed,
+    /// No observed score qualifies.
+    NoneQualifies,
+    /// The lowest qualifying observed score, how many points score at least
+    /// it, and how many of those agree.
+    Chosen {
+        /// The threshold.
+        threshold: f64,
+        /// Points whose score is `>= threshold`.
+        answered: usize,
+        /// Of those, the points that agree.
+        agreeing: usize,
+    },
+}
+
+impl ThresholdChoice {
+    /// The chosen threshold, if any.
+    pub fn threshold(self) -> Option<f64> {
+        match self {
+            Self::Chosen { threshold, .. } => Some(threshold),
+            Self::NotComputed | Self::NoneQualifies => None,
+        }
+    }
+}
+
+/// The distinct finite scores of `points`, ascending: the only candidate
+/// thresholds, so none lies below the lowest observed score.
+fn threshold_candidates(points: &[(f64, bool)]) -> Vec<f64> {
+    let mut candidates: Vec<f64> = points
+        .iter()
+        .map(|(score, _)| *score)
+        .filter(|score| score.is_finite())
+        .collect();
+    candidates.sort_by(f64::total_cmp);
+    candidates.dedup();
+    candidates
+}
+
+/// [`lowest_qualifying_threshold`] with the counts at the threshold.
+fn threshold_rule(points: &[(f64, bool)]) -> ThresholdChoice {
+    for threshold in threshold_candidates(points) {
+        let answered: Vec<bool> = points
+            .iter()
+            .filter(|(score, _)| triage::reaches(*score, threshold))
+            .map(|(_, agrees)| *agrees)
+            .collect();
+        let n = answered.len();
+        let agreeing = answered.iter().filter(|agrees| **agrees).count();
+        if n >= MIN_ANSWERED && agreeing * 100 >= MIN_AGREEMENT_PERCENT * n {
+            return ThresholdChoice::Chosen {
+                threshold,
+                answered: n,
+                agreeing,
+            };
+        }
+    }
+    ThresholdChoice::NoneQualifies
+}
+
+/// The lowest observed score `t` such that the points scoring `>= t` (D-24)
+/// number at least [`MIN_ANSWERED`] and at least [`MIN_AGREEMENT_PERCENT`]
+/// percent of them agree (D-07). Each point is `(score, agrees)`.
+pub fn lowest_qualifying_threshold(points: &[(f64, bool)]) -> Option<f64> {
+    threshold_rule(points).threshold()
+}
+
+/// Both thresholds the rule chose, and what it left out.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ChosenThresholds {
+    /// The pre-check threshold over `accept`, positive = an option answer.
+    pub pre_check: ThresholdChoice,
+    /// The option threshold over the top probability, on the entries whose
+    /// `accept` reaches the pre-check threshold.
+    pub option: ThresholdChoice,
+    /// `blocking-human` entries, never counted (D-08).
+    pub blocking_human: usize,
+    /// Entries whose request failed, never counted.
+    pub errors: usize,
+}
+
+impl ChosenThresholds {
+    /// The pre-check and option thresholds, or `None` when the result is
+    /// escalate-all.
+    pub fn both(&self) -> Option<(f64, f64)> {
+        Some((self.pre_check.threshold()?, self.option.threshold()?))
+    }
+}
+
+/// Choose the pre-check threshold, then the option threshold on the entries
+/// that pass it (D-24 order, D-07 rule). `blocking-human` entries and failed
+/// requests are left out and counted.
+pub fn choose_thresholds(scores: &[ScoredEntry]) -> ChosenThresholds {
+    let blocking_human = scores
+        .iter()
+        .filter(|entry| entry.kind == QuestionKind::BlockingHuman)
+        .count();
+    let errors = scores
+        .iter()
+        .filter(|entry| entry.kind != QuestionKind::BlockingHuman && entry.error.is_some())
+        .count();
+    let eligible: Vec<(f64, f64, &ScoredEntry)> = scores
+        .iter()
+        .filter_map(|entry| entry.scores().map(|(accept, top)| (accept, top, entry)))
+        .collect();
+    let pre_points: Vec<(f64, bool)> = eligible
+        .iter()
+        .map(|(accept, _, entry)| (*accept, entry.answered_with_option()))
+        .collect();
+    let pre_check = threshold_rule(&pre_points);
+    let option = match pre_check.threshold() {
+        None => ThresholdChoice::NotComputed,
+        Some(pre_threshold) => {
+            let option_points: Vec<(f64, bool)> = eligible
+                .iter()
+                .filter(|(accept, _, _)| triage::reaches(*accept, pre_threshold))
+                .map(|(_, top, entry)| (*top, entry.option_hit()))
+                .collect();
+            threshold_rule(&option_points)
+        }
+    };
+    ChosenThresholds {
+        pre_check,
+        option,
+        blocking_human,
+        errors,
+    }
+}
+
+/// One project's corpus sizes and exclusions.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ProjectCounts {
+    /// The project's name, as the caller gave it.
+    pub name: String,
+    /// `decision` entries.
+    pub decision: usize,
+    /// `discuss` entries.
+    pub discuss: usize,
+    /// `blocking-human` entries.
+    pub blocking_human: usize,
+    /// Entries from the event log.
+    pub event_entries: usize,
+    /// Entries from DISCUSSION-LOG files.
+    pub log_entries: usize,
+    /// What mining left out.
+    pub excluded: ExclusionCounts,
+}
+
+impl ProjectCounts {
+    /// The counts of `report`, a project mined as `name`.
+    pub fn from_mining(name: &str, report: &MiningReport) -> Self {
+        let kind = |kind| report.entries.iter().filter(|e| e.kind == kind).count();
+        let source = |source| report.entries.iter().filter(|e| e.source == source).count();
+        Self {
+            name: name.to_string(),
+            decision: kind(QuestionKind::Decision),
+            discuss: kind(QuestionKind::Discuss),
+            blocking_human: kind(QuestionKind::BlockingHuman),
+            event_entries: source(CorpusSource::Events),
+            log_entries: source(CorpusSource::DiscussionLog),
+            excluded: report.excluded.clone(),
+        }
+    }
+}
+
+/// How many points fall in one tenth of `[0, 1]` and how many are positive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CalibrationBucket {
+    /// The tenth: `0` is `[0.0, 0.1)`, `9` is `[0.9, 1.0]`.
+    pub bucket: u8,
+    /// Points in the bucket.
+    pub n: usize,
+    /// Of those, the positives.
+    pub positives: usize,
+}
+
+/// How often the operator chose the agent's recommended option (D-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct Baseline {
+    /// Questions whose recommendation is known.
+    pub known: usize,
+    /// Of those, the ones answered with it.
+    pub picked: usize,
+}
+
+impl Baseline {
+    fn of<'a>(entries: impl Iterator<Item = &'a ScoredEntry>) -> Self {
+        entries
+            .filter(|entry| entry.recommended_known)
+            .fold(Self::default(), |baseline, entry| Self {
+                known: baseline.known + 1,
+                picked: baseline.picked + usize::from(entry.picked_recommended),
+            })
+    }
+}
+
+/// Everything the scoring tool's report says: counts and scores, never a
+/// question, option or answer text (D-05).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MeasurementReport {
+    /// The model scored.
+    pub model: String,
+    /// Each project's corpus sizes and exclusions.
+    pub projects: Vec<ProjectCounts>,
+    /// Entries answered in the operator's own words (D-11).
+    pub free_text: usize,
+    /// Requests sent: every entry but `blocking-human` ones.
+    pub requests: usize,
+    /// Failed requests by reason.
+    pub errors: BTreeMap<String, usize>,
+    /// Input tokens the responses reported.
+    pub input_tokens: u64,
+    /// `accept` against option answers.
+    pub pre_check_calibration: Vec<CalibrationBucket>,
+    /// The top probability against agreement.
+    pub option_calibration: Vec<CalibrationBucket>,
+    /// The thresholds chosen.
+    pub thresholds: ChosenThresholds,
+    /// The recommendation baseline over every question sent.
+    pub baseline_overall: Baseline,
+    /// The baseline on the questions both thresholds would answer, when
+    /// both were chosen.
+    pub baseline_answered: Option<Baseline>,
+}
+
+impl MeasurementReport {
+    /// The report on `scores`, scored with `model`, of `projects`.
+    pub fn new(model: &str, projects: Vec<ProjectCounts>, scores: &[ScoredEntry]) -> Self {
+        let sent: Vec<&ScoredEntry> = scores
+            .iter()
+            .filter(|entry| entry.kind != QuestionKind::BlockingHuman)
+            .collect();
+        let mut errors = BTreeMap::new();
+        for reason in sent.iter().filter_map(|entry| entry.error.as_deref()) {
+            *errors.entry(reason.to_string()).or_insert(0) += 1;
+        }
+        let eligible: Vec<(f64, f64, &ScoredEntry)> = scores
+            .iter()
+            .filter_map(|entry| entry.scores().map(|(accept, top)| (accept, top, entry)))
+            .collect();
+        let thresholds = choose_thresholds(scores);
+        let baseline_answered = thresholds.both().map(|(pre_check, option)| {
+            Baseline::of(
+                scores
+                    .iter()
+                    .filter(|entry| entry.answered_at(pre_check, option)),
+            )
+        });
+        Self {
+            model: model.to_string(),
+            projects,
+            free_text: sent
+                .iter()
+                .filter(|entry| !entry.answered_with_option())
+                .count(),
+            requests: sent.len(),
+            errors,
+            input_tokens: sent.iter().filter_map(|entry| entry.input_tokens).sum(),
+            pre_check_calibration: calibration(
+                eligible
+                    .iter()
+                    .map(|(accept, _, entry)| (*accept, entry.answered_with_option())),
+            ),
+            option_calibration: calibration(
+                eligible
+                    .iter()
+                    .map(|(_, top, entry)| (*top, entry.option_hit())),
+            ),
+            thresholds,
+            baseline_overall: Baseline::of(sent.iter().copied()),
+            baseline_answered,
+        }
+    }
+}
+
+/// `points` counted into tenths of `[0, 1]`; a non-finite score is in none.
+fn calibration(points: impl Iterator<Item = (f64, bool)>) -> Vec<CalibrationBucket> {
+    let mut buckets: Vec<CalibrationBucket> = (0..CALIBRATION_BUCKETS)
+        .map(|bucket| CalibrationBucket {
+            bucket,
+            n: 0,
+            positives: 0,
+        })
+        .collect();
+    let last = f64::from(CALIBRATION_BUCKETS - 1);
+    for (score, positive) in points.filter(|(score, _)| score.is_finite()) {
+        let index = (score * f64::from(CALIBRATION_BUCKETS))
+            .floor()
+            .clamp(0.0, last) as usize;
+        buckets[index].n += 1;
+        buckets[index].positives += usize::from(positive);
+    }
+    buckets
+}
+
+/// `report` as markdown: numbers, the model id and project names only. A
+/// threshold prints in Rust's shortest round-trip form, so it parses back to
+/// the same `f64`.
+pub fn render_report(report: &MeasurementReport) -> String {
+    let mut out = String::from("# Jev measurement report\n\n");
+    out.push_str(&format!("Model: {}\n\n## Corpus\n\n", report.model));
+    for project in &report.projects {
+        out.push_str(&format!(
+            "- {}: decision {}, discuss {}, blocking-human {} (event-log entries {}, \
+             DISCUSSION-LOG entries {})\n",
+            project.name,
+            project.decision,
+            project.discuss,
+            project.blocking_human,
+            project.event_entries,
+            project.log_entries
+        ));
+    }
+    out.push_str("\n## Left out of the corpus\n\n");
+    for project in &report.projects {
+        let reasons: Vec<String> = project
+            .excluded
+            .by_reason()
+            .iter()
+            .map(|(reason, count)| format!("{reason} {count}"))
+            .collect();
+        out.push_str(&format!("- {}: {}\n", project.name, reasons.join(", ")));
+    }
+    let thresholds = &report.thresholds;
+    out.push_str(&format!(
+        "\n## Requests\n\nBlocking-human questions (never sent, never counted): {}\n\
+         Free-text answers: {}\nRequests: {}\nErrors: {}\n",
+        thresholds.blocking_human, report.free_text, report.requests, thresholds.errors
+    ));
+    for (reason, count) in &report.errors {
+        out.push_str(&format!("- {reason}: {count}\n"));
+    }
+    out.push_str(&format!("Input tokens: {}\n", report.input_tokens));
+    render_thresholds(&mut out, thresholds);
+    render_calibration(
+        &mut out,
+        "Pre-check (`accept`; positive: an offered option was chosen)",
+        &report.pre_check_calibration,
+    );
+    render_calibration(
+        &mut out,
+        "Option (top probability; positive: the operator chose Jev's pick)",
+        &report.option_calibration,
+    );
+    out.push_str(&format!(
+        "\n## Recommendation baseline (D-10)\n\nOverall: {}\n",
+        baseline_text(report.baseline_overall)
+    ));
+    let answered = report.baseline_answered.map_or_else(
+        || "not applicable (escalate-all)".to_string(),
+        baseline_text,
+    );
+    out.push_str(&format!("At the chosen thresholds: {answered}\n"));
+    out
+}
+
+fn render_thresholds(out: &mut String, thresholds: &ChosenThresholds) {
+    out.push_str(&format!(
+        "\n## Thresholds (D-07, D-24)\n\nRule: the lowest observed score t at which at least \
+         {MIN_ANSWERED} questions score >= t and at least {MIN_AGREEMENT_PERCENT}% of them \
+         agree.\n"
+    ));
+    out.push_str(&format!(
+        "Pre-check threshold: {}\n",
+        choice_text(thresholds.pre_check, "option answers")
+    ));
+    out.push_str(&format!(
+        "Option threshold: {}\n",
+        choice_text(thresholds.option, "agreeing")
+    ));
+    let result = thresholds.both().map_or_else(
+        || "escalate-all".to_string(),
+        |(pre_check, option)| format!("pre-check {pre_check}, option {option}"),
+    );
+    out.push_str(&format!("Result: {result}\n"));
+}
+
+fn choice_text(choice: ThresholdChoice, agreeing_name: &str) -> String {
+    match choice {
+        ThresholdChoice::Chosen {
+            threshold,
+            answered,
+            agreeing,
+        } => format!("{threshold} (answered {answered}, {agreeing_name} {agreeing})"),
+        ThresholdChoice::NoneQualifies => "none qualifies".to_string(),
+        ThresholdChoice::NotComputed => "not computed (no pre-check threshold)".to_string(),
+    }
+}
+
+fn render_calibration(out: &mut String, title: &str, buckets: &[CalibrationBucket]) {
+    out.push_str(&format!(
+        "\n### {title}\n\n| Bucket | n | positives |\n|---|---|---|\n"
+    ));
+    for bucket in buckets {
+        let lower = f64::from(bucket.bucket) / f64::from(CALIBRATION_BUCKETS);
+        let upper = f64::from(bucket.bucket + 1) / f64::from(CALIBRATION_BUCKETS);
+        let close = if bucket.bucket + 1 == CALIBRATION_BUCKETS {
+            ']'
+        } else {
+            ')'
+        };
+        out.push_str(&format!(
+            "| [{lower:.1}, {upper:.1}{close} | {} | {} |\n",
+            bucket.n, bucket.positives
+        ));
+    }
+}
+
+fn baseline_text(baseline: Baseline) -> String {
+    format!(
+        "{} of {} questions with a known recommendation",
+        baseline.picked, baseline.known
+    )
 }
 
 #[cfg(test)]

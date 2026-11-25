@@ -22,6 +22,8 @@ mod ask_server;
 
 mod triage_client;
 
+mod triage_score;
+
 mod phase_worktree;
 
 mod service;
@@ -141,6 +143,23 @@ enum Command {
         /// `pending`; absent holds a call until its question ends.
         #[arg(long)]
         hold_cap_secs: Option<u64>,
+    },
+    /// Internal: measure Jev on the operator's past answers (D-01, D-04).
+    ///
+    /// Mines every named project, scores each question leave-one-out with the request
+    /// a run sends, and writes the corpus, the scores and a counts-only report under
+    /// the user data dir. Hidden: a one-off measurement, not an operator workflow.
+    #[command(name = "__triage-score", hide = true)]
+    Score {
+        /// A project to mine, as `<name>=<path>`; repeatable.
+        #[arg(long = "project", value_name = "NAME=PATH", required = true)]
+        projects: Vec<triage_score::ProjectArg>,
+        /// A project's phase whose labels are left out, as `<name>:<phase>`; repeatable.
+        #[arg(long = "exclude", value_name = "NAME:PHASE")]
+        excludes: Vec<triage_score::ExcludeArg>,
+        /// The Jev model to score with.
+        #[arg(long, default_value = devflow_core::triage::DEFAULT_MODEL)]
+        model: String,
     },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
@@ -589,6 +608,15 @@ fn run() -> Result<(), CliError> {
             let _ = std::io::stdout().flush();
             std::process::exit(code)
         }
+        Command::Score {
+            projects,
+            excludes,
+            model,
+        } => triage_score::run_score(&triage_score::ScoreArgs {
+            projects,
+            excludes,
+            model,
+        }),
         Command::Resume {
             phase,
             agent,

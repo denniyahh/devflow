@@ -9,6 +9,8 @@
 
 use std::time::Duration;
 
+use devflow_core::triage::FallbackReason;
+
 /// TypeSafe's API host, the one remote host the key may be sent to.
 pub(crate) const TYPESAFE_API_HOST: &str = "api.typesafe.ai";
 
@@ -60,6 +62,20 @@ pub(crate) enum TransportFailure {
     HttpStatus { status: u16 },
     #[error("the endpoint's reply was not JSON")]
     NotJson,
+}
+
+impl TransportFailure {
+    /// The fallback this failure records.
+    pub(crate) fn fallback_reason(&self) -> FallbackReason {
+        match self {
+            Self::NoApiKey => FallbackReason::NoApiKey,
+            Self::EndpointRefused => FallbackReason::EndpointRefused,
+            Self::Unreachable => FallbackReason::Unreachable,
+            Self::Timeout => FallbackReason::Timeout,
+            Self::HttpStatus { .. } => FallbackReason::HttpStatus,
+            Self::NotJson => FallbackReason::Unparsable,
+        }
+    }
 }
 
 /// A fixed reason per documented Jev error code; never the endpoint's text.

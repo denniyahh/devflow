@@ -567,7 +567,7 @@ pub fn pre_decide(kind: QuestionKind, config: &TriageConfig) -> Option<TriageOut
 }
 
 /// Whether `score` reaches `threshold` (D-24's `>=`). A NaN never reaches.
-fn reaches(score: f64, threshold: f64) -> bool {
+pub(crate) fn reaches(score: f64, threshold: f64) -> bool {
     score >= threshold
 }
 
