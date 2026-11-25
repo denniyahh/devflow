@@ -3824,6 +3824,62 @@ fn resolve_single_open_gate_stage(open: &[OpenGate], phase: PhaseId) -> Result<S
     }
 }
 
+/// The variable a delegated agent session sets so its gate answers are
+/// recorded as the agent's, not the operator's (#343, D-13).
+const ANSWERED_BY_ENV: &str = "DEVFLOW_ANSWERED_BY";
+
+/// The longest agent name `agent:<name>` accepts.
+const AGENT_NAME_MAX: usize = 32;
+
+/// Who is answering a gate: [`answerer_from`] over this process's environment.
+fn answerer() -> Result<String, CliError> {
+    answerer_from(
+        std::env::var_os("DEVFLOW_ANSWERED_BY"),
+        std::env::var("USER").ok(),
+    )
+}
+
+/// Who is answering a gate. With no marker it is the operator: `user` when it
+/// is non-empty, else `devflow-cli`. A marker must be `agent:<name>` (`<name>`
+/// 1-32 of `[a-z0-9_-]`, starting alphanumeric) and is returned unchanged;
+/// every other marker is refused, before anything is written. `triage:*` is
+/// refused on its own terms: only DevFlow's triage records a triage answer.
+fn answerer_from(
+    marker: Option<std::ffi::OsString>,
+    user: Option<String>,
+) -> Result<String, CliError> {
+    let Some(marker) = marker else {
+        return Ok(user
+            .filter(|user| !user.is_empty())
+            .unwrap_or_else(|| "devflow-cli".into()));
+    };
+    let value = marker.to_string_lossy();
+    if value.starts_with("triage:") {
+        return Err(CliError::Message(format!(
+            "{ANSWERED_BY_ENV}={value:?} is refused: only DevFlow's triage records a triage answer, \
+             and no shell verb may claim one; nothing was written"
+        )));
+    }
+    if value.strip_prefix("agent:").is_some_and(is_agent_name) {
+        return Ok(value.into_owned());
+    }
+    Err(CliError::Message(format!(
+        "{ANSWERED_BY_ENV}={value:?} is refused: set it to agent:<name> (lowercase letters, \
+         digits, - or _, up to {AGENT_NAME_MAX}) when an agent answers for the operator, or unset \
+         it to answer as the operator; nothing was written"
+    )))
+}
+
+/// Whether `name` is an agent name `agent:<name>` accepts.
+fn is_agent_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= AGENT_NAME_MAX
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
 /// The three answers an operator can give a gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GateAnswerKind {
@@ -3889,10 +3945,7 @@ pub(crate) fn gate_respond_report(
     };
     require_gate_file_names(project_root, phase, stage, &observed)?;
     refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
-    let responded_by = std::env::var("USER")
-        .ok()
-        .filter(|user| !user.is_empty())
-        .unwrap_or_else(|| "devflow-cli".into());
+    let responded_by = answerer()?;
     let response = GateResponse {
         approved: kind == GateAnswerKind::Approve,
         abort: kind == GateAnswerKind::Abort,
@@ -4004,10 +4057,7 @@ pub(crate) fn gate_answer_report(
     };
     require_gate_file_names(project_root, phase, stage, &observed)?;
     refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
-    let responded_by = std::env::var("USER")
-        .ok()
-        .filter(|user| !user.is_empty())
-        .unwrap_or_else(|| "devflow-cli".into());
+    let responded_by = answerer()?;
     let gate =
         crate::pipeline_gate::read_gate_file(project_root, phase, stage).ok_or_else(|| {
             CliError::Message(format!(
