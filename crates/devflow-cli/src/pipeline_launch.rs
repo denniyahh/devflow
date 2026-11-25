@@ -2650,6 +2650,16 @@ fn resume_loaded(
             .unwrap_or_else(|| project_root.to_path_buf());
         require_reviews_file_in_checkout(&launch_root, phase)?;
     }
+    // D-09, restrictive verbs: `--no-triage` is judged beside `--reviews`, before any write.
+    if no_triage
+        && let Some(refusal) = crate::commands::no_triage_refusal(
+            crate::commands::LaunchVerb::Resume,
+            project_root,
+            state.triage_off,
+        )
+    {
+        return Err(refusal);
+    }
     // 999.251 (D-02): a run its own `--until` cap halted resumes at the next stage;
     // any other stop reruns the stage it stopped in.
     let saved_stage = state.stage;
@@ -9314,6 +9324,74 @@ mod tests {
         assert!(
             crate::service::double::launched_units().is_empty(),
             "resume_loaded launches nothing: its caller launches the runner unit"
+        );
+    }
+
+    /// A stopped Code run of `phase` under a fresh repo at `root`, saved with
+    /// `triage_off`, and its state file's bytes.
+    fn saved_run_for_no_triage(root: &Path, phase: PhaseId, triage_off: bool) -> (State, Vec<u8>) {
+        init_repo(root);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        state.stopped = true;
+        state.triage_off = triage_off;
+        workflow::save_state(&state).unwrap();
+        let bytes = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        (state, bytes)
+    }
+
+    /// D-09: `resume --no-triage` on a run that already has triage off is refused
+    /// before any write.
+    #[test]
+    fn resume_no_triage_is_refused_when_already_off() {
+        const NAME: &str = "pipeline_launch::tests::resume_no_triage_is_refused_when_already_off";
+        enter_agent_free_child!(NAME, "codex");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5486);
+        let (state, before) = saved_run_for_no_triage(root, phase, true);
+        std::fs::write(root.join("devflow.toml"), "[triage]\nenabled = true\n").unwrap();
+
+        let error = resume_loaded(root, phase, state, None, None, false, true)
+            .expect_err("a run already off refuses --no-triage")
+            .to_string();
+
+        assert!(error.contains("--no-triage"), "{error}");
+        assert!(error.contains("already off"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "a refused resume writes nothing"
+        );
+    }
+
+    /// D-09: `resume --no-triage` on a project whose devflow.toml does not enable
+    /// triage is refused before any write, naming the key.
+    #[test]
+    fn resume_no_triage_is_refused_when_triage_is_not_enabled() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_no_triage_is_refused_when_triage_is_not_enabled";
+        enter_agent_free_child!(NAME, "codex");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5487);
+        let (state, before) = saved_run_for_no_triage(root, phase, false);
+
+        let error = resume_loaded(root, phase, state, None, None, false, true)
+            .expect_err("a project without triage refuses --no-triage")
+            .to_string();
+
+        assert!(error.contains("--no-triage"), "{error}");
+        assert!(error.contains("devflow.toml's [triage] enabled"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "a refused resume writes nothing"
         );
     }
 

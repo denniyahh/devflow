@@ -399,6 +399,10 @@ pub(crate) fn start(
     }
 
     // D-09: judged with the other refusals before `dry_run`, so a dry run prints it too.
+    // D-09: judged with the other refusals before `dry_run`, so a dry run prints it too.
+    if no_triage && let Some(refusal) = no_triage_refusal(LaunchVerb::Start, project_root, false) {
+        return Err(refusal);
+    }
     state.triage_off = no_triage;
 
     if dry_run {
@@ -781,6 +785,27 @@ fn dry_run_not_checked_line(phase: PhaseId, base: &str, reviews: bool) -> String
          reachability (phase {phase} on `{base}`), and the CONTEXT.md/PLAN.md checks on \
          `{base}`{reviews_check}; a real start runs them after these checks"
     )
+}
+
+/// D-09, restrictive verbs: `--no-triage` has one job, turning decision triage off for
+/// this run, so it is refused where it would change nothing: on a project whose
+/// devflow.toml does not enable triage, and on a run that already has triage off.
+pub(crate) fn no_triage_refusal(
+    verb: LaunchVerb,
+    project_root: &Path,
+    already_off: bool,
+) -> Option<CliError> {
+    let verb = verb.label();
+    let reason = if !config::triage_config(project_root).enabled {
+        "devflow.toml's [triage] enabled is not true, so triage does not run for this project"
+    } else if already_off {
+        "triage is already off for this run"
+    } else {
+        return None;
+    };
+    Some(CliError::Message(format!(
+        "{verb}: --no-triage is refused: {reason}; {verb} without --no-triage"
+    )))
 }
 
 /// The refusal of a `--reviews` launch (D-04, #250) whose phase has no REVIEWS.md at
