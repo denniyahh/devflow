@@ -329,7 +329,9 @@ const NOT_TRIAGED: &str = "not_triaged";
 
 /// Fold the phase's question events from `.devflow/events.jsonl` into its
 /// ledger. Only the first answer or close of a question applies, as in
-/// `devflow history`; overrides apply in log order.
+/// `devflow history`; overrides apply in log order. The last `question_asked`
+/// of a question sets its triage outcome and gate; it keeps the first one's
+/// place.
 pub fn ledger(project_root: &Path, phase: PhaseId) -> Ledger {
     let events = phase_events(project_root, phase);
     let mut entries: Vec<LedgerEntry> = Vec::new();
@@ -341,7 +343,11 @@ pub fn ledger(project_root: &Path, phase: PhaseId) -> Ledger {
         let Some(id) = string_field(event, "question_id") else {
             continue;
         };
-        if positions.contains_key(&id) {
+        // A later ask of the same question (an escalation of a decision whose
+        // answer could not be recorded) replaces it in the first one's place.
+        if let Some(&index) = positions.get(&id) {
+            let first_asked_at = entries[index].asked_at;
+            entries[index] = asked_entry(id, first_asked_at, event);
             continue;
         }
         positions.insert(id.clone(), entries.len());
