@@ -46,8 +46,7 @@ pub fn try_emit(
     event: &str,
     fields: serde_json::Value,
 ) -> std::io::Result<()> {
-    let _ = (project_root, phase, event, fields);
-    Ok(())
+    append_event(project_root, phase, event, fields).map_err(AppendError::into_io)
 }
 
 /// [`emit`], writing the warning line for an event it could not record to
@@ -60,6 +59,63 @@ fn emit_to(
     fields: serde_json::Value,
     sink: &mut dyn Write,
 ) {
+    match append_event(project_root, phase, event, fields) {
+        Ok(()) => {}
+        Err(AppendError::Dir { path, source }) => {
+            warn!("could not create events dir: {source}");
+            let _ = writeln!(
+                sink,
+                "warning: could not record the `{event}` event: could not create {} ({source})",
+                path.display()
+            );
+        }
+        Err(AppendError::Append { path, source }) => {
+            warn!("could not append to {}: {source}", path.display());
+            let _ = writeln!(
+                sink,
+                "warning: could not record the `{event}` event in {} ({source})",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Why an event line was not appended.
+enum AppendError {
+    /// The events directory could not be created.
+    Dir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The log could not be opened or written.
+    Append {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl AppendError {
+    /// The error as an `io::Error` naming the path it concerns.
+    fn into_io(self) -> std::io::Error {
+        let (what, path, source) = match self {
+            AppendError::Dir { path, source } => ("create", path, source),
+            AppendError::Append { path, source } => ("append to", path, source),
+        };
+        std::io::Error::new(
+            source.kind(),
+            format!("could not {what} {} ({source})", path.display()),
+        )
+    }
+}
+
+/// Build the event line and append it: the one line format [`emit`] and
+/// [`try_emit`] share.
+fn append_event(
+    project_root: &Path,
+    phase: PhaseId,
+    event: &str,
+    fields: serde_json::Value,
+) -> Result<(), AppendError> {
     let mut line = serde_json::json!({
         "v": SCHEMA_VERSION,
         "ts": unix_now(),
@@ -82,29 +138,19 @@ fn emit_to(
     }
     let path = events_path(project_root);
     if let Some(parent) = path.parent()
-        && let Err(err) = crate::workflow::ensure_devflow_dir(parent)
+        && let Err(source) = crate::workflow::ensure_devflow_dir(parent)
     {
-        warn!("could not create events dir: {err}");
-        let _ = writeln!(
-            sink,
-            "warning: could not record the `{event}` event: could not create {} ({err})",
-            parent.display()
-        );
-        return;
+        return Err(AppendError::Dir {
+            path: parent.to_path_buf(),
+            source,
+        });
     }
-    let result = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
-    if let Err(err) = result {
-        warn!("could not append to {}: {err}", path.display());
-        let _ = writeln!(
-            sink,
-            "warning: could not record the `{event}` event in {} ({err})",
-            path.display()
-        );
-    }
+        .and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()))
+        .map_err(|source| AppendError::Append { path, source })
 }
 
 /// A phase's latest event plus its newest matching `stage_launched`
@@ -218,10 +264,14 @@ pub fn has_event_for_phase(project_root: &Path, phase: PhaseId, event: &str) -> 
 /// - `question_asked`: `stage`, `question_id`, `gate_id`, `kind`
 ///   (`decision` | `blocking-human` | `discuss`), `question`, `options`
 ///   (array of `{id, label, description?}` in payload order), `context`
-///   (string or null), `recommended` (option id or null).
+///   (string or null), `recommended` (option id or null), `run_started_at`
+///   (the run's `started_at`) and, when triage ran, `triage` (the object
+///   [`crate::triage::TriageOutcome::event_fields`] renders). `gate_id` is
+///   absent for a question triage decided, since no gate was written.
 /// - `question_answered`: `stage`, `question_id`, `gate_id`, `answer`
 ///   (`{option_id}` or `{text}`), `policy`
-///   ([`ANSWERING_POLICY_OPERATOR_VIA_GATE`]), `answered_by`.
+///   ([`ANSWERING_POLICY_OPERATOR_VIA_GATE`], or [`ANSWERING_POLICY_TRIAGE`]
+///   with `answered_by` [`crate::triage::TRIAGE_ANSWERER`]), `answered_by`.
 /// - `question_closed`: `stage`, `question_id`, `gate_id`, `reason` (one of
 ///   `cancelled_by_client`, `client_disconnected`, `terminated`,
 ///   `run_stopped`, `runner_gone`, `timed_out`, `aborted_by_operator`,
@@ -234,6 +284,24 @@ pub const QUESTION_CLOSED: &str = "question_closed";
 /// The `policy` value of a `question_answered` event: the operator answered
 /// the question gate.
 pub const ANSWERING_POLICY_OPERATOR_VIA_GATE: &str = "operator_via_gate";
+/// The `policy` value of a `question_answered` event: triage answered the
+/// question.
+pub const ANSWERING_POLICY_TRIAGE: &str = "triage";
+/// Triage could not score a question, so it went to the operator. Fields:
+/// `question_id`, `run_started_at`, `reason`
+/// ([`crate::triage::FallbackReason::as_str`]), `detail`. `detail` never
+/// carries response-body text or the API key: an HTTP failure is
+/// `HTTP <code> <fixed reason>`.
+pub const TRIAGE_FALLBACK: &str = "triage_fallback";
+/// The operator replaced an answer triage gave. Fields: `question_id`,
+/// `override_id` (a fresh [`crate::question::new_question_id`]), `answer`,
+/// `was` (the triage answer it replaces), `overridden_by`, `run_started_at`.
+pub const QUESTION_OVERRIDDEN: &str = "question_overridden";
+/// A launched agent's prompt carried these overrides. Fields:
+/// `run_started_at`, `override_ids` (array of `override_id`).
+pub const OVERRIDES_DELIVERED: &str = "overrides_delivered";
+/// A run was discarded. Fields: `started_at` (the discarded run's).
+pub const RUN_DISCARDED: &str = "run_discarded";
 
 /// Render an event as a short human-readable summary ("gate_fired (ship)").
 pub fn describe(event: &serde_json::Value) -> String {

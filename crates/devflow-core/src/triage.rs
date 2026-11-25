@@ -406,7 +406,18 @@ pub fn decide(scores: &JevScores, config: &TriageConfig) -> TriageOutcome {
 /// `blocking-human` question (D-08), then any question while a threshold is
 /// unset (D-07). `None` means the question is to be scored.
 pub fn pre_decide(kind: QuestionKind, config: &TriageConfig) -> Option<TriageOutcome> {
-    let _ = (kind, config);
+    let skip = |reason| {
+        Some(TriageOutcome::Escalated {
+            reason,
+            scores: None,
+        })
+    };
+    if kind == QuestionKind::BlockingHuman {
+        return skip(EscalateReason::BlockingHuman);
+    }
+    if config.threshold.is_none() || config.pre_check_threshold.is_none() {
+        return skip(EscalateReason::NoThreshold);
+    }
     None
 }
 
