@@ -155,6 +155,8 @@ pub struct AskOverrides {
     pub timeout_secs: Option<u64>,
     /// A `--hold-cap-secs`, which the fixture's server otherwise has none of.
     pub hold_cap_secs: Option<u64>,
+    /// Variables set on the server process only, never on the test's own.
+    pub env: Vec<(String, String)>,
 }
 
 /// A running `devflow __ask` and the lines it has written to stdout.
@@ -171,7 +173,7 @@ impl AskClient {
     }
 
     /// `devflow __ask` for the fixture's run, with `overrides` replacing its
-    /// `--run-started-at` or `--timeout-secs`.
+    /// `--run-started-at` or `--timeout-secs` and adding to its environment.
     pub fn spawn_with(fixture: &AskFixture, overrides: AskOverrides) -> Self {
         let run_started_at = overrides
             .run_started_at
@@ -195,6 +197,7 @@ impl AskClient {
             )
             // The hook a test means comes from the saved state alone.
             .env_remove(devflow_core::gates::GATE_NOTIFY_CMD_ENV)
+            .envs(overrides.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

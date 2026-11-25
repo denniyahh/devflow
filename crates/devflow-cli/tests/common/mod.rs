@@ -693,8 +693,26 @@ fn scrubbed(mut command: Command, home: &HermeticHome) -> Command {
     {
         command.env_remove(name);
     }
+    // No test reaches TypeSafe with the developer's key, and none sends a
+    // loopback fake's request through the developer's proxy.
+    for name in TYPESAFE_VARS.iter().chain(PROXY_VARS) {
+        command.env_remove(name);
+    }
     command
 }
+
+/// The TypeSafe SDK's variables, which a test sets only to a loopback fake.
+pub const TYPESAFE_VARS: &[&str] = &["TYPESAFE_API_KEY", "TYPESAFE_BASE_URL"];
+
+/// The proxy variables ureq reads from the environment.
+const PROXY_VARS: &[&str] = &[
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
 
 /// A directory of stub programs to put first on a child's `PATH`. Removed on
 /// drop.
