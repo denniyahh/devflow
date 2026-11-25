@@ -47,6 +47,11 @@ const ACCEPT_INSTRUCTIONS: &str = "Would the operator accept one of the offered 
 const PICK_INSTRUCTIONS: &str = "Which offered option would this operator choose for \
      `question`, given `context` and how they answered `precedents`?";
 
+/// How far the offered options' probabilities may sum from 1 and still be a
+/// complete distribution: per-value rounding over up to
+/// [`crate::question::MAX_OPTIONS`] values.
+pub const PROBABILITY_SUM_TOLERANCE: f64 = 0.01;
+
 /// The longest response-supplied value a fallback detail repeats.
 const DETAIL_VALUE_MAX_CHARS: usize = 64;
 
@@ -283,8 +288,12 @@ fn options_state(options: &[QuestionOption]) -> Value {
         .map(|option| {
             let mut entry = Map::new();
             entry.insert("id".into(), json!(option.id));
-            entry.insert("label".into(), json!(option.label));
+            entry.insert(
+                "label".into(),
+                json!(strip_recommended_marker(&option.label).0),
+            );
             if let Some(description) = &option.description {
+                let description = strip_recommended_marker(description).0;
                 entry.insert("description".into(), json!(description));
             }
             Value::Object(entry)
@@ -307,15 +316,70 @@ fn precedent_state(precedent: &Precedent) -> Value {
 }
 
 /// `text` without a recommendation marker, and whether one was removed (D-10).
+///
+/// Removed, case-insensitively: every parenthesized or bracketed group whose
+/// first word is `recommended`, whatever follows inside it, and a trailing
+/// `— recommended…` or `- recommended…`. The word inside ordinary prose, and
+/// a group whose first word is another word, are kept.
 pub fn strip_recommended_marker(text: &str) -> (String, bool) {
-    (text.to_string(), false)
+    let mut kept = String::with_capacity(text.len());
+    let mut removed = false;
+    let mut rest = text;
+    while let Some(open) = rest.find(['(', '[']) {
+        let closer = if rest[open..].starts_with('(') {
+            ')'
+        } else {
+            ']'
+        };
+        let inside = &rest[open + 1..];
+        match inside.find(closer) {
+            Some(close) if starts_with_recommended(&inside[..close]) => {
+                kept.push_str(&rest[..open]);
+                rest = &inside[close + 1..];
+                removed = true;
+            }
+            _ => {
+                kept.push_str(&rest[..=open]);
+                rest = inside;
+            }
+        }
+    }
+    kept.push_str(rest);
+    if let Some(dash) = trailing_recommended_dash(&kept) {
+        kept.truncate(dash);
+        removed = true;
+    }
+    if !removed {
+        return (text.to_string(), false);
+    }
+    (kept.split_whitespace().collect::<Vec<_>>().join(" "), true)
+}
+
+/// Whether the first word of `text` is `recommended`, in any case.
+fn starts_with_recommended(text: &str) -> bool {
+    text.trim_start()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("recommended"))
+}
+
+/// Where a trailing `— recommended…` (em dash, en dash or hyphen, after
+/// whitespace) starts in `text`.
+fn trailing_recommended_dash(text: &str) -> Option<usize> {
+    text.char_indices().find_map(|(index, ch)| {
+        let dash = matches!(ch, '—' | '–' | '-');
+        let after_space = text[..index].ends_with(char::is_whitespace);
+        (dash && after_space && starts_with_recommended(&text[index + ch.len_utf8()..]))
+            .then_some(index)
+    })
 }
 
 /// An option's `pick` criterion: `label — description`, or the label alone.
 fn criterion(option: &QuestionOption) -> String {
+    let (label, _) = strip_recommended_marker(&option.label);
     match &option.description {
-        Some(description) => format!("{} — {}", option.label, description),
-        None => option.label.clone(),
+        Some(description) => format!("{label} — {}", strip_recommended_marker(description).0),
+        None => label,
     }
 }
 
@@ -326,7 +390,6 @@ pub fn parse_jev_response(
     spec: &QuestionSpec,
     expected_model: &str,
 ) -> Result<JevScores, (FallbackReason, String)> {
-    let _ = spec;
     let model = text_at(body, &["model"])?;
     if model != expected_model {
         return Err((
@@ -337,15 +400,90 @@ pub fn parse_jev_response(
             ),
         ));
     }
-    let accept = number_at(body, &["answers", "accept", "noul"])?;
+    expect_type(body, "accept", "noul")?;
+    expect_type(body, "pick", "choice")?;
+    let accept = probability_at(body, &["answers", "accept", "noul"])?;
     let choice = text_at(body, &["answers", "pick", "choice"])?;
-    let top_probability = number_at(body, &["answers", "pick", "probabilities", choice])?;
+    if !spec.options.iter().any(|option| option.id == choice) {
+        return Err(unparsable(
+            &["answers", "pick", "choice"],
+            &format!("`{}` is not an offered option", bounded(choice)),
+        ));
+    }
+    let distribution = complete_distribution(body, spec)?;
+    let top_probability = distribution
+        .iter()
+        .find_map(|(id, probability)| (*id == choice).then_some(*probability))
+        .ok_or_else(|| unparsable(&["answers", "pick", "probabilities"], "lacks the choice"))?;
     Ok(JevScores {
         accept,
         top_option: choice.to_string(),
         top_probability,
         model: model.to_string(),
     })
+}
+
+/// Check that `answers.<question>.type` is `expected`.
+fn expect_type(
+    body: &Value,
+    question: &str,
+    expected: &str,
+) -> Result<(), (FallbackReason, String)> {
+    let path = ["answers", question, "type"];
+    let found = text_at(body, &path)?;
+    if found == expected {
+        return Ok(());
+    }
+    Err(unparsable(
+        &path,
+        &format!("is `{}`, expected `{expected}`", bounded(found)),
+    ))
+}
+
+/// `answers.pick.probabilities` as (option id, probability) pairs, checked to
+/// hold exactly the offered ids, each in [0, 1], summing to 1 within
+/// [`PROBABILITY_SUM_TOLERANCE`].
+fn complete_distribution<'a>(
+    body: &Value,
+    spec: &'a QuestionSpec,
+) -> Result<Vec<(&'a str, f64)>, (FallbackReason, String)> {
+    let path = ["answers", "pick", "probabilities"];
+    let probabilities = value_at(body, &path)?
+        .as_object()
+        .ok_or_else(|| unparsable(&path, "is not an object"))?;
+    if let Some(extra) = probabilities
+        .keys()
+        .find(|key| !spec.options.iter().any(|option| &option.id == *key))
+    {
+        let problem = format!("has `{}`, which was not offered", bounded(extra));
+        return Err(unparsable(&path, &problem));
+    }
+    let mut distribution = Vec::with_capacity(spec.options.len());
+    for option in &spec.options {
+        if !probabilities.contains_key(&option.id) {
+            let problem = format!("has no `{}`", bounded(&option.id));
+            return Err(unparsable(&path, &problem));
+        }
+        let probability = probability_at(body, &["answers", "pick", "probabilities", &option.id])?;
+        distribution.push((option.id.as_str(), probability));
+    }
+    let sum: f64 = distribution
+        .iter()
+        .map(|(_, probability)| probability)
+        .sum();
+    if (sum - 1.0).abs() > PROBABILITY_SUM_TOLERANCE {
+        return Err(unparsable(&path, &format!("sums to {sum}, not 1")));
+    }
+    Ok(distribution)
+}
+
+/// The number at `path`, checked to be a probability in [0, 1].
+fn probability_at(body: &Value, path: &[&str]) -> Result<f64, (FallbackReason, String)> {
+    let number = number_at(body, path)?;
+    if number.is_finite() && (0.0..=1.0).contains(&number) {
+        return Ok(number);
+    }
+    Err(unparsable(path, &format!("is {number}, not in [0, 1]")))
 }
 
 /// The value at `path`, or an `Unparsable` naming the missing field.
