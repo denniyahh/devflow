@@ -46,8 +46,9 @@ Anything else your final message must contain, such as the reasoning for a decis
 DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.";
 
 /// The question policy every stage prompt carries (ASK-03, 53-CONTEXT.md D-12):
-/// every question an agent meets goes to the operator through the `devflow_ask`
-/// tool, and the agent never answers one itself. A macro for the same `concat!`
+/// every question an agent meets goes through the `devflow_ask` tool and is
+/// answered by the operator or by triage on the operator's policy (TRIAGE-01),
+/// and the agent never answers one itself. A macro for the same `concat!`
 /// reason as [`checkpoint_declaration`]; [`ASK_POLICY`] is its one expansion,
 /// and each stage builder places it just before the completion contract.
 ///
@@ -58,7 +59,7 @@ DevFlow reads this line to decide whether the stage succeeded. Output nothing af
 macro_rules! ask_policy {
     () => {
         "\
-## Questions go to the operator\n\
+## Questions go through `devflow_ask`\n\
 \n\
 When you reach a decision checkpoint, a `blocking-human` gate, a package-verification \
 checkpoint, or a question a GSD workflow would ask the user (including a discuss \
@@ -67,7 +68,9 @@ it: Claude Code lists it as `mcp__devflow__devflow_ask`, and codex as tool `devf
 of server `devflow`; call the name your tool list shows for that server's `devflow_ask`. \
 Pass the question, every option as `{id, label, description}`, the context the operator \
 needs, `kind` (`decision`, `blocking-human` or `discuss`), and `recommended` if one option \
-is recommended. Wait for the answer and apply exactly that answer. Do not choose an option \
+is recommended. Wait for the answer and apply exactly that answer. The operator answers, \
+or DevFlow triage answers on the operator's triage policy; the result's `answered_by` says \
+which, and your final message records it with the answer. Do not choose an option \
 yourself, do not choose by position, and do not stop with a report instead of asking. When \
 a GSD subagent you ran stops at such a point, you ask and pass the answer on. Record the \
 question and the answer you received in your final message.\n\
@@ -1021,7 +1024,7 @@ mod tests {
             assert!(prompt.contains(angle), "Code prompt missing angle: {angle}");
         }
         assert!(
-            prompt.contains("## Questions go to the operator"),
+            prompt.contains("## Questions go through `devflow_ask`"),
             "Code prompt must carry the question policy"
         );
         assert!(
@@ -1757,6 +1760,38 @@ mod tests {
         assert!(
             missing_ask_policy_fragments(&without_recall).contains(&"question_id"),
             "{without_recall}"
+        );
+    }
+
+    /// The fragments of the question policy's answerer statement (RESEARCH
+    /// Pitfall 5) that `policy` lacks.
+    fn missing_answerer_fragments(policy: &str) -> Vec<&'static str> {
+        [
+            "## Questions go through `devflow_ask`\n",
+            "DevFlow triage",
+            "the operator's triage policy",
+            "`answered_by`",
+        ]
+        .into_iter()
+        .filter(|fragment| !policy.contains(fragment))
+        .collect()
+    }
+
+    /// TRIAGE-01: with triage on, DevFlow answers some questions, so the policy
+    /// says who may answer and that the result's `answered_by` names which.
+    #[test]
+    fn the_ask_policy_says_who_may_answer() {
+        assert_eq!(missing_answerer_fragments(ASK_POLICY), Vec::<&str>::new());
+
+        // Control: the policy without its answerer sentence is reported.
+        let answerer_sentence = ASK_POLICY
+            .split(". ")
+            .find(|sentence| sentence.contains("answered_by"))
+            .expect("the policy has a sentence naming answered_by");
+        let without_answerer = ASK_POLICY.replace(answerer_sentence, "");
+        assert!(
+            missing_answerer_fragments(&without_answerer).contains(&"`answered_by`"),
+            "{without_answerer}"
         );
     }
 
