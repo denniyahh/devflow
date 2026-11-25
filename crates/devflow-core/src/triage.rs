@@ -363,11 +363,30 @@ fn bounded(value: &str) -> String {
 /// Decide `scores` by D-24: decided only when `accept >= pre_check_threshold`
 /// and `top_probability >= threshold`.
 pub fn decide(scores: &JevScores, config: &TriageConfig) -> TriageOutcome {
-    let _ = config;
-    TriageOutcome::Escalated {
-        reason: EscalateReason::NoThreshold,
+    let escalate = |reason| TriageOutcome::Escalated {
+        reason,
         scores: Some(scores.clone()),
+    };
+    let (Some(threshold), Some(pre_check_threshold)) =
+        (config.threshold, config.pre_check_threshold)
+    else {
+        return escalate(EscalateReason::NoThreshold);
+    };
+    if !reaches(scores.accept, pre_check_threshold) {
+        return escalate(EscalateReason::PreCheckBelowThreshold);
     }
+    if !reaches(scores.top_probability, threshold) {
+        return escalate(EscalateReason::TopProbabilityBelowThreshold);
+    }
+    TriageOutcome::Decided {
+        option_id: scores.top_option.clone(),
+        scores: scores.clone(),
+    }
+}
+
+/// Whether `score` reaches `threshold` (D-24's `>=`). A NaN never reaches.
+fn reaches(score: f64, threshold: f64) -> bool {
+    score >= threshold
 }
 
 #[cfg(test)]
