@@ -406,4 +406,285 @@ mod tests {
             "keep it simple"
         );
     }
+
+    fn overridden(qid: &str, phase: Value, answer: Value, by: &str, ts: u64) -> Value {
+        json!({
+            "v": 1, "ts": ts, "phase": phase, "event": "question_overridden",
+            "question_id": qid, "override_id": format!("o-{qid}-{ts}"),
+            "answer": answer, "was": {"option_id": "a"}, "overridden_by": by,
+            "run_started_at": 1,
+        })
+    }
+
+    fn option(id: &str) -> PrecedentAnswer {
+        PrecedentAnswer::Option {
+            option_id: id.to_string(),
+        }
+    }
+
+    fn own_words(text: &str) -> PrecedentAnswer {
+        PrecedentAnswer::OwnWords {
+            text: text.to_string(),
+        }
+    }
+
+    /// An entry whose own-words answer is its id, so a precedent names the
+    /// entry it came from.
+    fn entry(id: &str, source: CorpusSource, order: u64, question: &str) -> CorpusEntry {
+        CorpusEntry {
+            id: id.to_string(),
+            project: String::new(),
+            phase: "54".to_string(),
+            source,
+            kind: QuestionKind::Decision,
+            question: question.to_string(),
+            options: options(&[("a", "Thirty seconds")]),
+            context: None,
+            answer: own_words(id),
+            recommended: None,
+            order,
+        }
+    }
+
+    fn picked(precedents: &[Precedent]) -> Vec<String> {
+        precedents
+            .iter()
+            .map(|p| match &p.answer {
+                PrecedentAnswer::OwnWords { text } => text.clone(),
+                other => panic!("unexpected answer {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The characters `precedents` take in the Jev request, measured from
+    /// the request itself.
+    fn wire_chars(spec: &QuestionSpec, precedents: &[Precedent]) -> usize {
+        let request = crate::triage::jev_request(spec, precedents, "m");
+        request["state"]["precedents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string().chars().count())
+            .sum()
+    }
+
+    #[test]
+    fn only_operator_answers_are_labels() {
+        let (_dir, root) = project();
+        let mut events = Vec::new();
+        for (index, by) in ["op", "agent:claude", "triage:jev", "unknown"]
+            .iter()
+            .enumerate()
+        {
+            let qid = format!("q{index}");
+            let ts = 10 * index as u64;
+            events.push(asked(&qid, json!(54), "decision", "Pick a budget", ts));
+            events.push(answered(
+                &qid,
+                json!(54),
+                json!({"option_id": "a"}),
+                by,
+                ts + 1,
+            ));
+        }
+        write_events(&root, &lines(&events));
+
+        let report = mine_project(&root, "p", &[]);
+        assert_eq!(report.entries.len(), 1, "{:?}", report.entries);
+        assert_eq!(report.entries[0].id, "events:q0");
+        assert_eq!(report.excluded.non_operator, 3);
+        assert_eq!(report.excluded.unanswered, 0);
+    }
+
+    #[test]
+    fn an_excluded_phase_gives_no_labels() {
+        let (_dir, root) = project();
+        write_events(
+            &root,
+            &lines(&[
+                asked("q1", json!("53.2"), "decision", "Pick a budget", 1),
+                answered("q1", json!("53.2"), json!({"option_id": "a"}), "op", 2),
+                asked("q2", json!("53.2"), "decision", "Pick a budget", 3),
+                answered("q2", json!("53.2"), json!({"option_id": "b"}), "op", 4),
+                asked("q3", json!(54), "decision", "Pick a budget", 5),
+                answered("q3", json!(54), json!({"option_id": "b"}), "op", 6),
+            ]),
+        );
+        let excluded: PhaseId = "53.2".parse().unwrap();
+
+        let report = mine_project(&root, "p", &[excluded]);
+        assert_eq!(report.entries.len(), 1, "{:?}", report.entries);
+        assert_eq!(report.entries[0].phase, "54");
+        assert_eq!(report.excluded.excluded_phase, 2);
+    }
+
+    #[test]
+    fn an_operator_override_replaces_the_label() {
+        let (_dir, root) = project();
+        write_events(
+            &root,
+            &lines(&[
+                asked("q1", json!(54), "decision", "Pick a budget", 1),
+                answered("q1", json!(54), json!({"option_id": "a"}), "op", 2),
+                overridden("q1", json!(54), json!({"option_id": "b"}), "op", 3),
+            ]),
+        );
+
+        let report = mine_project(&root, "p", &[]);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].answer, option("b"));
+    }
+
+    #[test]
+    fn a_triage_answer_overridden_by_the_operator_is_a_label() {
+        let (_dir, root) = project();
+        write_events(
+            &root,
+            &lines(&[
+                asked("q1", json!(54), "decision", "Pick a budget", 1),
+                answered("q1", json!(54), json!({"option_id": "a"}), "triage:jev", 2),
+                overridden("q1", json!(54), json!({"option_id": "b"}), "op", 3),
+                asked("q2", json!(54), "decision", "Pick a budget", 4),
+                answered("q2", json!(54), json!({"option_id": "a"}), "triage:jev", 5),
+                overridden("q2", json!(54), json!({"option_id": "b"}), "agent:pi", 6),
+            ]),
+        );
+
+        let report = mine_project(&root, "p", &[]);
+        assert_eq!(report.entries.len(), 1, "{:?}", report.entries);
+        assert_eq!(report.entries[0].id, "events:q1");
+        assert_eq!(report.entries[0].answer, option("b"));
+        assert_eq!(report.excluded.non_operator, 1);
+    }
+
+    #[test]
+    fn a_text_answer_is_kept_as_own_words() {
+        let (_dir, root) = project();
+        write_events(
+            &root,
+            &lines(&[
+                asked("q1", json!(54), "discuss", "Pick a budget", 1),
+                answered(
+                    "q1",
+                    json!(54),
+                    json!({"text": "neither, use ninety"}),
+                    "op",
+                    2,
+                ),
+            ]),
+        );
+
+        let report = mine_project(&root, "p", &[]);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].answer, own_words("neither, use ninety"));
+        assert_eq!(report.entries[0].kind, QuestionKind::Discuss);
+    }
+
+    #[test]
+    fn precedent_ties_break_by_source_then_recency_then_id() {
+        let question = "Pick a retry budget";
+        let entries = vec![
+            entry("log:x.md:1", CorpusSource::DiscussionLog, 100, question),
+            entry("events:b", CorpusSource::Events, 5, question),
+            entry("events:a", CorpusSource::Events, 5, question),
+            entry("events:c", CorpusSource::Events, 9, question),
+        ];
+        let target = spec(question, &[("a", "Thirty seconds")]);
+
+        let first = picked(&select_precedents(&entries, &target, None));
+        assert_eq!(first, ["events:c", "events:a", "events:b", "log:x.md:1"]);
+        assert_eq!(picked(&select_precedents(&entries, &target, None)), first);
+    }
+
+    #[test]
+    fn precedents_stay_within_the_budget() {
+        let long_question = format!("Pick a retry budget {}", "x".repeat(4_000));
+        let entries: Vec<CorpusEntry> = (0..10)
+            .map(|index| {
+                entry(
+                    &format!("events:{index}"),
+                    CorpusSource::Events,
+                    index,
+                    &long_question,
+                )
+            })
+            .collect();
+        let target = spec(&long_question, &[("a", "Thirty seconds")]);
+
+        let kept = select_precedents(&entries, &target, None);
+        assert!(kept.len() <= MAX_PRECEDENTS, "{}", kept.len());
+        assert!(wire_chars(&target, &kept) <= PRECEDENT_CHAR_BUDGET);
+        let expected: Vec<String> = (0..10).rev().map(|i| format!("events:{i}")).collect();
+        assert_eq!(picked(&kept), expected[..kept.len()]);
+        let mut one_more = kept.clone();
+        one_more.push(Precedent {
+            question: long_question.clone(),
+            options: options(&[("a", "Thirty seconds")]),
+            answer: own_words(&expected[kept.len()]),
+        });
+        assert!(wire_chars(&target, &one_more) > PRECEDENT_CHAR_BUDGET);
+
+        let short: Vec<CorpusEntry> = (0..10)
+            .map(|index| {
+                entry(
+                    &format!("events:{index}"),
+                    CorpusSource::Events,
+                    index,
+                    "Pick a retry budget",
+                )
+            })
+            .collect();
+        let kept = select_precedents(&short, &target, None);
+        assert_eq!(picked(&kept), expected[..MAX_PRECEDENTS]);
+    }
+
+    #[test]
+    fn run_time_precedents_come_from_this_project_only() {
+        let parent = TempDir::new().unwrap();
+        let this = parent.path().join("this");
+        let sibling = parent.path().join("sibling");
+        std::fs::create_dir_all(&this).unwrap();
+        write_events(
+            &sibling,
+            &lines(&[
+                asked("q1", json!(54), "decision", "Pick a budget", 1),
+                answered("q1", json!(54), json!({"option_id": "a"}), "op", 2),
+            ]),
+        );
+        let target = spec("Pick a budget", &[("a", "Thirty seconds")]);
+        let config = TriageConfig::default();
+
+        assert_eq!(precedents_for(&sibling, &config, &target).len(), 1);
+        assert!(precedents_for(&this, &config, &target).is_empty());
+    }
+
+    #[test]
+    fn an_empty_project_gives_no_precedents() {
+        let (_dir, root) = project();
+        let target = spec("Pick a budget", &[("a", "Thirty seconds")]);
+
+        assert!(precedents_for(&root, &TriageConfig::default(), &target).is_empty());
+        assert_eq!(mine_project(&root, "p", &[]), MiningReport::default());
+    }
+
+    #[test]
+    fn a_torn_event_line_is_skipped_and_counted() {
+        let (_dir, root) = project();
+        let mut text = lines(&[
+            asked("q1", json!(54), "decision", "Pick a budget", 1),
+            answered("q1", json!(54), json!({"option_id": "a"}), "op", 2),
+        ]);
+        text.push("not json".to_string());
+        text.extend(lines(&[
+            asked("q2", json!(54), "decision", "Pick a budget", 3),
+            answered("q2", json!(54), json!({"option_id": "b"}), "op", 4),
+        ]));
+        text.push(r#"{"v":1,"ts":5,"phase":54,"event":"question_ask"#.to_string());
+        write_events(&root, &text);
+
+        let report = mine_project(&root, "p", &[]);
+        let ids: Vec<&str> = report.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["events:q1", "events:q2"]);
+        assert_eq!(report.excluded.unreadable_event_lines, 2);
+    }
 }
