@@ -5251,9 +5251,16 @@ fn ledger_override_report_by(
                  written. `devflow ledger {phase}` lists its questions"
             ))
         })?;
-    let previous = entry.effective_answer.clone().unwrap_or_default();
+    let previous = overridable_answer(phase, entry)?;
+    refuse_an_unusable_override(phase, entry, choice)?;
     let answer = serde_json::to_value(choice)
         .map_err(|error| CliError::Message(format!("could not encode the override: {error}")))?;
+    if answer == previous {
+        return Err(CliError::Message(format!(
+            "{} is already the answer of question {question_id}; nothing was written",
+            choice_text(&answer)
+        )));
+    }
     let override_id = devflow_core::question::new_question_id();
     let fields = serde_json::json!({
         "question_id": question_id,
@@ -5284,6 +5291,73 @@ fn ledger_override_report_by(
         choice_text(&answer),
         choice_text(&previous),
     ))
+}
+
+/// The answer an override of `entry` replaces: refused for a question still
+/// open (its gate takes the answer) and for one closed without an answer.
+fn overridable_answer(
+    phase: PhaseId,
+    entry: &history::LedgerEntry,
+) -> Result<serde_json::Value, CliError> {
+    let question_id = &entry.question_id;
+    if let Some(answer) = entry
+        .effective_answer
+        .clone()
+        .filter(|_| entry.answer.is_some())
+    {
+        return Ok(answer);
+    }
+    if let Some(reason) = &entry.closed {
+        return Err(CliError::Message(format!(
+            "question {question_id} was closed without an answer ({reason}), so there is no \
+             answer to override; nothing was written"
+        )));
+    }
+    let answer_with = match &entry.gate_id {
+        Some(gate_id) => format!("`devflow gate answer {phase} --gate-id {gate_id}`"),
+        None => format!("`devflow gate answer {phase}` (see `devflow gate list`)"),
+    };
+    Err(CliError::Message(format!(
+        "question {question_id} is still open, so there is no answer to override; nothing was \
+         written. Answer it with {answer_with}"
+    )))
+}
+
+/// Refuse an option `entry` did not offer, and an empty text answer.
+fn refuse_an_unusable_override(
+    phase: PhaseId,
+    entry: &history::LedgerEntry,
+    choice: &QuestionChoice,
+) -> Result<(), CliError> {
+    let question_id = &entry.question_id;
+    match choice {
+        QuestionChoice::Option { option_id } => {
+            let offered: Vec<&str> = entry
+                .options
+                .as_ref()
+                .and_then(|options| options.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|option| option.get("id").and_then(|id| id.as_str()))
+                .collect();
+            if offered.contains(&option_id.as_str()) {
+                return Ok(());
+            }
+            Err(CliError::Message(format!(
+                "`{option_id}` is not an option of phase {phase} question {question_id}; nothing \
+                 was written. The options offered: {}",
+                if offered.is_empty() {
+                    "(none)".into()
+                } else {
+                    offered.join(", ")
+                }
+            )))
+        }
+        QuestionChoice::Text { text } if text.is_empty() => Err(CliError::Message(format!(
+            "an empty `--text` cannot override question {question_id}; nothing was written"
+        ))),
+        QuestionChoice::Text { .. } => Ok(()),
+    }
 }
 
 /// An answer as the override reply shows it: `option <id>` or the quoted text.
@@ -7178,6 +7252,194 @@ mod tests {
             serde_json::json!({"option_id": "drop"}),
             "{json}"
         );
+    }
+
+    /// Append `lines` to the fixture's event log.
+    fn append_events(root: &Path, lines: &[serde_json::Value]) {
+        use std::io::Write as _;
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(devflow_core::events::events_path(root))
+            .unwrap();
+        for line in lines {
+            writeln!(log, "{line}").unwrap();
+        }
+    }
+
+    fn log_bytes(root: &Path) -> Vec<u8> {
+        std::fs::read(devflow_core::events::events_path(root)).unwrap()
+    }
+
+    /// Run `refused` on a fresh fixture and assert it is refused with every
+    /// `expected` text and the log is byte-identical after it.
+    fn assert_refused_unwritten(
+        refused: impl FnOnce(&Path) -> Result<String, CliError>,
+        setup: impl FnOnce(&Path),
+        expected: &[&str],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        setup(dir.path());
+        let before = log_bytes(dir.path());
+        let error = refused(dir.path())
+            .expect_err("the override was accepted")
+            .to_string();
+        for text in expected {
+            assert!(error.contains(text), "`{text}` missing from: {error}");
+        }
+        assert!(error.contains("nothing was written"), "{error}");
+        assert_eq!(
+            log_bytes(dir.path()),
+            before,
+            "the refusal wrote to the log"
+        );
+    }
+
+    /// Criterion 3 control: an id the ledger does not hold is refused and the
+    /// log is unchanged. Control: a known id in the same fixture is accepted.
+    #[test]
+    fn an_override_of_an_unknown_question_changes_nothing() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "nope", &option("drop")),
+            |_| {},
+            &["no question", "devflow ledger 54"],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        override_as_op(dir.path(), "q-decided", &option("drop"))
+            .unwrap_or_else(|error| panic!("control: a known id was refused: {error}"));
+    }
+
+    /// D-18: an escalated question still open is answered through its gate.
+    #[test]
+    fn an_override_of_an_open_question_names_gate_answer() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "q-escalated", &option("drop")),
+            |_| {},
+            &["still open", "devflow gate answer 54 --gate-id g-2"],
+        );
+    }
+
+    /// D-18: a question closed without an answer has nothing to override.
+    #[test]
+    fn an_override_of_a_closed_question_is_refused() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "q-escalated", &option("drop")),
+            |root| {
+                append_events(
+                    root,
+                    &[serde_json::json!({
+                        "v": 1, "ts": 13, "phase": 54, "event": "question_closed",
+                        "stage": "code", "question_id": "q-escalated", "reason": "run_stopped",
+                    })],
+                )
+            },
+            &["closed without an answer", "run_stopped"],
+        );
+    }
+
+    #[test]
+    fn an_override_with_an_unoffered_option_is_refused() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "q-decided", &option("z")),
+            |_| {},
+            &["`z` is not an option", "keep, drop"],
+        );
+    }
+
+    #[test]
+    fn an_override_equal_to_the_answer_is_refused() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "q-decided", &option("keep")),
+            |_| {},
+            &["already the answer"],
+        );
+    }
+
+    #[test]
+    fn an_empty_override_text_is_refused() {
+        assert_refused_unwritten(
+            |root| {
+                override_as_op(
+                    root,
+                    "q-decided",
+                    &QuestionChoice::Text {
+                        text: String::new(),
+                    },
+                )
+            },
+            |_| {},
+            &["empty `--text`"],
+        );
+    }
+
+    /// Adjacency: a second override is accepted, both stay listed, and the
+    /// second is the effective answer, replacing the first.
+    #[test]
+    fn a_second_override_becomes_the_effective_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        override_as_op(dir.path(), "q-decided", &option("drop")).unwrap();
+        let second = QuestionChoice::Text {
+            text: "neither".into(),
+        };
+        override_as_op(dir.path(), "q-decided", &second)
+            .unwrap_or_else(|error| panic!("the second override was refused: {error}"));
+
+        let overrides = logged_events_of(dir.path(), events::QUESTION_OVERRIDDEN);
+        assert_eq!(overrides.len(), 2, "{overrides:?}");
+        assert_eq!(
+            overrides[1]["was"],
+            serde_json::json!({"option_id": "drop"})
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&ledger_report(dir.path(), PhaseId::new(54), true).unwrap())
+                .unwrap();
+        let entry = &json["decided"][0];
+        assert_eq!(
+            entry["overrides"].as_array().map(Vec::len),
+            Some(2),
+            "{json}"
+        );
+        assert_eq!(
+            entry["effective_answer"],
+            serde_json::json!({"text": "neither"}),
+            "{json}"
+        );
+    }
+
+    /// D-17 / D-18: an agent-marked caller cannot override. Control: an
+    /// unmarked call is the operator's and is recorded under the user name.
+    #[test]
+    fn an_agent_marked_override_is_refused() {
+        let by = |marker: Option<&str>| answerer_from(marker.map(Into::into), Some("op".into()));
+        assert_refused_unwritten(
+            |root| {
+                ledger_override_report_by(
+                    root,
+                    PhaseId::new(54),
+                    "q-decided",
+                    &option("drop"),
+                    by(Some("agent:claude")),
+                    record_override,
+                )
+            },
+            |_| {},
+            &["DEVFLOW_ANSWERED_BY", "operator"],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        ledger_override_report_by(
+            dir.path(),
+            PhaseId::new(54),
+            "q-decided",
+            &option("drop"),
+            by(None),
+            record_override,
+        )
+        .unwrap_or_else(|error| panic!("control: the operator's override was refused: {error}"));
+        let overrides = logged_events_of(dir.path(), events::QUESTION_OVERRIDDEN);
+        assert_eq!(overrides[0]["overridden_by"], "op", "{overrides:?}");
     }
 
     /// T-54-35: when the append fails the override is refused and nothing is
