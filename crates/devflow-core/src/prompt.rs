@@ -327,6 +327,44 @@ fn note_block(introduction: &str, note: &str) -> Option<String> {
     Some(format!("{introduction}\n\n{begin}\n{note}\n{end}\n\n"))
 }
 
+/// The introduction of [`override_block`] (D-17).
+pub const OVERRIDE_INTRODUCTION: &str = "The operator overrode answers given through \
+`devflow_ask`. Each answer below is now the answer; revisit any work that depended on the old \
+one.";
+
+/// The section a launch prompt ends with when the operator overrode answers no
+/// launched agent has been given (D-17): [`OVERRIDE_INTRODUCTION`], then one
+/// line per question inside [`note_block`]'s markers, so neither question nor
+/// answer text can close the block. `None` when there is no override.
+pub fn override_block(overrides: &[crate::history::PendingOverride]) -> Option<String> {
+    let lines: Vec<String> = overrides.iter().map(override_line).collect();
+    note_block(OVERRIDE_INTRODUCTION, &lines.join("\n"))
+}
+
+/// `- question `q1` ("text"): the answer is now option `b`, replacing option `a`.`
+fn override_line(change: &crate::history::PendingOverride) -> String {
+    let question = change.question.as_deref().map_or_else(
+        || "text not recorded".to_string(),
+        |text| format!("{text:?}"),
+    );
+    let was = change
+        .was
+        .as_ref()
+        .map_or_else(|| "no recorded answer".to_string(), choice_text);
+    format!(
+        "- question `{}` ({question}): the answer is now {}, replacing {was}.",
+        change.question_id,
+        choice_text(&change.now)
+    )
+}
+
+fn choice_text(choice: &crate::question::QuestionChoice) -> String {
+    match choice {
+        crate::question::QuestionChoice::Option { option_id } => format!("option `{option_id}`"),
+        crate::question::QuestionChoice::Text { text } => format!("the text {text:?}"),
+    }
+}
+
 /// The note blocks a prompt carries, in order: the fix request first, then the
 /// relaunch note (P4). Empty when neither is set, so a prompt with no note is
 /// byte-identical to one built before notes existed.

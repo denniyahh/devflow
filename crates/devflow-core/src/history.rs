@@ -1,6 +1,7 @@
 //! Read-only per-phase attempt history assembled from existing DevFlow stores.
 
 use crate::phase_id::PhaseId;
+use crate::question::{AnswererKind, QuestionChoice, answerer_kind};
 use crate::{agent_result, events, gates};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -493,6 +494,98 @@ fn event_kind(event: &serde_json::Value) -> Option<&str> {
 
 fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(|v| v.as_str()).map(String::from)
+}
+
+/// One question the operator overrode that no launched agent has been given
+/// yet (D-17), merged across its pending overrides: `now` is the latest
+/// answer, `was` the answer the first of them replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingOverride {
+    pub question_id: String,
+    /// The text of the question's last `question_asked`, when one is logged.
+    pub question: Option<String>,
+    pub now: QuestionChoice,
+    pub was: Option<QuestionChoice>,
+    /// Every merged override's `override_id`, in log line order.
+    pub override_ids: Vec<String>,
+}
+
+/// The operator's overrides in `run_started_at`'s run of `phase` that no
+/// `overrides_delivered` line of that run names, one per question in the order
+/// of each question's first pending override, by events.jsonl line order.
+/// Delivery is matched by `override_id`, never by `ts`. An override whose
+/// `overridden_by` is not an operator, or that lacks an `override_id` or a
+/// readable `answer`, is not pending: it cannot be truthfully delivered.
+pub fn pending_overrides(
+    project_root: &Path,
+    phase: PhaseId,
+    run_started_at: &str,
+) -> Vec<PendingOverride> {
+    let mut events = phase_events(project_root, phase);
+    events.sort_by_key(|(_, line, _)| *line);
+    let in_run = |event: &serde_json::Value| {
+        string_field(event, "run_started_at").as_deref() == Some(run_started_at)
+    };
+    let delivered: HashSet<String> = events
+        .iter()
+        .filter(|(_, _, event)| {
+            event_kind(event) == Some(events::OVERRIDES_DELIVERED) && in_run(event)
+        })
+        .filter_map(|(_, _, event)| event.get("override_ids")?.as_array().cloned())
+        .flatten()
+        .filter_map(|id| id.as_str().map(String::from))
+        .collect();
+    let mut pending: Vec<PendingOverride> = Vec::new();
+    for (_, _, event) in &events {
+        if event_kind(event) != Some(events::QUESTION_OVERRIDDEN) || !in_run(event) {
+            continue;
+        }
+        let by_operator = string_field(event, "overridden_by")
+            .is_some_and(|by| answerer_kind(&by) == AnswererKind::Operator);
+        let (Some(question_id), Some(override_id), Some(now)) = (
+            string_field(event, "question_id"),
+            string_field(event, "override_id"),
+            choice_field(event, "answer"),
+        ) else {
+            continue;
+        };
+        if !by_operator || delivered.contains(&override_id) {
+            continue;
+        }
+        match pending.iter_mut().find(|p| p.question_id == question_id) {
+            Some(merged) => {
+                merged.now = now;
+                merged.override_ids.push(override_id);
+            }
+            None => pending.push(PendingOverride {
+                question: asked_question_text(&events, &question_id),
+                question_id,
+                now,
+                was: choice_field(event, "was"),
+                override_ids: vec![override_id],
+            }),
+        }
+    }
+    pending
+}
+
+/// The text of the last `question_asked` of `question_id`.
+fn asked_question_text(
+    events: &[(u64, usize, serde_json::Value)],
+    question_id: &str,
+) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .map(|(_, _, event)| event)
+        .filter(|event| event_kind(event) == Some(events::QUESTION_ASKED))
+        .find(|event| string_field(event, "question_id").as_deref() == Some(question_id))
+        .and_then(|event| string_field(event, "question"))
+}
+
+fn choice_field(event: &serde_json::Value, key: &str) -> Option<QuestionChoice> {
+    serde_json::from_value(event.get(key)?.clone()).ok()
 }
 
 /// The ledger as text: a `Decided (N)` section, then `Escalated (N)`.

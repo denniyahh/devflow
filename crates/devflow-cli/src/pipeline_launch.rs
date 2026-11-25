@@ -137,7 +137,7 @@ pub(crate) fn launch_stage_inner(
 /// that either spawn path runs.
 fn prepare_stage_launch(
     state: &mut State,
-    prompt: String,
+    mut prompt: String,
     archived_stage: Option<Stage>,
 ) -> Result<StageLaunch, CliError> {
     let driver = agents::driver_for(state.agent);
@@ -186,6 +186,17 @@ fn prepare_stage_launch(
         canary::run_delivery_canary(canary_launcher.as_ref(), &canary_capture_dir)
     })?;
 
+    // D-17: the operator's overrides no launched agent has been given go last,
+    // since a prompt can begin with a workflow command.
+    let pending = devflow_core::history::pending_overrides(
+        &state.project_root,
+        state.phase,
+        &state.started_at,
+    );
+    if let Some(block) = prompt::override_block(&pending) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
+    }
     let (program, args, launch) = resolve_launch_shape(
         state.agent,
         driver.as_ref(),
@@ -196,14 +207,19 @@ fn prepare_stage_launch(
     );
     let args = wire_ask_registration(state, driver.as_ref(), args)?;
 
-    stage_launch(
+    let mut launch = stage_launch(
         state,
         program,
         &args,
         &driver.environment(),
         archived_stage,
         launch,
-    )
+    )?;
+    launch.overrides = pending
+        .into_iter()
+        .flat_map(|change| change.override_ids)
+        .collect();
+    Ok(launch)
 }
 
 /// The phase's `devflow_ask` registration file, `.devflow/ask-NN.mcp.json`: written
@@ -1414,7 +1430,7 @@ fn record_runner_stop(project_root: &Path, phase: PhaseId, source: Option<StopSo
 fn run_one_stage(
     project_root: &Path,
     phase: PhaseId,
-    launch: StageLaunch,
+    mut launch: StageLaunch,
     token: &StopToken,
 ) -> Result<Result<Option<StageLaunch>, CliError>, CliError> {
     // A stop that arrived during the hand-back starts no stage.
@@ -1427,6 +1443,8 @@ fn run_one_stage(
     let stage = launch.state.stage;
     let agent = launch.state.agent;
     let relaunch = launch.relaunch.clone();
+    let run_started_at = launch.state.started_at.clone();
+    let overrides = std::mem::take(&mut launch.overrides);
     let auto_chain_guard = match launch.launch {
         StageShape::Stream { .. } => Some(AutoChainGuard::engage(
             launch
@@ -1447,6 +1465,16 @@ fn run_one_stage(
     });
     // Before the advance: the flag lives as long as the agent does.
     drop(auto_chain_guard);
+    // D-17: the agent ran with the overrides in its prompt. A lost line makes the
+    // next launch repeat them, which errs toward telling the agent twice.
+    if ran.is_ok() && !overrides.is_empty() {
+        events::emit(
+            project_root,
+            phase,
+            events::OVERRIDES_DELIVERED,
+            serde_json::json!({ "run_started_at": run_started_at, "override_ids": overrides }),
+        );
+    }
     let outcome = match ran {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -1708,6 +1736,9 @@ pub(crate) struct StageLaunch {
     /// The rate-limit handoff this launch relaunches the stage after, set only by
     /// [`fail_over_on_rate_limit`].
     pub(crate) relaunch: Option<HandoffRelaunch>,
+    /// The `override_id`s whose override section this launch's prompt carries
+    /// (D-17), recorded as delivered once the agent ran.
+    pub(crate) overrides: Vec<String>,
 }
 
 /// Commit the state before anything is spawned, as this save always has, so the launch
@@ -1731,6 +1762,7 @@ fn stage_launch(
         archived_stage,
         launch,
         relaunch: None,
+        overrides: Vec::new(),
     })
 }
 
@@ -11061,6 +11093,7 @@ mod tests {
                 archived_stage: None,
                 launch: StageShape::Capture,
                 relaunch: None,
+                overrides: Vec::new(),
             });
             assert_eq!(spec.stage, Some(stage), "{stage}");
             assert_eq!(
@@ -11069,5 +11102,98 @@ mod tests {
                 "{stage}: the question hold's bound"
             );
         }
+    }
+
+    /// Append `lines` to the event log under `root`, in order.
+    fn append_events(root: &Path, lines: &[serde_json::Value]) {
+        use std::io::Write as _;
+        let path = devflow_core::events::events_path(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    /// Phase 54's `question_asked` for `question_id`.
+    fn override_asked(question_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": 10, "phase": 54, "event": devflow_core::events::QUESTION_ASKED,
+            "question_id": question_id, "question": "Which store?",
+        })
+    }
+
+    /// The operator's override of `question_id` in run `run`: option `was` to `now`.
+    fn override_event(
+        question_id: &str,
+        override_id: &str,
+        now: &str,
+        was: &str,
+        run: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": 20, "phase": 54, "event": devflow_core::events::QUESTION_OVERRIDDEN,
+            "question_id": question_id, "override_id": override_id,
+            "answer": {"option_id": now}, "was": {"option_id": was},
+            "overridden_by": "operator", "run_started_at": run,
+        })
+    }
+
+    /// A saved claude Code-stage state for phase 54 whose canary is confirmed.
+    fn override_launch_state(root: &Path) -> State {
+        let mut state = State::new(
+            PhaseId::new(54),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// Everything a launch hands the agent: its argv and its stream prompt.
+    fn delivered_text(launch: &StageLaunch) -> String {
+        let mut text = launch.args.join("\n");
+        if let StageShape::Stream { prompt } = &launch.launch {
+            text.push('\n');
+            text.push_str(prompt);
+        }
+        text
+    }
+
+    /// D-17: an override made since the last launch is in the next launch's
+    /// prompt, with its question, both answers and the revisit instruction, and
+    /// the launch records its `override_id`.
+    #[test]
+    fn the_next_launch_carries_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = override_launch_state(root);
+        let run = state.started_at.clone();
+        append_events(
+            root,
+            &[
+                override_asked("q1"),
+                override_event("q1", "o1", "b", "a", &run),
+            ],
+        );
+        let launch = prepare_stage_launch(&mut state, "stage prompt".to_string(), None).unwrap();
+        let text = delivered_text(&launch);
+        for part in [
+            "`q1`",
+            "Which store?",
+            "now option `b`",
+            "replacing option `a`",
+            "revisit any work that depended on the old one",
+        ] {
+            assert!(text.contains(part), "the launch carries {part:?}:\n{text}");
+        }
+        assert_eq!(launch.overrides, ["o1"]);
     }
 }
