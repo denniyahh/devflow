@@ -10,10 +10,13 @@
 //! This module is pure apart from reading the project's files: the run-time
 //! call ([`precedents_for`]) and the scoring tool both use it.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::events;
 use crate::phase_id::PhaseId;
 use crate::question::{QuestionKind, QuestionOption, QuestionSpec};
 use crate::triage::{Precedent, PrecedentAnswer, TriageConfig};
@@ -124,13 +127,129 @@ pub fn mine_project(
     project: &str,
     exclude_phases: &[PhaseId],
 ) -> MiningReport {
-    let _ = (project_root, project, exclude_phases);
-    MiningReport::default()
+    let _ = exclude_phases;
+    let mut report = MiningReport::default();
+    mine_events(project_root, project, &mut report);
+    report
+}
+
+/// The event log's v1 lines, in `(ts, line index)` order.
+fn read_events(project_root: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(events::events_path(project_root)).unwrap_or_default();
+    let mut indexed: Vec<(u64, usize, Value)> = text
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let event = serde_json::from_str::<Value>(line).ok()?;
+            (event.get("v").and_then(Value::as_u64) == Some(1)).then(|| {
+                let ts = event.get("ts").and_then(Value::as_u64).unwrap_or(0);
+                (ts, index, event)
+            })
+        })
+        .collect();
+    indexed.sort_by_key(|(ts, index, _)| (*ts, *index));
+    indexed.into_iter().map(|(_, _, event)| event).collect()
+}
+
+/// Pair each `question_asked` with its `question_answered` by `question_id`.
+fn mine_events(project_root: &Path, project: &str, report: &mut MiningReport) {
+    let mut asked: Vec<Value> = Vec::new();
+    let mut answers: HashMap<String, Value> = HashMap::new();
+    for event in read_events(project_root) {
+        let Some(qid) = event.get("question_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some(events::QUESTION_ASKED) => asked.push(event.clone()),
+            Some(events::QUESTION_ANSWERED) => {
+                answers.insert(qid.to_string(), event.clone());
+            }
+            _ => {}
+        }
+    }
+    for question in asked {
+        let qid = question["question_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let Some(answer) = answers
+            .get(&qid)
+            .and_then(|a| precedent_answer(a.get("answer")))
+        else {
+            report.excluded.unanswered += 1;
+            continue;
+        };
+        match event_entry(&question, &qid, project, answer) {
+            Some(entry) => report.entries.push(entry),
+            None => report.excluded.unparsed += 1,
+        }
+    }
+}
+
+/// An event's `answer` (`{option_id}` or `{text}`) as a precedent answer.
+fn precedent_answer(answer: Option<&Value>) -> Option<PrecedentAnswer> {
+    let answer = answer?;
+    if let Some(option_id) = answer.get("option_id").and_then(Value::as_str) {
+        return Some(PrecedentAnswer::Option {
+            option_id: option_id.to_string(),
+        });
+    }
+    let text = answer.get("text").and_then(Value::as_str)?;
+    Some(PrecedentAnswer::OwnWords {
+        text: text.to_string(),
+    })
+}
+
+/// The entry a `question_asked` event and its label make, or `None` when
+/// the event lacks a readable kind, question or options.
+fn event_entry(
+    question: &Value,
+    qid: &str,
+    project: &str,
+    answer: PrecedentAnswer,
+) -> Option<CorpusEntry> {
+    let kind = serde_json::from_value::<QuestionKind>(question.get("kind")?.clone()).ok()?;
+    let options =
+        serde_json::from_value::<Vec<QuestionOption>>(question.get("options")?.clone()).ok()?;
+    Some(CorpusEntry {
+        id: format!("events:{qid}"),
+        project: project.to_string(),
+        phase: event_phase(question.get("phase")),
+        source: CorpusSource::Events,
+        kind,
+        question: question.get("question")?.as_str()?.to_string(),
+        options,
+        context: question
+            .get("context")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        answer,
+        recommended: question
+            .get("recommended")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        order: question.get("ts").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
+/// An event's `phase` as written: the canonical phase id, or the raw value.
+fn event_phase(phase: Option<&Value>) -> String {
+    match (PhaseId::from_json(phase), phase) {
+        (Some(id), _) => id.to_string(),
+        (None, Some(Value::String(text))) => text.clone(),
+        (None, Some(other)) => other.to_string(),
+        (None, None) => String::new(),
+    }
 }
 
 /// `text` lowercased, punctuation removed and whitespace collapsed.
 pub fn normalize_question(text: &str) -> String {
-    text.to_string()
+    let kept: String = text
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The precedents `spec` is sent with, from `entries`: the most similar
@@ -142,8 +261,16 @@ pub fn select_precedents(
     spec: &QuestionSpec,
     exclude_entry_id: Option<&str>,
 ) -> Vec<Precedent> {
-    let _ = (entries, spec, exclude_entry_id);
-    Vec::new()
+    let _ = spec;
+    entries
+        .iter()
+        .filter(|entry| Some(entry.id.as_str()) != exclude_entry_id)
+        .map(|entry| Precedent {
+            question: entry.question.clone(),
+            options: entry.options.clone(),
+            answer: entry.answer.clone(),
+        })
+        .collect()
 }
 
 /// The precedents for `spec` at run time: this project's labels only (D-04),
