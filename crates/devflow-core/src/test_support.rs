@@ -620,6 +620,221 @@ pub fn write_executable(path: &std::path::Path, contents: &str) {
         .unwrap_or_else(|error| panic!("make {} executable: {error}", path.display()));
 }
 
+// ## Fake Jev endpoint (54-01)
+//
+// No test may call TypeSafe, so every triage test talks to this loopback fake
+// instead. It is std only: one listener on `127.0.0.1:0`, one background
+// thread, one connection per queued reply, in order.
+
+/// One reply [`FakeJev`] gives, in the order queued.
+#[derive(Debug, Clone)]
+pub struct FakeReply {
+    /// HTTP status code of the reply.
+    pub status: u16,
+    /// Reply body, sent with a `Content-Length`.
+    pub body: String,
+    /// Sleep this long after reading the request and before replying.
+    pub delay: std::time::Duration,
+}
+
+impl FakeReply {
+    /// A `200` reply carrying `body`.
+    pub fn json(body: impl Into<String>) -> Self {
+        Self::status(200, body)
+    }
+
+    /// A reply with status `code` carrying `body`.
+    pub fn status(code: u16, body: impl Into<String>) -> Self {
+        Self {
+            status: code,
+            body: body.into(),
+            delay: std::time::Duration::ZERO,
+        }
+    }
+
+    /// The same reply, sent only after `delay`.
+    #[must_use]
+    pub fn delayed(self, delay: std::time::Duration) -> Self {
+        Self { delay, ..self }
+    }
+}
+
+/// A request [`FakeJev`] received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedRequest {
+    /// Request method, for example `POST`.
+    pub method: String,
+    /// Request target, for example `/v1/systemone`.
+    pub path: String,
+    /// Headers in arrival order, names lowercased, values trimmed.
+    pub headers: Vec<(String, String)>,
+    /// Exactly `content-length` bytes of body (empty without the header).
+    pub body: Vec<u8>,
+}
+
+impl CapturedRequest {
+    /// The first value of header `name` (lowercase).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Reply body for a request that carried no `content-length`, so a chunked
+/// client fails its test loudly instead of hanging.
+pub const FAKE_JEV_NO_CONTENT_LENGTH: &str = "fake jev: no content-length";
+
+type Captured = std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>;
+
+/// A loopback stand-in for TypeSafe's Jev endpoint.
+#[derive(Debug)]
+pub struct FakeJev {
+    url: String,
+    requests: Captured,
+}
+
+impl FakeJev {
+    /// Bind `127.0.0.1:0` and serve one connection per reply, in order, on a
+    /// background thread that records each request. A reply never asked for
+    /// leaves the thread parked in `accept` until the test process ends.
+    pub fn serve(replies: Vec<FakeReply>) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake Jev");
+        let address = listener.local_addr().expect("the fake Jev's address");
+        let requests = Captured::default();
+        let recorded = std::sync::Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                serve_one(stream, &reply, &recorded);
+            }
+        });
+        Self {
+            url: format!("http://{address}"),
+            requests,
+        }
+    }
+
+    /// The base URL, `http://127.0.0.1:<port>`.
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    /// Every request received so far.
+    pub fn requests(&self) -> Vec<CapturedRequest> {
+        lock_captured(&self.requests).clone()
+    }
+
+    /// How many requests arrived.
+    pub fn request_count(&self) -> usize {
+        lock_captured(&self.requests).len()
+    }
+}
+
+fn lock_captured(captured: &Captured) -> std::sync::MutexGuard<'_, Vec<CapturedRequest>> {
+    captured
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read one request, record it, then answer it (write errors ignored: a client
+/// that timed out has closed its end).
+fn serve_one(stream: std::net::TcpStream, reply: &FakeReply, recorded: &Captured) {
+    use std::io::Write;
+    let Some(request) = read_request(&stream) else {
+        return;
+    };
+    let has_length = request.header("content-length").is_some();
+    lock_captured(recorded).push(request);
+    std::thread::sleep(reply.delay);
+    let (status, body) = if has_length {
+        (reply.status, reply.body.as_str())
+    } else {
+        (500, FAKE_JEV_NO_CONTENT_LENGTH)
+    };
+    let mut out = stream;
+    let _ = write!(
+        out,
+        "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = out.flush();
+}
+
+/// The request line, the headers to the blank line, then exactly
+/// `content-length` body bytes. `None` when the client hung up early.
+fn read_request(stream: &std::net::TcpStream) -> Option<CapturedRequest> {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?.to_owned();
+    let path = parts.next()?.to_owned();
+    let mut headers = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        }
+    }
+    let mut request = CapturedRequest {
+        method,
+        path,
+        headers,
+        body: Vec::new(),
+    };
+    if let Some(length) = request.header("content-length") {
+        let mut body = vec![0; length.parse().ok()?];
+        reader.read_exact(&mut body).ok()?;
+        request.body = body;
+    }
+    Some(request)
+}
+
+/// A loopback URL nothing listens on: bind `127.0.0.1:0`, read the port, drop
+/// the listener.
+pub fn refused_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
+    let address = listener.local_addr().expect("the probe port's address");
+    drop(listener);
+    format!("http://{address}")
+}
+
+/// A Jev response in the documented shape: `accept` is a noul answer with
+/// probability `accept`, `pick` a choice answer naming `choice` with
+/// `probabilities` (its confidence is the chosen option's probability).
+pub fn jev_answer(model: &str, accept: f64, choice: &str, probabilities: &[(&str, f64)]) -> String {
+    let confidence = probabilities
+        .iter()
+        .find(|(option, _)| *option == choice)
+        .map_or(0.0, |(_, probability)| *probability);
+    let probabilities: serde_json::Map<String, serde_json::Value> = probabilities
+        .iter()
+        .map(|(option, probability)| ((*option).to_owned(), serde_json::json!(probability)))
+        .collect();
+    serde_json::json!({
+        "model": model,
+        "answers": {
+            "accept": {"type": "noul", "noul": accept},
+            "pick": {
+                "type": "choice",
+                "choice": choice,
+                "confidence": confidence,
+                "probabilities": probabilities,
+            },
+        },
+        "usage": {"input_tokens": 120, "output_tokens": 12},
+    })
+    .to_string()
+}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests

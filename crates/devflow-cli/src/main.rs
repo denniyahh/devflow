@@ -20,6 +20,8 @@ mod pipeline_gate;
 
 mod ask_server;
 
+mod triage_client;
+
 mod phase_worktree;
 
 mod service;
