@@ -40,9 +40,10 @@ use devflow_core::question::QuestionChoice;
 use devflow_core::registry;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::triage::TriageConfig;
 use devflow_core::workflow;
 use devflow_core::worktree;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3440,6 +3441,107 @@ fn status_run_lines(state: &State) -> Vec<String> {
     lines
 }
 
+/// One run's triage fallbacks: how many, and the last one's reason and detail.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct FallbackTally {
+    count: usize,
+    last_reason: String,
+    last_detail: String,
+}
+
+/// Every run's triage fallbacks, keyed by phase and the run's `started_at`
+/// (a `triage_fallback` event's `run_started_at`, matched by value), from
+/// one read of events.jsonl. A missing log is no fallbacks.
+fn triage_fallback_tallies(project_root: &Path) -> HashMap<(PhaseId, String), FallbackTally> {
+    std::fs::read_to_string(events::events_path(project_root))
+        .map(|contents| fallback_tallies_from(&contents))
+        .unwrap_or_default()
+}
+
+/// [`triage_fallback_tallies`] over the text of events.jsonl.
+fn fallback_tallies_from(contents: &str) -> HashMap<(PhaseId, String), FallbackTally> {
+    let mut tallies: HashMap<(PhaseId, String), FallbackTally> = HashMap::new();
+    for event in contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == events::TRIAGE_FALLBACK)
+    {
+        let (Some(phase), Some(run)) = (
+            PhaseId::from_json(event.get("phase")),
+            event["run_started_at"].as_str(),
+        ) else {
+            continue;
+        };
+        let text = |key: &str| event[key].as_str().unwrap_or("unknown").to_string();
+        let tally = tallies.entry((phase, run.to_string())).or_default();
+        tally.count += 1;
+        tally.last_reason = text("reason");
+        tally.last_detail = text("detail");
+    }
+    tallies
+}
+
+/// The project's triage configuration for `status`; `None` when
+/// `devflow.toml` has no `[triage]` table (or is missing or unparsable), so
+/// a project that never configured triage gets no triage line.
+fn status_triage_config(project_root: &Path) -> Option<TriageConfig> {
+    let contents = std::fs::read_to_string(project_root.join("devflow.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&contents).ok()?;
+    table
+        .contains_key("triage")
+        .then(|| config::triage_config(project_root))
+}
+
+/// The host of `base_url` (`scheme://[user@]host[:port]/...`), brackets kept
+/// for an IPv6 literal.
+fn url_host(base_url: &str) -> &str {
+    let rest = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    match host_port.find(']') {
+        Some(end) if host_port.starts_with('[') => &host_port[..=end],
+        _ => host_port.split(':').next().unwrap_or(host_port),
+    }
+}
+
+/// `status`'s line about triage for `state`'s run (TRIAGE-04, D-19): `None`
+/// without a `[triage]` table; otherwise its fallbacks this run when there
+/// are any, else whether it is off, escalating everything, or on with its
+/// thresholds. `base_url` is `TYPESAFE_BASE_URL`, named when its host is not
+/// TypeSafe's.
+fn triage_line(
+    state: &State,
+    config: Option<&TriageConfig>,
+    tally: Option<&FallbackTally>,
+    base_url: Option<&str>,
+) -> Option<String> {
+    let config = config?;
+    let via = base_url
+        .map(url_host)
+        .filter(|host| *host != crate::triage_client::TYPESAFE_API_HOST)
+        .map_or(String::new(), |host| format!(" via {host}"));
+    let line = match tally.filter(|tally| tally.count > 0) {
+        Some(tally) => format!(
+            "  triage: fell back to the operator {} time(s) this run; last: {} ({}){via}",
+            tally.count, tally.last_reason, tally.last_detail
+        ),
+        None if !config.enabled => "  triage: off (enabled = false in devflow.toml)".to_string(),
+        None if state.triage_off => "  triage: off for this run (--no-triage)".to_string(),
+        None => match (config.threshold, config.pre_check_threshold) {
+            (Some(threshold), Some(pre_check)) => format!(
+                "  triage: on (threshold {threshold}, pre-check {pre_check}, model {}){via}",
+                config.model
+            ),
+            _ => format!("  triage: on, escalating every question (no threshold){via}"),
+        },
+    };
+    Some(line)
+}
+
 /// D-09 (review codex-8): every phase `status` lists, found by file name only, never
 /// by file contents: `.runner-NN` locks in `.devflow/`, gate request files
 /// `NN-{stage}.json` in [`Gates::dir`] and state files through
@@ -3520,6 +3622,14 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
         // 14-CR-10: one pass over events.jsonl for every phase's last event,
         // instead of a full-file scan per phase.
         let mut last_events = events::last_events_by_phase(project_root);
+        // devflow.toml and the fallback tallies are read once per call, not
+        // per phase; neither is read for a project without `[triage]`.
+        let triage = status_triage_config(project_root);
+        let fallbacks = triage
+            .as_ref()
+            .map(|_| triage_fallback_tallies(project_root))
+            .unwrap_or_default();
+        let base_url = std::env::var("TYPESAFE_BASE_URL").ok();
         println!("project_root: {}", project_root.display());
         println!("{}", active_phases_line(&states));
         for (phase, _, row) in &rows {
@@ -3532,6 +3642,11 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 };
                 for line in
                     status_state_lines(project_root, state, question, last_events.remove(phase))
+                {
+                    println!("{line}");
+                }
+                let tally = fallbacks.get(&(*phase, state.started_at.clone()));
+                if let Some(line) = triage_line(state, triage.as_ref(), tally, base_url.as_deref())
                 {
                     println!("{line}");
                 }
@@ -17360,5 +17475,56 @@ mod tests {
             return;
         }
         assert_eq!(local_utc_offset_secs(TZ_TEST_INSTANT), Some(-18_000));
+    }
+
+    /// A run state for the triage line, started at `started_at`.
+    fn triage_state(started_at: &str) -> State {
+        let mut state = State::new(
+            PhaseId::from(54),
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/nonexistent"),
+        );
+        state.started_at = started_at.to_string();
+        state
+    }
+
+    /// A `triage_fallback` line for phase 54 and the run `run_started_at`,
+    /// all at the same `ts` second.
+    fn fallback_event(run_started_at: &str, reason: &str, detail: &str) -> String {
+        serde_json::json!({
+            "v": 1, "ts": 1_700_000_000u64, "phase": 54, "event": events::TRIAGE_FALLBACK,
+            "question_id": "q-1", "run_started_at": run_started_at,
+            "reason": reason, "detail": detail,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn status_says_triage_fell_back() {
+        let state = triage_state("1700000000");
+        let config = TriageConfig::with_thresholds(Some(0.5), Some(0.5));
+        let log = [
+            fallback_event("1699999999", "timeout", "earlier run"),
+            fallback_event("1700000000", "unreachable", "connection refused"),
+        ]
+        .join("\n");
+        let tallies = fallback_tallies_from(&log);
+        let key = (state.phase, state.started_at.clone());
+        let line =
+            triage_line(&state, Some(&config), tallies.get(&key), None).expect("a triage line");
+        assert!(line.starts_with("  triage:"), "{line}");
+        assert!(line.contains("fell back"), "{line}");
+        assert!(line.contains("unreachable"), "{line}");
+        assert!(
+            line.contains(" 1 time(s) "),
+            "the earlier run's fallback is not counted: {line}"
+        );
+        assert!(!line.contains("earlier run"), "{line}");
+
+        let quiet = triage_line(&state, Some(&config), None, None).expect("a triage line");
+        assert!(!quiet.contains("fell back"), "{quiet}");
+        let only_earlier = fallback_tallies_from(&fallback_event("1699999999", "timeout", "x"));
+        assert!(!only_earlier.contains_key(&key), "{only_earlier:?}");
     }
 }

@@ -20,6 +20,8 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
 thiserror.workspace = true
+# `[triage]` table presence for `devflow status` (54-09).
+toml.workspace = true
 # `getuid` for this user's runtime dir, `/run/user/<uid>` (D-03, 52.2-04), and
 # process-group signals in the test reapers' identity-confirmed fallback (50-11).
 libc = "0.2"

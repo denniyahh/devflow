@@ -629,6 +629,9 @@ struct OpenQuestion {
     /// The `triage` object of `question_asked`, set once on the first call
     /// and recorded when the gate opens; `None` when triage did not run.
     triage: Option<Value>,
+    /// Why triage could not score the question, and its detail, recorded as
+    /// `triage_fallback` when the gate opens; `None` for any other outcome.
+    fallback: Option<(FallbackReason, String)>,
 }
 
 /// What triage did with a question's first call.
@@ -681,6 +684,7 @@ impl Worker for AskServer {
                     deadline: control.arrived + Duration::from_secs(self.args.timeout_secs),
                     gate: None,
                     triage: None,
+                    fallback: None,
                 };
                 let reply = match self.triage(&mut question, &state, control) {
                     Triaged::ToGate => return self.hold(question, control),
@@ -797,6 +801,9 @@ impl AskServer {
         // Past the deadline the question goes to `hold`, which ends it as
         // timed out before any gate opens.
         question.triage = Some(outcome.event_fields(&config));
+        if let TriageOutcome::Fallback { reason, detail } = outcome {
+            question.fallback = Some((reason, detail));
+        }
         Triaged::ToGate
     }
 
@@ -1008,6 +1015,9 @@ fn hold_question(args: &AskArgs, question: &mut OpenQuestion, watch: &RunWatch<'
         );
         let notifier = Notifier::spawn(args, spec);
         emit_question_asked(args, spec, &gate_id, question.triage.as_ref());
+        if let Some((reason, detail)) = &question.fallback {
+            emit_triage_fallback(args, spec, *reason, detail);
+        }
         question.gate = Some(OpenGate {
             gate_id,
             registration,
@@ -1242,6 +1252,25 @@ fn emit_question_asked(
         args.phase,
         events::QUESTION_ASKED,
         question_asked_fields(args, spec, Some(gate_id), triage),
+    );
+}
+
+/// Record `triage_fallback` for `spec` (D-19), beside its `question_asked`
+/// once its gate is open, so a question that never got the ask lock has
+/// neither. `detail` is a failure name or `HTTP <code> <reason>`, never
+/// response-body text or the key.
+fn emit_triage_fallback(args: &AskArgs, spec: &QuestionSpec, reason: FallbackReason, detail: &str) {
+    events::emit(
+        &args.project,
+        args.phase,
+        events::TRIAGE_FALLBACK,
+        json!({
+            "stage": args.stage.to_string(),
+            "question_id": spec.question_id,
+            "run_started_at": args.run_started_at,
+            "reason": reason.as_str(),
+            "detail": detail,
+        }),
     );
 }
 
