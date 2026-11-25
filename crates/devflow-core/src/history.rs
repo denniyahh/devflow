@@ -147,8 +147,8 @@ fn resolved_question_ids(timeline: &AttemptTimeline) -> HashSet<&str> {
         .collect()
 }
 
-/// The indented sub-lines for a question event (D-16); empty for any other
-/// event. Only the first answer or close recorded for a `question_id` is
+/// The indented sub-lines for a question, override, triage fallback,
+/// override delivery or run discard event (D-16); empty for any other event. Only the first answer or close recorded for a `question_id` is
 /// applied; a later one is shown as ignored.
 fn question_rows<'a>(
     event: &'a serde_json::Value,
@@ -161,6 +161,9 @@ fn question_rows<'a>(
         Some(events::QUESTION_ASKED) => {
             let mut rows = format!("  question {id}: {}\n", text_field(event, "question"));
             rows.push_str(&format!("  options: {}\n", options_line(event)));
+            if let Some(triage) = event.get("triage").filter(|triage| triage.is_object()) {
+                rows.push_str(&format!("  {}\n", triage_line(triage)));
+            }
             if event.get("recommended").is_none() {
                 rows.push_str(&format!("  recommended: {MISSING_FIELD}\n"));
             }
@@ -182,6 +185,31 @@ fn question_rows<'a>(
         ),
         Some(events::QUESTION_CLOSED) => {
             format!("  closed {id}: {}\n", text_field(event, "reason"))
+        }
+        Some(events::QUESTION_OVERRIDDEN) => format!(
+            "  override {id}: {} (was {}) by {}\n",
+            answer_text(event),
+            event
+                .get("was")
+                .map_or(MISSING_FIELD.into(), answer_value_text),
+            text_field(event, "overridden_by")
+        ),
+        Some(events::TRIAGE_FALLBACK) => {
+            format!(
+                "  triage fell back for {id}: {}\n",
+                text_field(event, "reason")
+            )
+        }
+        Some(events::OVERRIDES_DELIVERED) => {
+            let count = event.get("override_ids").and_then(|ids| ids.as_array());
+            let count = count.map_or(MISSING_FIELD.into(), |ids| ids.len().to_string());
+            format!("  overrides delivered to the launch: {count}\n")
+        }
+        Some(events::RUN_DISCARDED) => {
+            format!(
+                "  run discarded: started at {}\n",
+                text_field(event, "started_at")
+            )
         }
         _ => String::new(),
     }
