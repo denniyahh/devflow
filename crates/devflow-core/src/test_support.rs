@@ -1520,6 +1520,16 @@ mod tests {
             "(dir, std::fs::Permissions::from_mode(0o700))",
             "production code setting a directory's mode; nothing is executed",
         ),
+        (
+            "crates/devflow-cli/src/triage_score.rs",
+            "(dir, Permissions::from_mode(PRIVATE_DIR_MODE))",
+            "production code keeping the triage data dir private (0700); nothing is executed",
+        ),
+        (
+            "crates/devflow-cli/src/triage_score.rs",
+            "(Permissions::from_mode(PRIVATE_FILE_MODE))",
+            "production code keeping each triage data file private (0600); nothing is executed",
+        ),
     ];
 
     /// `path: line` for each non-comment line of `sources` that calls
