@@ -10,7 +10,7 @@
 //! This module is pure apart from reading the project's files: the run-time
 //! call ([`precedents_for`]) and the scoring tool both use it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,8 @@ use serde_json::Value;
 
 use crate::events;
 use crate::phase_id::PhaseId;
-use crate::question::{QuestionKind, QuestionOption, QuestionSpec};
-use crate::triage::{Precedent, PrecedentAnswer, TriageConfig};
+use crate::question::{AnswererKind, QuestionKind, QuestionOption, QuestionSpec, answerer_kind};
+use crate::triage::{Precedent, PrecedentAnswer, TriageConfig, precedent_state};
 
 /// The most precedents one question is sent with (Pitfall 9).
 pub const MAX_PRECEDENTS: usize = 8;
@@ -127,62 +127,126 @@ pub fn mine_project(
     project: &str,
     exclude_phases: &[PhaseId],
 ) -> MiningReport {
-    let _ = exclude_phases;
     let mut report = MiningReport::default();
-    mine_events(project_root, project, &mut report);
+    mine_events(project_root, project, exclude_phases, &mut report);
     report
 }
 
-/// The event log's v1 lines, in `(ts, line index)` order.
-fn read_events(project_root: &Path) -> Vec<Value> {
+/// The event log's v1 lines in `(ts, line index)` order, and how many lines
+/// were not a JSON object (a torn last line while another process appends,
+/// or garbage). Blank lines are neither.
+fn read_events(project_root: &Path) -> (Vec<Value>, usize) {
     let text = std::fs::read_to_string(events::events_path(project_root)).unwrap_or_default();
-    let mut indexed: Vec<(u64, usize, Value)> = text
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let event = serde_json::from_str::<Value>(line).ok()?;
-            (event.get("v").and_then(Value::as_u64) == Some(1)).then(|| {
-                let ts = event.get("ts").and_then(Value::as_u64).unwrap_or(0);
-                (ts, index, event)
-            })
-        })
-        .collect();
+    let mut unreadable = 0;
+    let mut indexed: Vec<(u64, usize, Value)> = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(event) if event.is_object() => {
+                if event.get("v").and_then(Value::as_u64) == Some(1) {
+                    let ts = event.get("ts").and_then(Value::as_u64).unwrap_or(0);
+                    indexed.push((ts, index, event));
+                }
+            }
+            _ => unreadable += 1,
+        }
+    }
     indexed.sort_by_key(|(ts, index, _)| (*ts, *index));
-    indexed.into_iter().map(|(_, _, event)| event).collect()
+    let events = indexed.into_iter().map(|(_, _, event)| event).collect();
+    (events, unreadable)
 }
 
-/// Pair each `question_asked` with its `question_answered` by `question_id`.
-fn mine_events(project_root: &Path, project: &str, report: &mut MiningReport) {
-    let mut asked: Vec<Value> = Vec::new();
-    let mut answers: HashMap<String, Value> = HashMap::new();
-    for event in read_events(project_root) {
+/// Whether the answerer an event field names is the operator (D-13). An
+/// absent field is not.
+fn is_operator(answerer: Option<&Value>) -> bool {
+    let name = answerer.and_then(Value::as_str).unwrap_or_default();
+    answerer_kind(name) == AnswererKind::Operator
+}
+
+/// Who gave a question's current answer.
+enum EventLabel<'a> {
+    /// The operator; the `answer` field it gave.
+    Operator(Option<&'a Value>),
+    /// An agent, triage or nobody recorded, with no operator override.
+    NotOperator,
+    /// No answer at all.
+    Unanswered,
+}
+
+/// The label a question's answer and its last operator override give: the
+/// override wins (D-18), else the answer when the operator gave it.
+fn event_label<'a>(
+    answered: Option<&'a Value>,
+    operator_override: Option<&'a Value>,
+) -> EventLabel<'a> {
+    if let Some(overridden) = operator_override {
+        return EventLabel::Operator(overridden.get("answer"));
+    }
+    match answered {
+        Some(answer) if is_operator(answer.get("answered_by")) => {
+            EventLabel::Operator(answer.get("answer"))
+        }
+        Some(_) => EventLabel::NotOperator,
+        None => EventLabel::Unanswered,
+    }
+}
+
+/// Pair each `question_asked` with its answer and its last operator override
+/// by `question_id`, keeping operator labels outside `exclude_phases`.
+fn mine_events(
+    project_root: &Path,
+    project: &str,
+    exclude_phases: &[PhaseId],
+    report: &mut MiningReport,
+) {
+    let (log, unreadable) = read_events(project_root);
+    report.excluded.unreadable_event_lines += unreadable;
+    let mut asked: Vec<&Value> = Vec::new();
+    let mut answers: HashMap<&str, &Value> = HashMap::new();
+    let mut overrides: HashMap<&str, &Value> = HashMap::new();
+    for event in &log {
         let Some(qid) = event.get("question_id").and_then(Value::as_str) else {
             continue;
         };
         match event.get("event").and_then(Value::as_str) {
-            Some(events::QUESTION_ASKED) => asked.push(event.clone()),
+            Some(events::QUESTION_ASKED) => asked.push(event),
             Some(events::QUESTION_ANSWERED) => {
-                answers.insert(qid.to_string(), event.clone());
+                answers.insert(qid, event);
+            }
+            Some(events::QUESTION_OVERRIDDEN) if is_operator(event.get("overridden_by")) => {
+                overrides.insert(qid, event);
             }
             _ => {}
         }
     }
     for question in asked {
-        let qid = question["question_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let Some(answer) = answers
-            .get(&qid)
-            .and_then(|a| precedent_answer(a.get("answer")))
+        let qid = question["question_id"].as_str().unwrap_or_default();
+        let answer = match event_label(answers.get(qid).copied(), overrides.get(qid).copied()) {
+            EventLabel::Operator(answer) => answer,
+            EventLabel::NotOperator => {
+                report.excluded.non_operator += 1;
+                continue;
+            }
+            EventLabel::Unanswered => {
+                report.excluded.unanswered += 1;
+                continue;
+            }
+        };
+        let Some(entry) =
+            precedent_answer(answer).and_then(|answer| event_entry(question, qid, project, answer))
         else {
-            report.excluded.unanswered += 1;
+            report.excluded.unparsed += 1;
             continue;
         };
-        match event_entry(&question, &qid, project, answer) {
-            Some(entry) => report.entries.push(entry),
-            None => report.excluded.unparsed += 1,
+        if PhaseId::from_json(question.get("phase"))
+            .is_some_and(|phase| exclude_phases.contains(&phase))
+        {
+            report.excluded.excluded_phase += 1;
+            continue;
         }
+        report.entries.push(entry);
     }
 }
 
@@ -253,24 +317,80 @@ pub fn normalize_question(text: &str) -> String {
 }
 
 /// The precedents `spec` is sent with, from `entries`: the most similar
-/// first, at most [`MAX_PRECEDENTS`] within [`PRECEDENT_CHAR_BUDGET`]. The
+/// first, at most [`MAX_PRECEDENTS`] whose serialized forms together stay
+/// within [`PRECEDENT_CHAR_BUDGET`], the lowest-ranked dropped first. The
 /// entry whose id is `exclude_entry_id` is never among them (D-06
 /// leave-one-out; run time passes `None`, since its question is new).
+///
+/// Similarity is the Jaccard overlap of the lowercase alphanumeric word sets
+/// of question plus option labels. Ties go to event-log entries before log
+/// entries, then the later `order`, then the smaller id.
 pub fn select_precedents(
     entries: &[CorpusEntry],
     spec: &QuestionSpec,
     exclude_entry_id: Option<&str>,
 ) -> Vec<Precedent> {
-    let _ = spec;
-    entries
+    let target = question_words(&spec.question, &spec.options);
+    let mut ranked: Vec<(f64, &CorpusEntry)> = entries
         .iter()
         .filter(|entry| Some(entry.id.as_str()) != exclude_entry_id)
-        .map(|entry| Precedent {
+        .map(|entry| {
+            (
+                jaccard(&target, &question_words(&entry.question, &entry.options)),
+                entry,
+            )
+        })
+        .collect();
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .total_cmp(left_score)
+            .then(source_rank(left.source).cmp(&source_rank(right.source)))
+            .then(right.order.cmp(&left.order))
+            .then(left.id.cmp(&right.id))
+    });
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for (_, entry) in ranked.into_iter().take(MAX_PRECEDENTS) {
+        let precedent = Precedent {
             question: entry.question.clone(),
             options: entry.options.clone(),
             answer: entry.answer.clone(),
-        })
+        };
+        let chars = precedent_state(&precedent).to_string().chars().count();
+        if used + chars > PRECEDENT_CHAR_BUDGET {
+            break;
+        }
+        used += chars;
+        kept.push(precedent);
+    }
+    kept
+}
+
+/// Event-log entries rank before log entries on equal similarity.
+fn source_rank(source: CorpusSource) -> u8 {
+    match source {
+        CorpusSource::Events => 0,
+        CorpusSource::DiscussionLog => 1,
+    }
+}
+
+/// The lowercase alphanumeric words of a question and its option labels.
+fn question_words(question: &str, options: &[QuestionOption]) -> HashSet<String> {
+    std::iter::once(question)
+        .chain(options.iter().map(|option| option.label.as_str()))
+        .flat_map(|text| text.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
         .collect()
+}
+
+/// `|a ∩ b| / |a ∪ b|`, or 0 when both are empty.
+fn jaccard(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
+    let union = left.union(right).count();
+    if union == 0 {
+        return 0.0;
+    }
+    left.intersection(right).count() as f64 / union as f64
 }
 
 /// The precedents for `spec` at run time: this project's labels only (D-04),
