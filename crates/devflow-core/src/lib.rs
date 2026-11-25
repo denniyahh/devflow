@@ -56,6 +56,7 @@ pub mod agent_result;
 pub mod agents;
 pub mod canary;
 pub mod config;
+pub mod corpus;
 #[cfg(test)]
 mod doc_check;
 pub(crate) mod durable;

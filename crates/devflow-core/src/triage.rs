@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::phase_id::PhaseId;
@@ -113,7 +114,8 @@ pub struct Precedent {
 }
 
 /// How the operator answered a precedent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PrecedentAnswer {
     /// The operator chose an offered option.
@@ -303,7 +305,7 @@ fn options_state(options: &[QuestionOption]) -> Value {
 }
 
 /// One precedent as Jev's `state` carries it.
-fn precedent_state(precedent: &Precedent) -> Value {
+pub(crate) fn precedent_state(precedent: &Precedent) -> Value {
     let answer = match &precedent.answer {
         PrecedentAnswer::Option { option_id } => json!({"option": option_id}),
         PrecedentAnswer::OwnWords { text } => json!({"own_words": text}),
