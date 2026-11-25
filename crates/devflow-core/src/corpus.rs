@@ -2140,4 +2140,255 @@ mod tests {
         };
         assert_eq!(report.excluded, expected);
     }
+
+    /// A scored decision whose operator answer is `answer` and whose Jev pick
+    /// is option `a`.
+    fn scored_entry(accept: f64, top: f64, answer: PrecedentAnswer) -> ScoredEntry {
+        ScoredEntry {
+            entry_id: "events:q".to_string(),
+            project: "p".to_string(),
+            kind: QuestionKind::Decision,
+            precedent_ids: Vec::new(),
+            accept: Some(accept),
+            top_option: Some("a".to_string()),
+            top_probability: Some(top),
+            hit: super::picked(&answer, Some("a")),
+            operator_answer: answer,
+            recommended_known: false,
+            picked_recommended: false,
+            error: None,
+            input_tokens: None,
+        }
+    }
+
+    /// The operator chose Jev's pick.
+    fn agreeing(accept: f64, top: f64) -> ScoredEntry {
+        scored_entry(accept, top, option("a"))
+    }
+
+    /// The operator chose an option other than Jev's pick.
+    fn disagreeing(accept: f64, top: f64) -> ScoredEntry {
+        scored_entry(accept, top, option("b"))
+    }
+
+    /// The operator answered in their own words.
+    fn in_own_words(accept: f64, top: f64) -> ScoredEntry {
+        scored_entry(accept, top, own_words("something else"))
+    }
+
+    fn repeated(count: usize, make: impl Fn() -> ScoredEntry) -> Vec<ScoredEntry> {
+        (0..count).map(|_| make()).collect()
+    }
+
+    /// `count` points at `score`, each agreeing or not.
+    fn points_at(count: usize, score: f64, agrees: bool) -> Vec<(f64, bool)> {
+        vec![(score, agrees); count]
+    }
+
+    #[test]
+    fn threshold_rule_needs_twenty_answered() {
+        assert_eq!(lowest_qualifying_threshold(&points_at(19, 0.9, true)), None);
+        let spread: Vec<(f64, bool)> = (0..20)
+            .map(|index| (0.3 + 0.6 * f64::from(index) / 19.0, true))
+            .collect();
+        assert_eq!(spread[0].0, 0.3);
+        assert_eq!(lowest_qualifying_threshold(&spread), Some(0.3));
+    }
+
+    #[test]
+    fn the_threshold_never_goes_below_the_lowest_observed_score() {
+        let points: Vec<(f64, bool)> = (0..40)
+            .map(|index| (0.6 + f64::from(index) / 100.0, true))
+            .collect();
+        assert_eq!(lowest_qualifying_threshold(&points), Some(0.6));
+        let candidates = threshold_candidates(&points);
+        assert_eq!(candidates.len(), 40);
+        for candidate in candidates {
+            assert!(
+                points.iter().any(|(score, _)| *score == candidate),
+                "candidate {candidate} is not an observed score"
+            );
+        }
+    }
+
+    #[test]
+    fn a_score_equal_to_the_threshold_is_answered() {
+        let mut points = points_at(2, 0.49, false);
+        points.push((0.50, true));
+        points.extend(points_at(19, 0.90, true));
+        assert_eq!(lowest_qualifying_threshold(&points), Some(0.50));
+        assert_eq!(
+            threshold_rule(&points),
+            ThresholdChoice::Chosen {
+                threshold: 0.50,
+                answered: 20,
+                agreeing: 20
+            }
+        );
+    }
+
+    #[test]
+    fn blocking_human_entries_are_not_scored() {
+        let mut scores = repeated(19, || agreeing(0.9, 0.9));
+        let mut blocking = agreeing(0.9, 0.9);
+        blocking.kind = QuestionKind::BlockingHuman;
+        scores.push(blocking);
+
+        let chosen = choose_thresholds(&scores);
+        assert_eq!(chosen.pre_check, ThresholdChoice::NoneQualifies);
+        assert_eq!(chosen.both(), None);
+        assert_eq!(chosen.blocking_human, 1);
+        let report = MeasurementReport::new("m", Vec::new(), &scores);
+        assert_eq!(report.requests, 19);
+        assert!(
+            render_report(&report)
+                .contains("Blocking-human questions (never sent, never counted): 1\n")
+        );
+
+        let control = repeated(20, || agreeing(0.9, 0.9));
+        assert!(choose_thresholds(&control).both().is_some());
+    }
+
+    #[test]
+    fn threshold_rule_needs_ninety_five_percent() {
+        let mut nineteen = points_at(19, 0.7, true);
+        nineteen.push((0.7, false));
+        assert_eq!(lowest_qualifying_threshold(&nineteen), Some(0.7));
+        let mut eighteen = points_at(18, 0.7, true);
+        eighteen.extend(points_at(2, 0.7, false));
+        assert_eq!(lowest_qualifying_threshold(&eighteen), None);
+    }
+
+    #[test]
+    fn the_lowest_qualifying_threshold_wins() {
+        let mut points: Vec<(f64, bool)> = [0.10, 0.20, 0.30, 0.40, 0.50]
+            .iter()
+            .map(|s| (*s, false))
+            .collect();
+        points.extend(points_at(20, 0.60, true));
+        assert_eq!(
+            threshold_rule(&points),
+            ThresholdChoice::Chosen {
+                threshold: 0.50,
+                answered: 21,
+                agreeing: 20
+            }
+        );
+    }
+
+    #[test]
+    fn equal_scores_are_answered_together() {
+        assert_eq!(
+            threshold_rule(&points_at(25, 0.5, true)),
+            ThresholdChoice::Chosen {
+                threshold: 0.5,
+                answered: 25,
+                agreeing: 25
+            }
+        );
+        // 19 of 21 is under 95%; any 20 of the tied 21 holding one miss
+        // would qualify, so a tie split at the threshold would pass here.
+        let mut tied = points_at(19, 0.7, true);
+        tied.extend(points_at(2, 0.7, false));
+        assert_eq!(threshold_rule(&tied), ThresholdChoice::NoneQualifies);
+    }
+
+    #[test]
+    fn a_text_answer_is_a_miss() {
+        let mut text = in_own_words(0.9, 0.9);
+        text.hit = true;
+        assert!(!text.answered_with_option());
+        assert!(!text.option_hit());
+
+        // Pre-check: 40 option answers and 2 own-words answers, 40/42.
+        // Option: 39 agree, 1 disagrees, 2 own words; counted as hits the
+        // own-words answers would make 41/42 and qualify.
+        let mut scores = repeated(39, || agreeing(0.9, 0.9));
+        scores.push(disagreeing(0.9, 0.9));
+        scores.extend(repeated(2, || text.clone()));
+        let chosen = choose_thresholds(&scores);
+        assert_eq!(
+            chosen.pre_check,
+            ThresholdChoice::Chosen {
+                threshold: 0.9,
+                answered: 42,
+                agreeing: 40
+            }
+        );
+        assert_eq!(chosen.option, ThresholdChoice::NoneQualifies);
+
+        let mut control = repeated(41, || agreeing(0.9, 0.9));
+        control.push(disagreeing(0.9, 0.9));
+        assert_eq!(
+            choose_thresholds(&control).option.threshold(),
+            Some(0.9),
+            "with the own-words answers as agreeing options, 41/42 qualifies"
+        );
+        let report = MeasurementReport::new("m", Vec::new(), &scores);
+        assert_eq!(report.free_text, 2);
+    }
+
+    #[test]
+    fn the_pre_check_threshold_is_chosen_first() {
+        let mut scores = repeated(20, || agreeing(0.9, 0.6));
+        scores.extend(repeated(5, || in_own_words(0.1, 0.95)));
+        let chosen = choose_thresholds(&scores);
+        assert_eq!(chosen.pre_check.threshold(), Some(0.9));
+        assert_eq!(
+            chosen.option,
+            ThresholdChoice::Chosen {
+                threshold: 0.6,
+                answered: 20,
+                agreeing: 20
+            }
+        );
+        let all_points: Vec<(f64, bool)> = scores
+            .iter()
+            .map(|entry| (entry.top_probability.unwrap(), entry.option_hit()))
+            .collect();
+        assert_eq!(
+            lowest_qualifying_threshold(&all_points),
+            None,
+            "over every entry the option rule finds nothing"
+        );
+    }
+
+    #[test]
+    fn no_qualifying_threshold_escalates_everything() {
+        let mut split = repeated(10, || agreeing(0.9, 0.6));
+        split.extend(repeated(10, || disagreeing(0.9, 0.6)));
+        let chosen = choose_thresholds(&split);
+        assert_eq!(chosen.pre_check.threshold(), Some(0.9));
+        assert_eq!(chosen.option, ThresholdChoice::NoneQualifies);
+        assert_eq!(chosen.both(), None);
+        let text = render_report(&MeasurementReport::new("m", Vec::new(), &split));
+        assert!(text.contains("Pre-check threshold: 0.9 (answered 20, option answers 20)\n"));
+        assert!(text.contains("Option threshold: none qualifies\n"));
+        assert!(text.contains("Result: escalate-all\n"));
+
+        let words = repeated(20, || in_own_words(0.9, 0.9));
+        let chosen = choose_thresholds(&words);
+        assert_eq!(chosen.pre_check, ThresholdChoice::NoneQualifies);
+        assert_eq!(chosen.option, ThresholdChoice::NotComputed);
+        let text = render_report(&MeasurementReport::new("m", Vec::new(), &words));
+        assert!(text.contains("Option threshold: not computed (no pre-check threshold)\n"));
+        assert!(text.contains("Result: escalate-all\n"));
+    }
+
+    #[test]
+    fn a_chosen_threshold_prints_in_round_trip_form() {
+        let score = 0.1 + 0.2;
+        assert_ne!(score, 0.3);
+        let scores = repeated(20, || agreeing(score, score));
+        let text = render_report(&MeasurementReport::new("m", Vec::new(), &scores));
+        for prefix in ["Pre-check threshold: ", "Option threshold: "] {
+            let printed = text
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .and_then(|rest| rest.split_whitespace().next())
+                .expect("the threshold line");
+            assert_eq!(printed.parse::<f64>().unwrap(), score, "{prefix}{printed}");
+        }
+        assert!(text.contains(&format!("Result: pre-check {score}, option {score}\n")));
+    }
 }
