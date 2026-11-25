@@ -306,6 +306,11 @@ fn precedent_state(precedent: &Precedent) -> Value {
     })
 }
 
+/// `text` without a recommendation marker, and whether one was removed (D-10).
+pub fn strip_recommended_marker(text: &str) -> (String, bool) {
+    (text.to_string(), false)
+}
+
 /// An option's `pick` criterion: `label — description`, or the label alone.
 fn criterion(option: &QuestionOption) -> String {
     match &option.description {
@@ -595,5 +600,165 @@ mod tests {
             pre_decide(QuestionKind::Decision, &without_pre_check),
             no_threshold
         );
+    }
+
+    /// Every object key anywhere in `value`.
+    fn keys_at_any_depth(value: &Value, keys: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    keys.push(key.clone());
+                    keys_at_any_depth(child, keys);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| keys_at_any_depth(item, keys)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn jev_never_sees_the_recommended_option() {
+        let spec = spec(
+            vec![
+                option("a", "Flat", Some("one module")),
+                option("b", "Nested (Recommended)", Some("one module per stage")),
+            ],
+            Some("b"),
+        );
+        let request = jev_request(&spec, &[], MODEL);
+        let mut keys = Vec::new();
+        keys_at_any_depth(&request, &mut keys);
+        assert!(
+            !keys.iter().any(|key| key == "recommended"),
+            "the request carries no `recommended` key: {request}"
+        );
+        let criteria = &request["questions"]["pick"]["criteria"];
+        assert_eq!(criteria["a"], "Flat — one module");
+        assert_eq!(criteria["b"], "Nested — one module per stage");
+        assert_eq!(request["state"]["options"][1]["label"], "Nested");
+    }
+
+    #[test]
+    fn a_recommended_marker_in_a_label_is_stripped() {
+        for (label, stripped) in [
+            ("Use X (Recommended)", "Use X"),
+            ("Use Y [recommended]", "Use Y"),
+            ("Use Z — recommended", "Use Z"),
+            ("Use W (recommended option)", "Use W"),
+            ("Use V (recommended default)", "Use V"),
+            ("Use U (Recommended — keeps the old path)", "Use U"),
+            ("Use T - recommended", "Use T"),
+        ] {
+            assert_eq!(
+                strip_recommended_marker(label),
+                (stripped.to_string(), true),
+                "{label}"
+            );
+            let spec = spec(vec![option("a", label, None)], None);
+            let request = jev_request(&spec, &[], MODEL);
+            assert_eq!(request["questions"]["pick"]["criteria"]["a"], stripped);
+        }
+        for kept in [
+            "The recommended Rust layout",
+            "Keep it (not recommended for CI)",
+        ] {
+            assert_eq!(strip_recommended_marker(kept), (kept.to_string(), false));
+        }
+    }
+
+    fn unparsable(body: &Value) -> String {
+        match parse_jev_response(body, &two_options(), MODEL) {
+            Err((FallbackReason::Unparsable, detail)) => detail,
+            other => panic!("expected an unparsable response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_response_missing_probabilities_is_unparsable() {
+        let mut body = response(MODEL, 0.9, "a", json!({"a": 0.9, "b": 0.1}));
+        body["answers"]["pick"]
+            .as_object_mut()
+            .unwrap()
+            .remove("probabilities");
+        unparsable(&body);
+    }
+
+    #[test]
+    fn a_missing_sibling_probability_is_unparsable() {
+        let detail = unparsable(&response(MODEL, 0.9, "a", json!({"a": 0.99})));
+        assert!(
+            detail.contains("`b`"),
+            "the detail names the missing id: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_answer_type_is_unparsable() {
+        let mut pick_is_noul = response(MODEL, 0.9, "a", json!({"a": 0.9, "b": 0.1}));
+        pick_is_noul["answers"]["pick"]["type"] = json!("noul");
+        unparsable(&pick_is_noul);
+        let mut accept_is_choice = response(MODEL, 0.9, "a", json!({"a": 0.9, "b": 0.1}));
+        accept_is_choice["answers"]["accept"]["type"] = json!("choice");
+        unparsable(&accept_is_choice);
+    }
+
+    #[test]
+    fn a_distribution_that_does_not_sum_to_one_is_unparsable() {
+        unparsable(&response(MODEL, 0.9, "a", json!({"a": 0.9, "b": 0.5})));
+        let inside_tolerance = response(MODEL, 0.9, "a", json!({"a": 0.6, "b": 0.395}));
+        parse_jev_response(&inside_tolerance, &two_options(), MODEL)
+            .expect("a sum of 0.995 is inside the tolerance");
+    }
+
+    #[test]
+    fn a_choice_that_was_not_offered_is_unparsable() {
+        let detail = unparsable(&response(MODEL, 0.9, "c", json!({"a": 0.5, "b": 0.5})));
+        assert!(
+            detail.contains("`c`"),
+            "the detail names the choice: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_probability_is_unparsable() {
+        unparsable(&response(MODEL, 1.5, "a", json!({"a": 0.9, "b": 0.1})));
+        unparsable(&response(MODEL, 0.9, "a", json!({"a": -0.1, "b": 1.1})));
+    }
+
+    #[test]
+    fn a_different_model_is_a_mismatch() {
+        let body = response("jev-1.13.0", 0.9, "a", json!({"a": 0.9, "b": 0.1}));
+        match parse_jev_response(&body, &two_options(), MODEL) {
+            Err((FallbackReason::ModelMismatch, detail)) => {
+                assert!(
+                    detail.contains("jev-1.13.0") && detail.contains("jev-1.14.0"),
+                    "the detail names both ids: {detail}"
+                );
+            }
+            other => panic!("expected a model mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_equal_probabilities_use_the_named_choice() {
+        let body = response(MODEL, 0.9, "b", json!({"a": 0.5, "b": 0.5}));
+        let scores = parse_jev_response(&body, &two_options(), MODEL).expect("parses");
+        let config = TriageConfig::with_thresholds(Some(0.4), Some(0.4));
+        match decide(&scores, &config) {
+            TriageOutcome::Decided { option_id, .. } => assert_eq!(option_id, "b"),
+            other => panic!("expected b to be decided, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_threshold_reads_the_chosen_probability_not_confidence() {
+        let mut body = response(MODEL, 0.9, "a", json!({"a": 0.9, "b": 0.1}));
+        body["answers"]["pick"]["confidence"] = json!(0.2);
+        let scores = parse_jev_response(&body, &two_options(), MODEL).expect("parses");
+        let config = TriageConfig::with_thresholds(Some(0.5), Some(0.5));
+        assert!(matches!(
+            decide(&scores, &config),
+            TriageOutcome::Decided { ref option_id, .. } if option_id == "a"
+        ));
     }
 }
