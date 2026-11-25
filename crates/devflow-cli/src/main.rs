@@ -93,6 +93,10 @@ enum Command {
         /// given. No environment variable selects it.
         #[arg(long)]
         fallback_agent: Option<AgentKind>,
+        /// Turn decision triage off for this run: every question goes to the
+        /// operator. Refused when devflow.toml does not enable triage.
+        #[arg(long)]
+        no_triage: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -170,6 +174,11 @@ enum Command {
         /// NN-REVIEWS.md.
         #[arg(long)]
         reviews: bool,
+        /// Turn decision triage off for the resumed run: every question goes to
+        /// the operator. Refused when devflow.toml does not enable triage, and when
+        /// the run already has triage off; omit it to keep the run's setting.
+        #[arg(long)]
+        no_triage: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -532,6 +541,7 @@ fn run() -> Result<(), CliError> {
             until,
             reviews,
             fallback_agent,
+            no_triage,
             project,
         } => {
             // Worktree is the default; `--no-worktree` is the only switch.
@@ -546,6 +556,7 @@ fn run() -> Result<(), CliError> {
                 until,
                 reviews,
                 commands::FallbackSource::FlagOrConfig(fallback_agent),
+                no_triage,
             )
         }
         Command::Runner { project, phase } => {
@@ -583,6 +594,7 @@ fn run() -> Result<(), CliError> {
             agent,
             fallback_agent,
             reviews,
+            no_triage,
             project,
         } => resume_with_fallback(
             &project_root(project)?,
@@ -590,6 +602,7 @@ fn run() -> Result<(), CliError> {
             agent,
             fallback_agent,
             reviews,
+            no_triage,
         ),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),

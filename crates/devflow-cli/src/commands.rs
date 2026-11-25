@@ -331,6 +331,7 @@ pub(crate) fn start(
     until: Option<Stage>,
     reviews: bool,
     fallback: FallbackSource,
+    no_triage: bool,
 ) -> Result<(), CliError> {
     // 999.229: said first, before any other output, a refusal or the dry-run
     // return. The detached supervisor that reads the value has no foreground.
@@ -396,6 +397,9 @@ pub(crate) fn start(
             );
         }
     }
+
+    // D-09: judged with the other refusals before `dry_run`, so a dry run prints it too.
+    state.triage_off = no_triage;
 
     if dry_run {
         return start_dry_run(project_root, &state);
@@ -9158,6 +9162,7 @@ mod tests {
                 None,
                 false,
                 FallbackSource::FlagOrConfig(None),
+                false,
             )
             .map_err(|err| err.to_string())
         };
@@ -15170,6 +15175,7 @@ mod tests {
             None,
             false,
             FallbackSource::FlagOrConfig(None),
+            false,
         )
         .map_err(|err| err.to_string())
     }
@@ -15206,6 +15212,7 @@ mod tests {
             None,
             false,
             FallbackSource::FlagOrConfig(fallback),
+            false,
         )
     }
 
@@ -16229,6 +16236,7 @@ mod tests {
             None,
             false,
             FallbackSource::FlagOrConfig(None),
+            false,
         )
         .map_err(|err| err.to_string())
     }

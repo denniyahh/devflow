@@ -2166,7 +2166,7 @@ pub(crate) fn resume(
     phase: PhaseId,
     agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
-    resume_with_fallback(project_root, phase, agent, None, false)
+    resume_with_fallback(project_root, phase, agent, None, false, false)
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
@@ -2218,6 +2218,7 @@ pub(crate) fn resume_with_fallback(
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
     reviews: bool,
+    no_triage: bool,
 ) -> Result<(), CliError> {
     // 999.229: said first, so it prints even when the resume then refuses.
     if let Some(warning) = devflow_core::config::external_verify_env_warning_now() {
@@ -2255,6 +2256,7 @@ pub(crate) fn resume_with_fallback(
         agent,
         fallback_agent,
         reviews,
+        no_triage,
     )?;
     // #338 WR-01, F05: the state resume committed (`commit` replaced `state` with it), as
     // start keeps `written`; not reloaded, so a runner's write cannot pass for resume's.
@@ -2633,6 +2635,7 @@ fn resume_loaded(
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
     reviews: bool,
+    no_triage: bool,
 ) -> Result<State, CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
     // D-04, restrictive verbs: `--reviews` is judged before any write, the state first,
@@ -2744,6 +2747,10 @@ fn resume_loaded(
         }
         if reviews {
             s.reviews_pass = true;
+        }
+        // D-09: a plain resume keeps the run's triage setting.
+        if no_triage {
+            s.triage_off = true;
         }
         s.gate_pending = false;
         // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
@@ -4145,7 +4152,7 @@ mod tests {
         let state_file = workflow::state_path(root, phase);
         let before = std::fs::read(&state_file).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, None, true);
+        let result = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         let err = result.err().map(|err| err.to_string()).unwrap_or_default();
         assert!(
@@ -4196,7 +4203,7 @@ mod tests {
         let state_file = workflow::state_path(root, phase);
         let before = std::fs::read(&state_file).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, None, true);
+        let result = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         let err = result.err().map(|err| err.to_string()).unwrap_or_default();
         assert!(
@@ -4236,7 +4243,7 @@ mod tests {
         );
         write_reviews_file(root, phase);
         crate::service::double::set_launch_end(crate::service::double::LaunchEnd::Failed);
-        let error = resume_with_fallback(root, phase, None, None, true)
+        let error = resume_with_fallback(root, phase, None, None, true, false)
             .expect_err("a failed launch fails")
             .to_string();
         assert!(
@@ -4252,7 +4259,7 @@ mod tests {
         );
 
         crate::service::double::set_launch_end(crate::service::double::LaunchEnd::Started);
-        let retry = resume_with_fallback(root, phase, None, None, true);
+        let retry = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         retry.expect("the retried resume --reviews launches");
     }
@@ -4291,7 +4298,7 @@ mod tests {
             .expect("the stand-in runner writes the state");
         });
 
-        let result = resume_with_fallback(root, phase, None, None, true);
+        let result = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         let error = result
             .expect_err("a timed-out resume with no live runner fails")
@@ -4393,7 +4400,7 @@ mod tests {
         write_reviews_file(root, phase);
         let saved = workflow::load_state(root, phase).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, None, true);
+        let result = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5732,7 +5739,7 @@ mod tests {
         let phase = PhaseId::new(5144);
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false);
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false, false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5779,7 +5786,7 @@ mod tests {
         let paused = workflow::load_state(root, phase).unwrap();
         assert!(!paused.stopped, "the run is not stopped");
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false);
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false, false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5849,7 +5856,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None, false);
+        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None, false, false);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let err = result
             .expect_err("handing the run to its own unused fallback is refused")
@@ -5893,7 +5900,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude), false);
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude), false, false);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let err = result
             .expect_err("a fallback equal to the run's agent is refused")
@@ -9292,7 +9299,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = resume_loaded(root, phase, state, None, None, false);
+        let result = resume_loaded(root, phase, state, None, None, false, false);
         result.unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
