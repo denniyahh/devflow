@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use crate::state::AgentKind;
+use crate::triage::TriageConfig;
 
 /// Number of capture generations retained when not otherwise configured.
 ///
@@ -528,6 +529,18 @@ fn fallback_agent_to(
     key.fallback_agent
         .map(|value| value.parse::<AgentKind>().map_err(|error| refusal(&error)))
         .transpose()
+}
+
+/// Resolve `devflow.toml`'s `[triage]` table (D-07, D-09), writing a
+/// `warning:` line to stderr for every value it cannot use.
+pub fn triage_config(project_root: &Path) -> TriageConfig {
+    triage_config_to(project_root, &mut std::io::stderr())
+}
+
+/// [`triage_config`], writing its warning lines to `err`.
+pub fn triage_config_to(project_root: &Path, err: &mut dyn std::io::Write) -> TriageConfig {
+    let _ = (project_root, err);
+    TriageConfig::default()
 }
 
 fn env_value(key: &str) -> Option<String> {
@@ -1231,5 +1244,90 @@ mod tests {
             not_a_string.contains("cannot read `fallback_agent`"),
             "the refusal names the key: {not_a_string}"
         );
+    }
+
+    /// The triage config for a project whose `devflow.toml` holds `contents`,
+    /// and the warning lines it wrote.
+    fn triage_for(contents: Option<&str>) -> (TriageConfig, String) {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(contents) = contents {
+            std::fs::write(dir.path().join("devflow.toml"), contents).unwrap();
+        }
+        let mut sink = Vec::new();
+        let config = triage_config_to(dir.path(), &mut sink);
+        (config, String::from_utf8(sink).unwrap())
+    }
+
+    #[test]
+    fn triage_is_off_by_default() {
+        for contents in [None, Some("capture_retention = 3\n")] {
+            let (config, warnings) = triage_for(contents);
+            assert!(!config.enabled, "{contents:?} must leave triage off");
+            assert_eq!(warnings, "", "{contents:?} must not warn");
+        }
+    }
+
+    #[test]
+    fn an_invalid_threshold_escalates_everything() {
+        for key in ["threshold", "pre_check_threshold"] {
+            for value in ["\"high\"", "-0.1", "1.5", "nan", "2"] {
+                let (config, warnings) =
+                    triage_for(Some(&format!("[triage]\nenabled = true\n{key} = {value}\n")));
+                let resolved = if key == "threshold" {
+                    config.threshold
+                } else {
+                    config.pre_check_threshold
+                };
+                assert_eq!(resolved, None, "{key} = {value} must escalate everything");
+                assert!(
+                    warnings.contains(&format!("warning: devflow.toml [triage] {key}"))
+                        && warnings.contains("escalating every question"),
+                    "{key} = {value} must warn: {warnings:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_valid_threshold_is_used() {
+        for (value, expected) in [("0.9", 0.9), ("1", 1.0), ("0", 0.0)] {
+            let (config, warnings) = triage_for(Some(&format!(
+                "[triage]\nenabled = true\nthreshold = {value}\npre_check_threshold = {value}\n"
+            )));
+            assert_eq!(config.threshold, Some(expected), "threshold = {value}");
+            assert_eq!(config.pre_check_threshold, Some(expected), "pre_check = {value}");
+            assert_eq!(warnings, "", "threshold = {value} must not warn");
+        }
+    }
+
+    #[test]
+    fn a_configured_threshold_overrides_the_default() {
+        let (absent, _) = triage_for(Some("[triage]\nenabled = true\n"));
+        assert_eq!(absent.threshold, crate::triage::DEFAULT_THRESHOLD);
+        assert_eq!(
+            absent.pre_check_threshold,
+            crate::triage::DEFAULT_PRE_CHECK_THRESHOLD
+        );
+        for value in [0.25, 0.75] {
+            let (config, warnings) = triage_for(Some(&format!(
+                "[triage]\nenabled = true\nthreshold = {value}\npre_check_threshold = {value}\n"
+            )));
+            assert_eq!(config.threshold, Some(value));
+            assert_eq!(config.pre_check_threshold, Some(value));
+            assert_eq!(warnings, "");
+        }
+    }
+
+    #[test]
+    fn a_non_bool_enabled_turns_triage_off() {
+        let (config, warnings) = triage_for(Some("[triage]\nenabled = \"yes\"\n"));
+        assert!(!config.enabled);
+        assert!(
+            warnings.contains("warning: devflow.toml [triage] enabled"),
+            "a non-bool enabled must warn: {warnings:?}"
+        );
+        let (control, control_warnings) = triage_for(Some("[triage]\nenabled = true\n"));
+        assert!(control.enabled, "a bool enabled turns triage on");
+        assert_eq!(control_warnings, "");
     }
 }

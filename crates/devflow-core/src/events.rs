@@ -37,6 +37,19 @@ pub fn emit(project_root: &Path, phase: PhaseId, event: &str, fields: serde_json
     emit_to(project_root, phase, event, fields, &mut std::io::stderr());
 }
 
+/// Append one event line exactly as [`emit`] does, returning the append's
+/// error instead of warning. A caller whose outcome depends on the record
+/// (a triage decision, an override, a discard) uses this and fails closed.
+pub fn try_emit(
+    project_root: &Path,
+    phase: PhaseId,
+    event: &str,
+    fields: serde_json::Value,
+) -> std::io::Result<()> {
+    let _ = (project_root, phase, event, fields);
+    Ok(())
+}
+
 /// [`emit`], writing the warning line for an event it could not record to
 /// `err`: with tracing off by default that line is the operator's only sign
 /// that the log is missing an event.
@@ -623,5 +636,27 @@ mod tests {
             "transition",
             serde_json::Value::Null,
         );
+    }
+
+    #[test]
+    fn try_emit_reports_a_failed_append() {
+        let dir = tempfile::tempdir().unwrap();
+        // The log path is a directory, so the append cannot open it.
+        std::fs::create_dir_all(events_path(dir.path())).unwrap();
+        let failed = try_emit(dir.path(), PhaseId::new(7), "probe", serde_json::json!({}));
+        assert!(failed.is_err(), "an unwritable log must be an error");
+
+        let writable = tempfile::tempdir().unwrap();
+        try_emit(
+            writable.path(),
+            PhaseId::new(7),
+            "probe",
+            serde_json::json!({"question_id": "q-1"}),
+        )
+        .expect("a writable log records the event");
+        let lines = read_lines(writable.path());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event"], "probe");
+        assert_eq!(lines[0]["question_id"], "q-1");
     }
 }

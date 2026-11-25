@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use crate::phase_id::PhaseId;
-use crate::question::{QuestionOption, QuestionSpec};
+use crate::question::{QuestionKind, QuestionOption, QuestionSpec};
 
 /// The `answered_by` value of a question triage decided (D-12).
 pub const TRIAGE_ANSWERER: &str = "triage:jev";
@@ -29,6 +29,14 @@ pub const DEFAULT_MODEL: &str = "jev-1.14.0";
 /// The request timeout when `[triage] timeout_secs` is absent (the SDK's
 /// per-operation default).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// The option threshold when `[triage] threshold` is absent. `None`
+/// escalates every question until a measured value is recorded (D-07).
+pub const DEFAULT_THRESHOLD: Option<f64> = None;
+
+/// The pre-check threshold when `[triage] pre_check_threshold` is absent.
+/// `None` escalates every question until a measured value is recorded (D-07).
+pub const DEFAULT_PRE_CHECK_THRESHOLD: Option<f64> = None;
 
 /// The instructions of the `accept` question.
 const ACCEPT_INSTRUCTIONS: &str = "Would the operator accept one of the offered `options` as \
@@ -60,6 +68,16 @@ pub struct TriageConfig {
     pub timeout: Duration,
     /// Phases whose recorded answers are not used as precedents (D-23).
     pub exclude_label_phases: Vec<PhaseId>,
+}
+
+impl Default for TriageConfig {
+    /// Triage off, every value at its default (D-09).
+    fn default() -> Self {
+        TriageConfig {
+            enabled: false,
+            ..TriageConfig::with_thresholds(DEFAULT_THRESHOLD, DEFAULT_PRE_CHECK_THRESHOLD)
+        }
+    }
 }
 
 impl TriageConfig {
@@ -384,6 +402,14 @@ pub fn decide(scores: &JevScores, config: &TriageConfig) -> TriageOutcome {
     }
 }
 
+/// The outcome of a question that is not sent to Jev at all: a
+/// `blocking-human` question (D-08), then any question while a threshold is
+/// unset (D-07). `None` means the question is to be scored.
+pub fn pre_decide(kind: QuestionKind, config: &TriageConfig) -> Option<TriageOutcome> {
+    let _ = (kind, config);
+    None
+}
+
 /// Whether `score` reaches `threshold` (D-24's `>=`). A NaN never reaches.
 fn reaches(score: f64, threshold: f64) -> bool {
     score >= threshold
@@ -392,7 +418,6 @@ fn reaches(score: f64, threshold: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::question::QuestionKind;
 
     const MODEL: &str = "jev-1.14.0";
 
@@ -466,5 +491,98 @@ mod tests {
             TriageOutcome::Decided { option_id, .. } => assert_eq!(option_id, "a"),
             other => panic!("expected a decision, got {other:?}"),
         }
+    }
+
+    fn scores(accept: f64, top_probability: f64) -> JevScores {
+        JevScores {
+            accept,
+            top_option: "a".to_string(),
+            top_probability,
+            model: MODEL.to_string(),
+        }
+    }
+
+    fn escalation(outcome: TriageOutcome) -> EscalateReason {
+        match outcome {
+            TriageOutcome::Escalated { reason, .. } => reason,
+            other => panic!("expected an escalation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_score_equal_to_the_threshold_decides() {
+        let config = TriageConfig::with_thresholds(Some(0.8), Some(0.9));
+        let outcome = decide(&scores(0.9, 0.8), &config);
+        assert!(
+            matches!(outcome, TriageOutcome::Decided { ref option_id, .. } if option_id == "a"),
+            "a score equal to its threshold decides (D-24): {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_score_one_step_below_the_threshold_escalates() {
+        let config = TriageConfig::with_thresholds(Some(0.8), Some(0.9));
+        let below_pre_check = f64::from_bits(0.9f64.to_bits() - 1);
+        assert_eq!(
+            escalation(decide(&scores(below_pre_check, 0.8), &config)),
+            EscalateReason::PreCheckBelowThreshold
+        );
+        let below_threshold = f64::from_bits(0.8f64.to_bits() - 1);
+        assert_eq!(
+            escalation(decide(&scores(0.9, below_threshold), &config)),
+            EscalateReason::TopProbabilityBelowThreshold
+        );
+    }
+
+    #[test]
+    fn a_threshold_above_any_probability_never_decides() {
+        let above_one = f64::from_bits(1.0f64.to_bits() + 1);
+        let config = TriageConfig::with_thresholds(Some(above_one), Some(above_one));
+        assert_eq!(
+            escalation(decide(&scores(1.0, 1.0), &config)),
+            EscalateReason::PreCheckBelowThreshold
+        );
+    }
+
+    #[test]
+    fn a_threshold_of_zero_decides_any_score() {
+        let config = TriageConfig::with_thresholds(Some(0.0), Some(0.0));
+        let outcome = decide(&scores(0.0, 0.5), &config);
+        assert!(
+            matches!(outcome, TriageOutcome::Decided { .. }),
+            "threshold 0.0 decides every score (D-22): {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_blocking_human_question_is_never_scored() {
+        let config = TriageConfig::with_thresholds(Some(0.0), Some(0.0));
+        assert_eq!(
+            pre_decide(QuestionKind::BlockingHuman, &config),
+            Some(TriageOutcome::Escalated {
+                reason: EscalateReason::BlockingHuman,
+                scores: None,
+            })
+        );
+        assert_eq!(pre_decide(QuestionKind::Discuss, &config), None);
+        assert_eq!(pre_decide(QuestionKind::Decision, &config), None);
+    }
+
+    #[test]
+    fn no_threshold_escalates_without_a_request() {
+        let no_threshold = Some(TriageOutcome::Escalated {
+            reason: EscalateReason::NoThreshold,
+            scores: None,
+        });
+        let without_option_threshold = TriageConfig::with_thresholds(None, Some(0.5));
+        assert_eq!(
+            pre_decide(QuestionKind::Decision, &without_option_threshold),
+            no_threshold
+        );
+        let without_pre_check = TriageConfig::with_thresholds(Some(0.5), None);
+        assert_eq!(
+            pre_decide(QuestionKind::Decision, &without_pre_check),
+            no_threshold
+        );
     }
 }
