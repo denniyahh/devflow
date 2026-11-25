@@ -11,7 +11,7 @@
 //! call ([`precedents_for`]) and the scoring tool both use it.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,7 +19,9 @@ use serde_json::Value;
 use crate::events;
 use crate::phase_id::PhaseId;
 use crate::question::{AnswererKind, QuestionKind, QuestionOption, QuestionSpec, answerer_kind};
-use crate::triage::{Precedent, PrecedentAnswer, TriageConfig, precedent_state};
+use crate::triage::{
+    Precedent, PrecedentAnswer, TriageConfig, precedent_state, strip_recommended_marker,
+};
 
 /// The most precedents one question is sent with (Pitfall 9).
 pub const MAX_PRECEDENTS: usize = 8;
@@ -128,7 +130,8 @@ pub fn mine_project(
     exclude_phases: &[PhaseId],
 ) -> MiningReport {
     let mut report = MiningReport::default();
-    mine_events(project_root, project, exclude_phases, &mut report);
+    let channel_phases = mine_events(project_root, project, exclude_phases, &mut report);
+    mine_logs(project_root, project, &channel_phases, &mut report);
     report
 }
 
@@ -195,12 +198,14 @@ fn event_label<'a>(
 
 /// Pair each `question_asked` with its answer and its last operator override
 /// by `question_id`, keeping operator labels outside `exclude_phases`.
+/// Returns the phases holding an operator-answered `discuss` question: their
+/// discuss ran through `devflow_ask`, so their logs restate the events.
 fn mine_events(
     project_root: &Path,
     project: &str,
     exclude_phases: &[PhaseId],
     report: &mut MiningReport,
-) {
+) -> HashSet<PhaseId> {
     let (log, unreadable) = read_events(project_root);
     report.excluded.unreadable_event_lines += unreadable;
     let mut asked: Vec<&Value> = Vec::new();
@@ -221,6 +226,7 @@ fn mine_events(
             _ => {}
         }
     }
+    let mut channel_phases = HashSet::new();
     for question in asked {
         let qid = question["question_id"].as_str().unwrap_or_default();
         let answer = match event_label(answers.get(qid).copied(), overrides.get(qid).copied()) {
@@ -240,14 +246,17 @@ fn mine_events(
             report.excluded.unparsed += 1;
             continue;
         };
-        if PhaseId::from_json(question.get("phase"))
-            .is_some_and(|phase| exclude_phases.contains(&phase))
-        {
+        let phase = PhaseId::from_json(question.get("phase"));
+        if let Some(phase) = phase.filter(|_| entry.kind == QuestionKind::Discuss) {
+            channel_phases.insert(phase);
+        }
+        if phase.is_some_and(|phase| exclude_phases.contains(&phase)) {
             report.excluded.excluded_phase += 1;
             continue;
         }
         report.entries.push(entry);
     }
+    channel_phases
 }
 
 /// An event's `answer` (`{option_id}` or `{text}`) as a precedent answer.
@@ -303,6 +312,430 @@ fn event_phase(phase: Option<&Value>) -> String {
         (None, Some(Value::String(text))) => text.clone(),
         (None, Some(other)) => other.to_string(),
         (None, None) => String::new(),
+    }
+}
+
+/// The end of a discuss log's file name; the part before it is the phase.
+const LOG_SUFFIX: &str = "-DISCUSSION-LOG.md";
+
+/// The paths inside `dir` (none when it cannot be read), sorted.
+fn dir_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// `<root>/.planning/phases/*/` and `<root>/.planning/milestones/*-phases/*/`
+/// discuss logs, read at fixed depth so no symlink can loop the walk.
+fn discussion_logs(project_root: &Path) -> Vec<PathBuf> {
+    let planning = project_root.join(".planning");
+    let mut phase_dirs = dir_paths(&planning.join("phases"));
+    for milestone in dir_paths(&planning.join("milestones")) {
+        let name = milestone.file_name().and_then(|name| name.to_str());
+        if name.is_some_and(|name| name.ends_with("-phases")) {
+            phase_dirs.extend(dir_paths(&milestone));
+        }
+    }
+    phase_dirs
+        .iter()
+        .filter(|dir| dir.is_dir())
+        .flat_map(|dir| dir_paths(dir))
+        .filter(|path| path.is_file() && path.to_string_lossy().ends_with(LOG_SUFFIX))
+        .collect()
+}
+
+/// One `| Option | Description | Selected |` table and the lines after it.
+struct LogBlock {
+    /// The 1-based line of the table header.
+    line: usize,
+    /// The question heading, else the area heading.
+    question: Option<String>,
+    /// The area heading, when the question came from a `### ` heading.
+    context: Option<String>,
+    /// Each row: label, description, whether it carries `✓`.
+    rows: Vec<(String, String, bool)>,
+    /// The `**User's choice…:**` line: its parenthetical and its text.
+    choice: Option<(String, String)>,
+    /// Whether the pick is marked `[auto]`.
+    auto_marker: bool,
+}
+
+/// What a table header line is.
+enum TableHeader {
+    /// `| Option | Description | Selected |`: a question.
+    Question,
+    /// Another table whose first column is `Option`: a block that does not fit.
+    Other,
+    /// Not an option table.
+    None,
+}
+
+/// A table line's trimmed cells.
+fn row_cells(line: &str) -> Vec<String> {
+    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
+    inner
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+fn table_header(line: &str) -> TableHeader {
+    if !line.trim_start().starts_with('|') {
+        return TableHeader::None;
+    }
+    let cells: Vec<String> = row_cells(line)
+        .iter()
+        .map(|cell| cell.to_lowercase())
+        .collect();
+    match cells.as_slice() {
+        [option, description, selected]
+            if option == "option" && description == "description" && selected == "selected" =>
+        {
+            TableHeader::Question
+        }
+        [option, ..] if option == "option" => TableHeader::Other,
+        _ => TableHeader::None,
+    }
+}
+
+/// Whether a table line is a `|---|---|` separator.
+fn is_separator(line: &str) -> bool {
+    row_cells(line)
+        .iter()
+        .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
+}
+
+/// `title` without a `Q<n>:` / `Q<n> —` / `Q<n> -` / `Q<n>.` prefix.
+fn strip_question_number(title: &str) -> String {
+    let title = title.trim();
+    if let Some(rest) = title.strip_prefix('Q') {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        let tail = &rest[digits..];
+        let stripped = tail
+            .trim_start_matches(|c: char| matches!(c, ':' | '—' | '-' | '.') || c.is_whitespace());
+        if digits > 0 && stripped.len() < tail.len() {
+            return stripped.to_string();
+        }
+    }
+    title.to_string()
+}
+
+/// The parenthetical and text of a `**User's choice…:**` line at `start`,
+/// the text running over following lines until a blank line, a heading, a
+/// table row or a `**` line, cut at any `→`.
+fn choice_at(lines: &[&str], start: usize, end: usize) -> Option<(String, String)> {
+    let line = lines[start].trim();
+    let rest = line
+        .strip_prefix("**User's choice")
+        .or_else(|| line.strip_prefix("**User\u{2019}s choice"))?;
+    let close = rest.find(":**")?;
+    let mut text = vec![rest[close + 3..].trim().to_string()];
+    for line in &lines[start + 1..end] {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with('|')
+            || line.starts_with("**")
+        {
+            break;
+        }
+        text.push(line.to_string());
+    }
+    let joined = text.join(" ");
+    let before_arrow = joined
+        .split('→')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Some((rest[..close].trim().to_string(), before_arrow))
+}
+
+/// The question table whose header is `lines[start]`, and the index after
+/// its answer block (the next table or heading).
+fn parse_block(
+    lines: &[&str],
+    start: usize,
+    question: Option<String>,
+    context: Option<String>,
+) -> (LogBlock, usize) {
+    let mut next = start + 1;
+    let mut rows = Vec::new();
+    while next < lines.len() && lines[next].trim_start().starts_with('|') {
+        if !is_separator(lines[next]) {
+            let cells = row_cells(lines[next]);
+            let selected = cells.len() >= 2 && cells[cells.len() - 1].contains('✓');
+            let description = if cells.len() >= 3 {
+                cells[1..cells.len() - 1].join("|")
+            } else {
+                String::new()
+            };
+            rows.push((cells[0].clone(), description, selected));
+        }
+        next += 1;
+    }
+    let mut end = next;
+    while end < lines.len() && !lines[end].trim_start().starts_with(['#', '|']) {
+        end += 1;
+    }
+    let choice = (next..end).find_map(|index| choice_at(lines, index, end));
+    let region_auto = lines[next..end]
+        .iter()
+        .any(|line| line.to_lowercase().contains("[auto]"));
+    let row_auto = rows
+        .iter()
+        .any(|(label, _, selected)| *selected && label.to_lowercase().contains("[auto]"));
+    let block = LogBlock {
+        line: start + 1,
+        question,
+        context,
+        rows,
+        choice,
+        auto_marker: region_auto || row_auto,
+    };
+    (block, end)
+}
+
+/// Every question table in a log, and how many other option tables it has.
+fn parse_log(text: &str) -> (Vec<LogBlock>, usize) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut blocks = Vec::new();
+    let mut other_tables = 0;
+    let mut area: Option<String> = None;
+    let mut heading: Option<String> = None;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if let Some(title) = line.strip_prefix("### ") {
+            heading = Some(strip_question_number(title));
+        } else if let Some(title) = line.strip_prefix("## ") {
+            area = Some(title.trim().to_string());
+            heading = None;
+        } else {
+            match table_header(line) {
+                TableHeader::Question => {
+                    let (question, context) = match heading.take() {
+                        Some(heading) => (Some(heading), area.clone()),
+                        None => (area.clone(), None),
+                    };
+                    let (block, end) = parse_block(&lines, index, question, context);
+                    blocks.push(block);
+                    index = end;
+                    continue;
+                }
+                TableHeader::Other => {
+                    other_tables += 1;
+                    index += 1;
+                    while index < lines.len() && lines[index].trim_start().starts_with('|') {
+                        index += 1;
+                    }
+                    continue;
+                }
+                TableHeader::None => {}
+            }
+        }
+        index += 1;
+    }
+    (blocks, other_tables)
+}
+
+/// How a log question's pick counts.
+enum LogOutcome {
+    Label(PrecedentAnswer),
+    Auto,
+    Delegation,
+    MultiSelect,
+    Unparsed,
+}
+
+/// `text` lowercased with whitespace collapsed and recommendation markers
+/// removed, for matching a choice to a label.
+fn fold_label(text: &str) -> String {
+    let (text, _) = strip_recommended_marker(text);
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether `text` hands the choice back (D-24).
+fn is_delegation(text: &str) -> bool {
+    let text = text.to_lowercase().replace('\u{2019}', "'");
+    DELEGATION_PHRASES
+        .iter()
+        .any(|phrase| text.contains(phrase))
+}
+
+/// The pick a block records: a free-text choice, else the one `✓` row, else
+/// the choice text matched to a label or kept as own words.
+fn classify_block(block: &LogBlock, options: &[QuestionOption]) -> LogOutcome {
+    if block.auto_marker {
+        return LogOutcome::Auto;
+    }
+    let selected: Vec<&QuestionOption> = block
+        .rows
+        .iter()
+        .zip(options)
+        .filter(|((_, _, selected), _)| *selected)
+        .map(|(_, option)| option)
+        .collect();
+    let free_text = block.choice.as_ref().filter(|(parenthetical, _)| {
+        let parenthetical = parenthetical.to_lowercase();
+        parenthetical.contains("text") || parenthetical.contains("verbatim")
+    });
+    let (answer, said) = match (free_text, selected.as_slice(), &block.choice) {
+        (Some((_, text)), _, _) => (
+            PrecedentAnswer::OwnWords { text: text.clone() },
+            text.clone(),
+        ),
+        (None, [option], _) => (
+            PrecedentAnswer::Option {
+                option_id: option.id.clone(),
+            },
+            option.label.clone(),
+        ),
+        (None, [_, _, ..], _) => return LogOutcome::MultiSelect,
+        (None, [], Some((_, text))) => match options
+            .iter()
+            .find(|option| fold_label(&option.label) == fold_label(text))
+        {
+            Some(option) => (
+                PrecedentAnswer::Option {
+                    option_id: option.id.clone(),
+                },
+                option.label.clone(),
+            ),
+            None => (
+                PrecedentAnswer::OwnWords { text: text.clone() },
+                text.clone(),
+            ),
+        },
+        (None, [], None) => return LogOutcome::Unparsed,
+    };
+    if said.is_empty() {
+        return LogOutcome::Unparsed;
+    }
+    if is_delegation(&said) {
+        return LogOutcome::Delegation;
+    }
+    LogOutcome::Label(answer)
+}
+
+/// The options a block's rows offer, ids `a`, `b`, `c`… in order, markers
+/// stripped, and the id of the first option marked recommended (D-10).
+fn block_options(block: &LogBlock) -> (Vec<QuestionOption>, Option<String>) {
+    let mut recommended = None;
+    let options = block
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, (label, description, _))| {
+            let id = match u8::try_from(index) {
+                Ok(offset) if offset < 26 => char::from(b'a' + offset).to_string(),
+                _ => format!("option-{}", index + 1),
+            };
+            let (label, label_marked) = strip_recommended_marker(label);
+            let (description, description_marked) = strip_recommended_marker(description);
+            if (label_marked || description_marked) && recommended.is_none() {
+                recommended = Some(id.clone());
+            }
+            let description = description.trim().to_string();
+            QuestionOption {
+                id,
+                label: label.trim().to_string(),
+                description: (!description.is_empty()).then_some(description),
+            }
+        })
+        .collect();
+    (options, recommended)
+}
+
+/// Mine every discuss log into `report`, skipping as duplicates the logs of
+/// `channel_phases`.
+fn mine_logs(
+    project_root: &Path,
+    project: &str,
+    channel_phases: &HashSet<PhaseId>,
+    report: &mut MiningReport,
+) {
+    for path in discussion_logs(project_root) {
+        let relative = path
+            .strip_prefix(project_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let prefix = file_name
+            .strip_suffix(LOG_SUFFIX)
+            .unwrap_or_default()
+            .to_string();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            report.excluded.unparsed += 1;
+            continue;
+        };
+        let (blocks, other_tables) = parse_log(&text);
+        report.excluded.unparsed += other_tables;
+        let file_auto = text
+            .lines()
+            .any(|line| line.trim_start().starts_with("**Mode:**") && line.contains("--auto"));
+        let duplicate = prefix
+            .parse::<PhaseId>()
+            .is_ok_and(|phase| channel_phases.contains(&phase));
+        for block in blocks {
+            if file_auto {
+                report.excluded.auto += 1;
+                continue;
+            }
+            if duplicate {
+                report.excluded.duplicate_log += 1;
+                continue;
+            }
+            let (options, recommended) = block_options(&block);
+            let Some(question) = block.question.clone().filter(|_| !options.is_empty()) else {
+                report.excluded.unparsed += 1;
+                continue;
+            };
+            let answer = match classify_block(&block, &options) {
+                LogOutcome::Label(answer) => answer,
+                LogOutcome::Auto => {
+                    report.excluded.auto += 1;
+                    continue;
+                }
+                LogOutcome::Delegation => {
+                    report.excluded.delegation += 1;
+                    continue;
+                }
+                LogOutcome::MultiSelect => {
+                    report.excluded.multi_select += 1;
+                    continue;
+                }
+                LogOutcome::Unparsed => {
+                    report.excluded.unparsed += 1;
+                    continue;
+                }
+            };
+            report.entries.push(CorpusEntry {
+                id: format!("log:{relative}:{}", block.line),
+                project: project.to_string(),
+                phase: prefix.clone(),
+                source: CorpusSource::DiscussionLog,
+                kind: QuestionKind::Discuss,
+                question,
+                options,
+                context: block.context.clone(),
+                answer,
+                recommended,
+                order: block.line as u64,
+            });
+        }
     }
 }
 
