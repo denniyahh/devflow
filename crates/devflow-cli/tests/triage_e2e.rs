@@ -642,3 +642,65 @@ fn a_capped_call_keeps_the_triage_result_for_the_recall() {
         "the re-call asked Jev again"
     );
 }
+
+/// Write one operator-answered question about `question` to `root`'s log.
+fn write_answered_question(root: &std::path::Path, question_id: &str, question: &str) {
+    let path = devflow_core::events::events_path(root);
+    std::fs::create_dir_all(path.parent().expect("the log's directory"))
+        .expect("create the log's directory");
+    let lines = [
+        json!({ "v": 1, "ts": 1, "phase": 1, "event": "question_asked", "stage": "plan",
+                "question_id": question_id, "gate_id": format!("g-{question_id}"),
+                "kind": "decision", "question": question, "options": options(),
+                "context": null, "recommended": null, "run_started_at": "1" }),
+        json!({ "v": 1, "ts": 2, "phase": 1, "event": "question_answered", "stage": "plan",
+                "question_id": question_id, "gate_id": format!("g-{question_id}"),
+                "answer": { "option_id": "b" }, "policy": "operator_via_gate",
+                "answered_by": "operator-name" }),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(path, text).expect("write the log");
+}
+
+#[test]
+fn the_request_carries_this_projects_precedents() {
+    const SIBLING_TOKEN: &str = "SIBLING-PRECEDENT-9c2e";
+    let fixture = triage_fixture(&TriageToml::at(0.5));
+    write_answered_question(
+        fixture.root(),
+        "q-here",
+        "How long should the budget be here?",
+    );
+    let sibling = tempfile::tempdir().expect("a sibling project");
+    write_answered_question(
+        sibling.path(),
+        "q-sibling",
+        &format!("How long should the budget be {SIBLING_TOKEN}?"),
+    );
+    let fake = FakeJev::serve(vec![scoring_a(0.93)]);
+    let mut client = triage_client(&fixture, &fake.url(), AskOverrides::default());
+    ask(
+        &mut client,
+        CALL_ID,
+        "decision",
+        "How long should the budget be?",
+    );
+    answered(&client, CALL_ID);
+
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1, "{requests:#?}");
+    let text = String::from_utf8_lossy(&requests[0].body).into_owned();
+    let body: Value = serde_json::from_str(&text).expect("the request is JSON");
+    let precedents = body["state"]["precedents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no precedents array: {text}"));
+    assert_eq!(precedents.len(), 1, "{precedents:#?}");
+    assert!(
+        precedents[0].to_string().contains("budget be here"),
+        "the precedent is this project's: {precedents:#?}"
+    );
+    assert!(
+        !text.contains(SIBLING_TOKEN),
+        "another project's precedent: {text}"
+    );
+}
