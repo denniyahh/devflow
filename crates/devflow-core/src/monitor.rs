@@ -52,16 +52,16 @@ pub enum MonitorError {
     NotReady(String),
 }
 
-/// Idle-timeout default in seconds (D-02): the measured constraint-8 floor.
+/// Claude's idle-timeout default in seconds, used when `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS`
+/// is unset or unparseable ([`idle_timeout_setting_for`]).
 ///
-/// Plan 31-02 supplies the configurable-and-clamped reader that can only raise
-/// this.
-///
-/// Raised 30s -> 120s on 2026-08-03 by direct measurement; see
-/// [`IDLE_TIMEOUT_FLOOR_SECS`] for the trials and the reasoning. The previous
-/// value's "~4.2x margin" was computed against a workload that never entered a
-/// long foreground tool call, and did not transfer to one.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+/// Raised from the 120s floor to 900s as a stopgap for #352. A tool call inside a
+/// subagent writes nothing to the parent's stream; a 197s subagent Bash call was
+/// measured fully silent. The per-stage extension budget
+/// ([`MAX_IDLE_EXTENSIONS_WITH_TASKS_OPEN`]) was spent by four such calls in the
+/// Phase 54 Code stage, and the next one was killed. The floor itself is unchanged:
+/// a configured value may still be as low as [`IDLE_TIMEOUT_FLOOR_SECS`].
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 
 /// The floor an idle timeout can never be configured below (D-02/D-04, 31-02).
 ///
@@ -132,7 +132,7 @@ pub const IDLE_TIMEOUT_ENV: &str = "DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS";
 /// for the same reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdleTimeoutResolution {
-    /// Nothing was configured; the default — which is the floor — is in force.
+    /// Nothing was configured; the agent's default is in force.
     Default,
     /// A configured value at or above the floor is in force verbatim.
     Configured,
@@ -252,8 +252,8 @@ pub fn parse_idle_timeout_secs(raw: Option<String>) -> IdleTimeoutSetting {
 /// to an unmeasured agent would be a behaviour prediction. The decision is
 /// therefore per-agent and explicit, never a silent inheritance:
 ///
-/// - Claude reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` — byte-identical to the
-///   pre-phase-41 behaviour this replaces.
+/// - Claude reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS`; unset or unparseable, it
+///   gets [`DEFAULT_IDLE_TIMEOUT_SECS`] rather than the floor (#352).
 /// - Antigravity reads `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` with the same
 ///   120s floor as a DECIDED starting point (documented in the variable's
 ///   OPERATIONS.md row), to be revisited after the first real cadence
@@ -267,7 +267,15 @@ pub fn idle_timeout_setting_for(agent: AgentKind) -> IdleTimeoutSetting {
         AgentKind::Antigravity => std::env::var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS").ok(),
         _ => std::env::var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS").ok(),
     };
-    parse_idle_timeout_secs(raw)
+    let mut setting = parse_idle_timeout_secs(raw);
+    let unchosen = matches!(
+        setting.resolution,
+        IdleTimeoutResolution::Default | IdleTimeoutResolution::Unparseable { .. }
+    );
+    if unchosen && !matches!(agent, AgentKind::Antigravity) {
+        setting.timeout = Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
+    }
+    setting
 }
 
 /// Remove `DEVFLOW_GATE_NOTIFY_CMD` from a child's environment (49-REVIEW.md
@@ -3921,7 +3929,7 @@ sleep 120
         static ENV_MUTEX: Mutex<()> = Mutex::new(());
         let _lock = ENV_MUTEX.lock().unwrap();
 
-        // Baseline: nothing set -> both agents get the decided floor.
+        // Baseline: nothing set -> Claude gets its 900s default, Antigravity the floor.
         unsafe {
             std::env::remove_var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS");
             std::env::remove_var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS");
@@ -3930,7 +3938,7 @@ sleep 120
         let antg_default = idle_timeout_setting_for(AgentKind::Antigravity);
         assert_eq!(
             claude_default.timeout,
-            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS)
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
         );
         assert_eq!(
             antg_default.timeout,
@@ -3965,8 +3973,30 @@ sleep 120
         );
         assert_eq!(
             idle_timeout_setting_for(AgentKind::Claude).timeout,
-            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS),
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             "Antigravity's variable must not move Claude"
+        );
+
+        // An unparseable value falls back to each agent's own default.
+        unsafe {
+            std::env::set_var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS", "60O");
+            std::env::set_var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS", "60O");
+        }
+        assert_eq!(
+            idle_timeout_setting_for(AgentKind::Claude).timeout,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            idle_timeout_setting_for(AgentKind::Antigravity).timeout,
+            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS)
+        );
+        // A configured value below the default but at the floor still holds.
+        unsafe {
+            std::env::set_var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS", "120");
+        }
+        assert_eq!(
+            idle_timeout_setting_for(AgentKind::Claude).timeout,
+            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS)
         );
 
         unsafe {
