@@ -8,6 +8,7 @@
 mod common;
 
 use common::{HermeticHome, hermetic_devflow};
+use devflow_core::corpus::normalize_question;
 use devflow_core::test_support::{FakeJev, FakeReply, jev_answer};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -109,9 +110,9 @@ impl Fixture {
         self.data.path().join("triage")
     }
 
-    /// Run the tool over both projects, against `fake` when given (with the
-    /// test key) and with no key otherwise.
-    fn run(&self, fake: Option<&FakeJev>) -> Output {
+    /// Run the tool over both projects against `fake`, sending `key` when
+    /// given and no key otherwise.
+    fn run(&self, fake: &FakeJev, key: Option<&str>) -> Output {
         let mut command = hermetic_devflow(&self.home);
         command
             .arg("__triage-score")
@@ -119,11 +120,10 @@ impl Fixture {
             .arg(project_arg("alpha", self.alpha.path()))
             .arg("--project")
             .arg(project_arg("beta", self.beta.path()))
-            .env("DEVFLOW_DATA_DIR", self.data.path());
-        if let Some(fake) = fake {
-            command
-                .env("TYPESAFE_BASE_URL", fake.url())
-                .env("TYPESAFE_API_KEY", TEST_KEY);
+            .env("DEVFLOW_DATA_DIR", self.data.path())
+            .env("TYPESAFE_BASE_URL", fake.url());
+        if let Some(key) = key {
+            command.env("TYPESAFE_API_KEY", key);
         }
         command.output().expect("run devflow __triage-score")
     }
@@ -139,7 +139,7 @@ fn text(bytes: &[u8]) -> String {
 
 /// Run against an answering fake and require success.
 fn scored(fixture: &Fixture, fake: &FakeJev) -> Output {
-    let output = fixture.run(Some(fake));
+    let output = fixture.run(fake, Some(TEST_KEY));
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
@@ -173,4 +173,164 @@ fn scoring_a_synthetic_corpus_writes_a_counts_only_report() {
         stdout.contains(&report_path.display().to_string()),
         "stdout does not name the report:\n{stdout}"
     );
+}
+
+/// Each captured request's body as JSON.
+fn request_bodies(fake: &FakeJev) -> Vec<Value> {
+    fake.requests()
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("a JSON request body"))
+        .collect()
+}
+
+/// `path`'s lines, each parsed as JSON.
+fn json_lines(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .expect("read a JSON-lines file")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect()
+}
+
+fn precedent_questions(body: &Value) -> Vec<String> {
+    body["state"]["precedents"]
+        .as_array()
+        .expect("state.precedents is an array")
+        .iter()
+        .map(|precedent| {
+            let question = precedent["question"]
+                .as_str()
+                .expect("a precedent question");
+            normalize_question(question)
+        })
+        .collect()
+}
+
+#[test]
+fn scoring_never_puts_a_question_among_its_own_precedents() {
+    let fixture = Fixture::new();
+    let fake = answering_fake(5);
+    scored(&fixture, &fake);
+
+    let lines = json_lines(&fixture.triage_dir().join("scores.jsonl"));
+    assert_eq!(lines.len(), 5);
+    for line in &lines {
+        let id = &line["entry_id"];
+        let precedent_ids = line["precedent_ids"].as_array().expect("precedent_ids");
+        assert!(!precedent_ids.contains(id), "{line}");
+    }
+    let bodies = request_bodies(&fake);
+    assert_eq!(bodies.len(), 5);
+    for body in &bodies {
+        let question = normalize_question(body["state"]["question"].as_str().expect("a question"));
+        assert!(
+            !precedent_questions(body).contains(&question),
+            "a request carries its own question: {body}"
+        );
+    }
+    assert!(
+        bodies
+            .iter()
+            .any(|body| !precedent_questions(body).is_empty()),
+        "no request carried a precedent, so the check above proves nothing"
+    );
+}
+
+#[test]
+fn scoring_takes_precedents_from_the_questions_own_project() {
+    let fixture = Fixture::new();
+    let fake = answering_fake(5);
+    scored(&fixture, &fake);
+
+    let bodies = request_bodies(&fake);
+    let alpha: Vec<&Value> = bodies
+        .iter()
+        .filter(|body| {
+            body["state"]["question"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(ALPHA_TOKEN)
+        })
+        .collect();
+    assert_eq!(alpha.len(), 3);
+    for body in &alpha {
+        assert!(!body.to_string().contains(BETA_TOKEN), "{body}");
+        assert!(
+            !precedent_questions(body).is_empty(),
+            "an alpha request carried no precedent: {body}"
+        );
+    }
+    let beta = bodies
+        .iter()
+        .filter(|body| body.to_string().contains(BETA_TOKEN))
+        .count();
+    assert_eq!(beta, 2, "the token is visible in beta's own requests");
+}
+
+#[test]
+fn the_corpus_files_are_private_to_the_user() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::new();
+    let fake = answering_fake(5);
+    scored(&fixture, &fake);
+
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    let dir = fixture.triage_dir();
+    assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+    for name in ["corpus.jsonl", "scores.jsonl", "report.md"] {
+        assert_eq!(mode(&dir.join(name)), 0o600, "{name}");
+    }
+}
+
+#[test]
+fn the_report_names_no_question_text() {
+    let fixture = Fixture::new();
+    let fake = answering_fake(5);
+    let output = scored(&fixture, &fake);
+
+    let report = std::fs::read_to_string(fixture.triage_dir().join("report.md")).expect("report");
+    let stdout = text(&output.stdout);
+    let corpus =
+        std::fs::read_to_string(fixture.triage_dir().join("corpus.jsonl")).expect("corpus");
+    for token in [ALPHA_TOKEN, BETA_TOKEN] {
+        assert!(
+            !report.contains(token),
+            "report.md carries {token}:\n{report}"
+        );
+        assert!(!stdout.contains(token), "stdout carries {token}:\n{stdout}");
+        assert!(
+            corpus.contains(token),
+            "corpus.jsonl lacks {token}, so the check proves nothing"
+        );
+    }
+}
+
+#[test]
+fn scoring_without_a_key_is_refused() {
+    let fixture = Fixture::new();
+    let fake = answering_fake(5);
+    let output = fixture.run(&fake, None);
+
+    assert!(!output.status.success(), "the run without a key succeeded");
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("TYPESAFE_API_KEY"), "stderr:\n{stderr}");
+    assert_eq!(fake.request_count(), 0);
+    assert!(
+        !fixture.triage_dir().exists(),
+        "the refused run wrote {}",
+        fixture.triage_dir().display()
+    );
+    let stdout = text(&output.stdout);
+    for line in [
+        "mined alpha: event entries 3, log entries 0",
+        "mined beta: event entries 0, log entries 2",
+    ] {
+        assert!(stdout.contains(line), "stdout lacks `{line}`:\n{stdout}");
+    }
 }

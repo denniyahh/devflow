@@ -322,3 +322,59 @@ fn score_entry(
 fn input_tokens(body: &Value) -> Option<u64> {
     body.get("usage")?.get("input_tokens")?.as_u64()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn some(value: &str) -> Option<OsString> {
+        Some(OsString::from(value))
+    }
+
+    #[test]
+    fn the_data_dir_follows_devflow_then_xdg_then_home() {
+        let all = data_dir_from(some("/d"), some("/x"), some("/h"));
+        assert_eq!(all, Some(PathBuf::from("/d")));
+        let xdg = data_dir_from(None, some("/x"), some("/h"));
+        assert_eq!(xdg, Some(PathBuf::from("/x/devflow")));
+        let home = data_dir_from(None, None, some("/h"));
+        assert_eq!(home, Some(PathBuf::from("/h/.local/share/devflow")));
+        let empty = data_dir_from(some(""), some(""), some("/h"));
+        assert_eq!(empty, Some(PathBuf::from("/h/.local/share/devflow")));
+        assert_eq!(data_dir_from(None, None, None), None);
+    }
+
+    #[test]
+    fn a_path_that_is_no_project_or_a_repeated_name_is_refused() {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".planning")).unwrap();
+        let bare = tempfile::TempDir::new().unwrap();
+        let arg = |name: &str, path: &Path| ProjectArg {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+        };
+        let args = |projects: Vec<ProjectArg>, excludes: Vec<ExcludeArg>| ScoreArgs {
+            projects,
+            excludes,
+            model: triage::DEFAULT_MODEL.to_string(),
+        };
+        let message = |result: Result<(), CliError>| match result {
+            Err(CliError::Message(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+
+        assert!(check_projects(&args(vec![arg("a", project.path())], Vec::new())).is_ok());
+        let twice = vec![arg("a", project.path()), arg("a", project.path())];
+        assert!(message(check_projects(&args(twice, Vec::new()))).contains("named twice"));
+        let bare_project = vec![arg("b", bare.path())];
+        assert!(
+            message(check_projects(&args(bare_project, Vec::new())))
+                .contains("neither .planning/ nor .devflow/")
+        );
+        let stray = vec!["z:54".parse::<ExcludeArg>().unwrap()];
+        assert!(
+            message(check_projects(&args(vec![arg("a", project.path())], stray)))
+                .contains("which no --project names")
+        );
+    }
+}
