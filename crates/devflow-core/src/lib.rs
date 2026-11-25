@@ -81,6 +81,7 @@ pub mod stop;
 /// `test-support` feature. Never compiled into a normal build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod triage;
 pub mod verify;
 pub mod workflow;
 pub mod worktree;

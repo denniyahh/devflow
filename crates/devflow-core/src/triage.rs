@@ -1,0 +1,451 @@
+//! Decision triage (TRIAGE-01): whether a question an agent asks can be
+//! answered from how the operator answered earlier ones.
+//!
+//! One Jev request per question carries two questions (D-24): `accept`, a
+//! noul on whether the operator would take an offered option as offered, and
+//! `pick`, a choice over the offered option ids. A question is decided only
+//! when `accept` reaches the pre-check threshold AND the probability of the
+//! named choice reaches the option threshold; both comparisons are `>=`.
+//! Everything else escalates to the operator.
+//!
+//! This module is pure: it builds the request, parses the response and
+//! applies the rule. The HTTP call and the event writes live with the caller.
+
+use std::time::Duration;
+
+use serde_json::{Map, Value, json};
+
+use crate::phase_id::PhaseId;
+use crate::question::{QuestionOption, QuestionSpec};
+
+/// The `answered_by` value of a question triage decided (D-12).
+pub const TRIAGE_ANSWERER: &str = "triage:jev";
+
+/// The Jev model asked when `[triage] model` is absent. A versioned id, not
+/// the moving `jev-latest` alias, so a threshold measured against one model
+/// is applied to that model.
+pub const DEFAULT_MODEL: &str = "jev-1.14.0";
+
+/// The request timeout when `[triage] timeout_secs` is absent (the SDK's
+/// per-operation default).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// The instructions of the `accept` question.
+const ACCEPT_INSTRUCTIONS: &str = "Would the operator accept one of the offered `options` as \
+     offered, rather than answering `question` in their own words? Use `precedents` as evidence \
+     of how this operator answers.";
+
+/// The instructions of the `pick` question.
+const PICK_INSTRUCTIONS: &str = "Which offered option would this operator choose for \
+     `question`, given `context` and how they answered `precedents`?";
+
+/// The longest response-supplied value a fallback detail repeats.
+const DETAIL_VALUE_MAX_CHARS: usize = 64;
+
+/// How triage is configured for a project (`devflow.toml` `[triage]`).
+///
+/// A threshold of `None` means escalate every question.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TriageConfig {
+    /// Whether triage runs at all.
+    pub enabled: bool,
+    /// The least `probabilities[choice]` that decides.
+    pub threshold: Option<f64>,
+    /// The least `accept` score that lets the choice be considered.
+    pub pre_check_threshold: Option<f64>,
+    /// The Jev model id sent and expected back.
+    pub model: String,
+    /// How long one Jev request may take.
+    pub timeout: Duration,
+    /// Phases whose recorded answers are not used as precedents (D-23).
+    pub exclude_label_phases: Vec<PhaseId>,
+}
+
+impl TriageConfig {
+    /// An enabled configuration with the given thresholds and every other
+    /// value at its default.
+    pub fn with_thresholds(threshold: Option<f64>, pre_check_threshold: Option<f64>) -> Self {
+        TriageConfig {
+            enabled: true,
+            threshold,
+            pre_check_threshold,
+            model: DEFAULT_MODEL.to_string(),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            exclude_label_phases: Vec::new(),
+        }
+    }
+}
+
+/// An earlier question and how the operator answered it, sent to Jev as
+/// evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Precedent {
+    /// The earlier question.
+    pub question: String,
+    /// The options it offered.
+    pub options: Vec<QuestionOption>,
+    /// How the operator answered it.
+    pub answer: PrecedentAnswer,
+}
+
+/// How the operator answered a precedent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PrecedentAnswer {
+    /// The operator chose an offered option.
+    Option { option_id: String },
+    /// The operator answered in their own words.
+    OwnWords { text: String },
+}
+
+/// The scores one Jev response gave a question.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JevScores {
+    /// The `accept` noul: the probability the operator takes an offered option.
+    pub accept: f64,
+    /// The option Jev named in `pick.choice`.
+    pub top_option: String,
+    /// `pick.probabilities[choice]`.
+    pub top_probability: f64,
+    /// The model that answered.
+    pub model: String,
+}
+
+/// Why a question went to the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EscalateReason {
+    /// A `blocking-human` question is never scored (D-08).
+    BlockingHuman,
+    /// A threshold is unset, so every question escalates (D-07).
+    NoThreshold,
+    /// `accept` is below the pre-check threshold.
+    PreCheckBelowThreshold,
+    /// `probabilities[choice]` is below the option threshold.
+    TopProbabilityBelowThreshold,
+}
+
+impl EscalateReason {
+    /// The stable name recorded in events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EscalateReason::BlockingHuman => "blocking_human",
+            EscalateReason::NoThreshold => "no_threshold",
+            EscalateReason::PreCheckBelowThreshold => "pre_check_below_threshold",
+            EscalateReason::TopProbabilityBelowThreshold => "top_probability_below_threshold",
+        }
+    }
+}
+
+/// Why triage could not score a question; the question goes to the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FallbackReason {
+    /// No API key is configured.
+    NoApiKey,
+    /// The configured endpoint is not an allowed host.
+    EndpointRefused,
+    /// The endpoint could not be reached.
+    Unreachable,
+    /// The request took longer than the configured timeout.
+    Timeout,
+    /// The endpoint answered with a non-success status.
+    HttpStatus,
+    /// The response is not a complete, well-formed answer.
+    Unparsable,
+    /// The response names a model other than the configured one.
+    ModelMismatch,
+    /// The ask's time budget was spent before triage could answer.
+    AskBudgetSpent,
+    /// The decision could not be recorded in the event log.
+    LedgerUnwritable,
+}
+
+impl FallbackReason {
+    /// The stable name recorded in events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FallbackReason::NoApiKey => "no_api_key",
+            FallbackReason::EndpointRefused => "endpoint_refused",
+            FallbackReason::Unreachable => "unreachable",
+            FallbackReason::Timeout => "timeout",
+            FallbackReason::HttpStatus => "http_status",
+            FallbackReason::Unparsable => "unparsable",
+            FallbackReason::ModelMismatch => "model_mismatch",
+            FallbackReason::AskBudgetSpent => "ask_budget_spent",
+            FallbackReason::LedgerUnwritable => "ledger_unwritable",
+        }
+    }
+}
+
+/// What triage did with a question.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum TriageOutcome {
+    /// Triage answered the question with `option_id`.
+    Decided {
+        option_id: String,
+        scores: JevScores,
+    },
+    /// The question goes to the operator; `scores` is `None` when it was
+    /// never scored.
+    Escalated {
+        reason: EscalateReason,
+        scores: Option<JevScores>,
+    },
+    /// Triage could not score the question; it goes to the operator.
+    Fallback {
+        reason: FallbackReason,
+        detail: String,
+    },
+}
+
+impl TriageOutcome {
+    /// The `triage` object recorded on `question_asked`.
+    pub fn event_fields(&self, config: &TriageConfig) -> Value {
+        let (outcome, reason, scores) = match self {
+            TriageOutcome::Decided { scores, .. } => ("decided", None, Some(scores)),
+            TriageOutcome::Escalated { reason, scores } => {
+                ("escalated", Some(reason.as_str()), scores.as_ref())
+            }
+            TriageOutcome::Fallback { reason, .. } => ("fallback", Some(reason.as_str()), None),
+        };
+        let mut fields = Map::new();
+        fields.insert("outcome".into(), json!(outcome));
+        if let Some(reason) = reason {
+            fields.insert("reason".into(), json!(reason));
+        }
+        if let Some(scores) = scores {
+            fields.insert("pre_check".into(), json!(scores.accept));
+            fields.insert("top_option".into(), json!(scores.top_option));
+            fields.insert("top_probability".into(), json!(scores.top_probability));
+        }
+        fields.insert("threshold".into(), json!(config.threshold));
+        fields.insert(
+            "pre_check_threshold".into(),
+            json!(config.pre_check_threshold),
+        );
+        let model = scores.map_or(config.model.as_str(), |scores| scores.model.as_str());
+        fields.insert("model".into(), json!(model));
+        Value::Object(fields)
+    }
+}
+
+/// The Jev request that scores `spec` against `precedents` (D-24). The
+/// recommended option is never sent (D-10).
+pub fn jev_request(spec: &QuestionSpec, precedents: &[Precedent], model: &str) -> Value {
+    let mut state = Map::new();
+    state.insert("question".into(), json!(spec.question));
+    if let Some(context) = &spec.context {
+        state.insert("context".into(), json!(context));
+    }
+    state.insert("options".into(), options_state(&spec.options));
+    let precedents: Vec<Value> = precedents.iter().map(precedent_state).collect();
+    state.insert("precedents".into(), Value::Array(precedents));
+    let criteria: Map<String, Value> = spec
+        .options
+        .iter()
+        .map(|option| (option.id.clone(), json!(criterion(option))))
+        .collect();
+    json!({
+        "model": model,
+        "state": Value::Object(state),
+        "questions": {
+            "accept": {"type": "noul", "instructions": ACCEPT_INSTRUCTIONS},
+            "pick": {"type": "choice", "instructions": PICK_INSTRUCTIONS, "criteria": criteria},
+        },
+    })
+}
+
+/// The options as Jev's `state` carries them.
+fn options_state(options: &[QuestionOption]) -> Value {
+    let options = options
+        .iter()
+        .map(|option| {
+            let mut entry = Map::new();
+            entry.insert("id".into(), json!(option.id));
+            entry.insert("label".into(), json!(option.label));
+            if let Some(description) = &option.description {
+                entry.insert("description".into(), json!(description));
+            }
+            Value::Object(entry)
+        })
+        .collect();
+    Value::Array(options)
+}
+
+/// One precedent as Jev's `state` carries it.
+fn precedent_state(precedent: &Precedent) -> Value {
+    let answer = match &precedent.answer {
+        PrecedentAnswer::Option { option_id } => json!({"option": option_id}),
+        PrecedentAnswer::OwnWords { text } => json!({"own_words": text}),
+    };
+    json!({
+        "question": precedent.question,
+        "options": options_state(&precedent.options),
+        "operator_answer": answer,
+    })
+}
+
+/// An option's `pick` criterion: `label — description`, or the label alone.
+fn criterion(option: &QuestionOption) -> String {
+    match &option.description {
+        Some(description) => format!("{} — {}", option.label, description),
+        None => option.label.clone(),
+    }
+}
+
+/// The scores a Jev response gives `spec`. A missing or malformed field is a
+/// fallback, never a default score.
+pub fn parse_jev_response(
+    body: &Value,
+    spec: &QuestionSpec,
+    expected_model: &str,
+) -> Result<JevScores, (FallbackReason, String)> {
+    let _ = spec;
+    let model = text_at(body, &["model"])?;
+    if model != expected_model {
+        return Err((
+            FallbackReason::ModelMismatch,
+            format!(
+                "response model {}, configured {expected_model}",
+                bounded(model)
+            ),
+        ));
+    }
+    let accept = number_at(body, &["answers", "accept", "noul"])?;
+    let choice = text_at(body, &["answers", "pick", "choice"])?;
+    let top_probability = number_at(body, &["answers", "pick", "probabilities", choice])?;
+    Ok(JevScores {
+        accept,
+        top_option: choice.to_string(),
+        top_probability,
+        model: model.to_string(),
+    })
+}
+
+/// The value at `path`, or an `Unparsable` naming the missing field.
+fn value_at<'a>(body: &'a Value, path: &[&str]) -> Result<&'a Value, (FallbackReason, String)> {
+    path.iter().try_fold(body, |value, key| {
+        value.get(key).ok_or_else(|| unparsable(path, "is missing"))
+    })
+}
+
+/// The string at `path`.
+fn text_at<'a>(body: &'a Value, path: &[&str]) -> Result<&'a str, (FallbackReason, String)> {
+    value_at(body, path)?
+        .as_str()
+        .ok_or_else(|| unparsable(path, "is not a string"))
+}
+
+/// The number at `path`.
+fn number_at(body: &Value, path: &[&str]) -> Result<f64, (FallbackReason, String)> {
+    value_at(body, path)?
+        .as_f64()
+        .ok_or_else(|| unparsable(path, "is not a number"))
+}
+
+/// An `Unparsable` fallback naming the field at `path`.
+fn unparsable(path: &[&str], problem: &str) -> (FallbackReason, String) {
+    let path: Vec<String> = path.iter().map(|key| bounded(key)).collect();
+    (
+        FallbackReason::Unparsable,
+        format!("`{}` {problem}", path.join(".")),
+    )
+}
+
+/// A response-supplied value cut to [`DETAIL_VALUE_MAX_CHARS`].
+fn bounded(value: &str) -> String {
+    value.chars().take(DETAIL_VALUE_MAX_CHARS).collect()
+}
+
+/// Decide `scores` by D-24: decided only when `accept >= pre_check_threshold`
+/// and `top_probability >= threshold`.
+pub fn decide(scores: &JevScores, config: &TriageConfig) -> TriageOutcome {
+    let _ = config;
+    TriageOutcome::Escalated {
+        reason: EscalateReason::NoThreshold,
+        scores: Some(scores.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::question::QuestionKind;
+
+    const MODEL: &str = "jev-1.14.0";
+
+    fn option(id: &str, label: &str, description: Option<&str>) -> QuestionOption {
+        QuestionOption {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    fn spec(options: Vec<QuestionOption>, recommended: Option<&str>) -> QuestionSpec {
+        QuestionSpec {
+            question_id: "q-1".to_string(),
+            question: "Which layout?".to_string(),
+            options,
+            context: Some("planning".to_string()),
+            kind: QuestionKind::Decision,
+            recommended: recommended.map(str::to_string),
+        }
+    }
+
+    fn two_options() -> QuestionSpec {
+        spec(
+            vec![
+                option("a", "Flat", Some("one module")),
+                option("b", "Nested", Some("one module per stage")),
+            ],
+            Some("b"),
+        )
+    }
+
+    fn response(model: &str, accept: f64, choice: &str, probabilities: Value) -> Value {
+        json!({
+            "model": model,
+            "answers": {
+                "accept": {"type": "noul", "noul": accept},
+                "pick": {
+                    "type": "choice",
+                    "choice": choice,
+                    "confidence": 0.5,
+                    "probabilities": probabilities,
+                },
+            },
+            "usage": {"input_tokens": 10, "output_tokens": 0},
+        })
+    }
+
+    #[test]
+    fn a_scored_question_above_both_thresholds_is_decided() {
+        let spec = two_options();
+        let request = jev_request(&spec, &[], MODEL);
+        assert_eq!(request["model"], MODEL);
+        assert_eq!(request["questions"]["accept"]["type"], "noul");
+        assert_eq!(request["questions"]["pick"]["type"], "choice");
+        let criteria = request["questions"]["pick"]["criteria"]
+            .as_object()
+            .expect("criteria is an object");
+        let keys: Vec<&str> = criteria.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["a", "b"]);
+
+        let body = response(MODEL, 0.93, "a", json!({"a": 0.9, "b": 0.1}));
+        let scores = parse_jev_response(&body, &spec, MODEL).expect("the fixture parses");
+        assert!(matches!(
+            &scores,
+            JevScores { accept, top_option, top_probability, .. }
+                if *accept == 0.93 && top_option == "a" && *top_probability == 0.9
+        ));
+        let config = TriageConfig::with_thresholds(Some(0.5), Some(0.5));
+        match decide(&scores, &config) {
+            TriageOutcome::Decided { option_id, .. } => assert_eq!(option_id, "a"),
+            other => panic!("expected a decision, got {other:?}"),
+        }
+    }
+}
