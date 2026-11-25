@@ -5201,17 +5201,100 @@ fn record_override(
     events::try_emit(project_root, phase, events::QUESTION_OVERRIDDEN, fields)
 }
 
-/// `devflow ledger override`'s work, answering as `answerer` and appending the
-/// override through `record`.
-fn ledger_override_report_by(
-    _project_root: &Path,
-    _phase: PhaseId,
-    _question_id: &str,
-    _choice: &QuestionChoice,
-    _answerer: Result<String, CliError>,
-    _record: impl FnOnce(&Path, PhaseId, serde_json::Value) -> std::io::Result<()>,
+/// `devflow ledger override <phase> --question-id <id>`: replace the answer of
+/// one answered question of the phase's ledger (D-15, D-18). It is the
+/// operator's verb, recorded as one `question_overridden` event.
+pub(crate) fn ledger_override_report(
+    project_root: &Path,
+    phase: PhaseId,
+    question_id: &str,
+    choice: &QuestionChoice,
 ) -> Result<String, CliError> {
-    Err(CliError::Message("ledger override is not built".into()))
+    ledger_override_report_by(
+        project_root,
+        phase,
+        question_id,
+        choice,
+        answerer(),
+        record_override,
+    )
+}
+
+/// [`ledger_override_report`] as `answerer`, the resolver's result, appending
+/// the override through `record`. Every refusal comes before the append, and
+/// an append that fails acknowledges nothing.
+fn ledger_override_report_by(
+    project_root: &Path,
+    phase: PhaseId,
+    question_id: &str,
+    choice: &QuestionChoice,
+    answerer: Result<String, CliError>,
+    record: impl FnOnce(&Path, PhaseId, serde_json::Value) -> std::io::Result<()>,
+) -> Result<String, CliError> {
+    let overridden_by = answerer?;
+    if overridden_by.starts_with("agent:") {
+        return Err(CliError::Message(format!(
+            "{ANSWERED_BY_ENV}={overridden_by:?} is refused: `ledger override` is the operator's \
+             verb (D-17, D-18): unset {ANSWERED_BY_ENV} to override as the operator; nothing was \
+             written"
+        )));
+    }
+    let ledger = history::ledger(project_root, phase);
+    let entry = ledger
+        .decided
+        .iter()
+        .chain(&ledger.escalated)
+        .find(|entry| entry.question_id == question_id)
+        .ok_or_else(|| {
+            CliError::Message(format!(
+                "phase {phase} has no question `{question_id}` in its ledger; nothing was \
+                 written. `devflow ledger {phase}` lists its questions"
+            ))
+        })?;
+    let previous = entry.effective_answer.clone().unwrap_or_default();
+    let answer = serde_json::to_value(choice)
+        .map_err(|error| CliError::Message(format!("could not encode the override: {error}")))?;
+    let override_id = devflow_core::question::new_question_id();
+    let fields = serde_json::json!({
+        "question_id": question_id,
+        "override_id": override_id,
+        "answer": answer,
+        "was": previous,
+        "overridden_by": overridden_by,
+        "run_started_at": entry.run_started_at,
+    });
+    record(project_root, phase, fields).map_err(|error| {
+        CliError::Message(format!(
+            "the override was not recorded: could not append to {} ({error}); nothing was \
+             acknowledged",
+            events::events_path(project_root).display()
+        ))
+    })?;
+    let current_run = workflow::load_state(project_root, phase)
+        .ok()
+        .map(|state| state.started_at);
+    let delivery = if entry.run_started_at.is_some() && entry.run_started_at == current_run {
+        "the next stage DevFlow launches for this run receives it in its prompt"
+    } else {
+        "it is recorded in the ledger and the corpus; no launch of that run remains to carry it"
+    };
+    Ok(format!(
+        "question {question_id} of phase {phase} overridden by {overridden_by}: {} (was {}); \
+         override {override_id}. {delivery}",
+        choice_text(&answer),
+        choice_text(&previous),
+    ))
+}
+
+/// An answer as the override reply shows it: `option <id>` or the quoted text.
+fn choice_text(answer: &serde_json::Value) -> String {
+    if let Some(option_id) = answer.get("option_id").and_then(|id| id.as_str()) {
+        return format!("option {option_id}");
+    }
+    if let Some(text) = answer.get("text").and_then(|text| text.as_str()) {
+        return format!("the text {text:?}");
+    }
+    answer.to_string()
 }
 
 /// Detect capture-file rollover for `logs --follow` (14-CR-03): a file
