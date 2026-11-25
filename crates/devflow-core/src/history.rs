@@ -476,6 +476,18 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_answer_shows_its_agent_in_history() {
+        let mut by_agent = answered(11, "q-1", serde_json::json!({"option_id": "keep"}));
+        by_agent["answered_by"] = serde_json::json!("agent:claude");
+        let rendered = render_events(&[asked(10, "q-1", "Keep the cache?"), by_agent]);
+
+        assert!(
+            rendered.contains("by agent:claude via operator_via_gate"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn a_run_with_no_questions_has_no_question_rows() {
         let dir = tempfile::tempdir().unwrap();
         seed_event_log(dir.path());

@@ -318,6 +318,30 @@ pub struct AskAnswer {
     pub answered_at: String,
 }
 
+/// The kind of answerer an `answered_by` / `responded_by` string names (#343,
+/// D-13). Only [`AnswererKind::Operator`] answers count as triage reference
+/// labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AnswererKind {
+    /// The operator: any name not carrying a reserved prefix.
+    Operator,
+    /// An agent answering for the operator, `agent:<name>`.
+    Agent,
+    /// DevFlow's own triage, `triage:<model>`.
+    Triage,
+    /// Nobody recorded: `unknown`, which `devflow_ask` writes when a response
+    /// names no answerer, or a blank string.
+    Unknown,
+}
+
+/// Classify `answered_by` by its prefix: `agent:` is an agent, `triage:` is
+/// triage, `unknown` or blank is unknown, and every other name is the operator.
+#[must_use]
+pub fn answerer_kind(answered_by: &str) -> AnswererKind {
+    AnswererKind::Operator
+}
+
 /// A fresh question id: 16 lowercase hex digits, built as a launch id is.
 #[must_use]
 pub fn new_question_id() -> String {
@@ -346,6 +370,20 @@ pub fn render_question_context(spec: &QuestionSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answerers_are_classified_by_prefix() {
+        for (answered_by, kind) in [
+            ("denniyahh", AnswererKind::Operator),
+            ("devflow-cli", AnswererKind::Operator),
+            ("agent:claude", AnswererKind::Agent),
+            ("triage:jev", AnswererKind::Triage),
+            ("unknown", AnswererKind::Unknown),
+            ("", AnswererKind::Unknown),
+        ] {
+            assert_eq!(answerer_kind(answered_by), kind, "{answered_by:?}");
+        }
+    }
 
     #[test]
     fn the_blocking_human_kind_serializes_as_kebab_case() {
