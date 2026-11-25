@@ -5177,6 +5177,16 @@ pub(crate) fn history_cmd(project_root: &Path, phase: Option<PhaseId>) -> Result
     Ok(())
 }
 
+/// `devflow ledger <phase>`: the phase's decided and escalated questions,
+/// as text or, with `json`, as the [`history::Ledger`] JSON.
+pub(crate) fn ledger_report(
+    _project_root: &Path,
+    _phase: PhaseId,
+    _json: bool,
+) -> Result<String, CliError> {
+    Ok(String::new())
+}
+
 /// Detect capture-file rollover for `logs --follow` (14-CR-03): a file
 /// shorter than the follower's offset was deleted and recreated by the next
 /// stage's monitor, so following must restart from 0. A missing file (the
@@ -6892,6 +6902,84 @@ mod tests {
     use devflow_core::gates::AnswerRead;
     use devflow_core::gates::WaiterRegistration;
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
+
+    /// A phase-54 log with one question triage decided and one it escalated
+    /// that the operator has not answered.
+    fn write_triaged_and_escalated_questions(root: &Path) {
+        let triage = |outcome: &str, reason: Option<&str>| {
+            let mut fields = serde_json::json!({
+                "outcome": outcome, "pre_check": 0.93, "top_option": "keep",
+                "top_probability": 0.91, "threshold": 0.85,
+                "pre_check_threshold": 0.8, "model": "jev-test",
+            });
+            if let Some(reason) = reason {
+                fields["reason"] = serde_json::json!(reason);
+            }
+            fields
+        };
+        let options = serde_json::json!([
+            {"id": "keep", "label": "Keep the cache"},
+            {"id": "drop", "label": "Drop the cache"},
+        ]);
+        let lines = [
+            serde_json::json!({
+                "v": 1, "ts": 10, "phase": 54, "event": "question_asked",
+                "stage": "code", "question_id": "q-decided", "kind": "decision",
+                "question": "Keep the cache?", "options": options,
+                "context": null, "recommended": "keep", "run_started_at": "100",
+                "triage": triage("decided", None),
+            }),
+            serde_json::json!({
+                "v": 1, "ts": 11, "phase": 54, "event": "question_answered",
+                "stage": "code", "question_id": "q-decided",
+                "answer": {"option_id": "keep"}, "policy": "triage",
+                "answered_by": "triage:jev",
+            }),
+            serde_json::json!({
+                "v": 1, "ts": 12, "phase": 54, "event": "question_asked",
+                "stage": "code", "question_id": "q-escalated", "gate_id": "g-2",
+                "kind": "decision", "question": "Drop the index?", "options": options,
+                "context": null, "recommended": null, "run_started_at": "100",
+                "triage": triage("escalated", Some("top_probability_below_threshold")),
+            }),
+        ];
+        let path = devflow_core::events::events_path(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn ledger_prints_decided_and_escalated_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+
+        let text = ledger_report(dir.path(), PhaseId::new(54), false).unwrap();
+        let (decided, escalated) = text
+            .split_once("Escalated (1)")
+            .unwrap_or_else(|| panic!("no `Escalated (1)` section in {text}"));
+        assert!(decided.contains("Decided (1)"), "{text}");
+        assert!(decided.contains("q-decided"), "{text}");
+        assert!(decided.contains("option keep"), "{text}");
+        assert!(decided.contains("triage:jev"), "{text}");
+        assert!(!decided.contains("q-escalated"), "{text}");
+        assert!(escalated.contains("q-escalated"), "{text}");
+        assert!(
+            escalated.contains("top_probability_below_threshold"),
+            "{text}"
+        );
+        assert!(escalated.contains("no answer yet"), "{text}");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&ledger_report(dir.path(), PhaseId::new(54), true).unwrap())
+                .unwrap_or_else(|error| panic!("ledger --json is not JSON: {error}"));
+        assert_eq!(json["decided"].as_array().map(Vec::len), Some(1), "{json}");
+        assert_eq!(
+            json["escalated"].as_array().map(Vec::len),
+            Some(1),
+            "{json}"
+        );
+    }
 
     /// #285: outside a git work tree the ignore check says nothing, so no
     /// `could not check … exit status: 128` lines reach the operator.

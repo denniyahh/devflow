@@ -2,6 +2,7 @@
 
 use crate::phase_id::PhaseId;
 use crate::{agent_result, events, gates};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -227,6 +228,48 @@ fn text_field(value: &serde_json::Value, key: &str) -> String {
         None => return MISSING_FIELD.into(),
     };
     gates::render_gate_context(&raw, usize::MAX)
+}
+
+/// The decision ledger of one phase (D-14): a fold over the event log, with
+/// no store of its own. Questions triage decided are in `decided`; every
+/// other question, answered by the operator or not, is in `escalated`.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct Ledger {
+    pub phase: PhaseId,
+    pub decided: Vec<LedgerEntry>,
+    pub escalated: Vec<LedgerEntry>,
+}
+
+/// One question in a [`Ledger`]. An optional field the log did not record
+/// is absent from the JSON, never empty: an escalated question the operator
+/// has not answered has no `answer` key.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct LedgerEntry {
+    pub question_id: String,
+}
+
+/// An operator's replacement of a triage answer, in log order.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct LedgerOverride {
+    pub answer: serde_json::Value,
+}
+
+/// Fold the phase's question events from `.devflow/events.jsonl` into its
+/// ledger.
+pub fn ledger(_project_root: &Path, phase: PhaseId) -> Ledger {
+    Ledger {
+        phase,
+        decided: Vec::new(),
+        escalated: Vec::new(),
+    }
+}
+
+/// The ledger as text: a `Decided (N)` section, then `Escalated (N)`.
+pub fn render_ledger(_ledger: &Ledger) -> String {
+    String::new()
 }
 
 struct CaptureGeneration {
