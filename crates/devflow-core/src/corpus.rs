@@ -807,4 +807,312 @@ mod tests {
         assert_eq!(ids, ["events:q1", "events:q2"]);
         assert_eq!(report.excluded.unreadable_event_lines, 2);
     }
+
+    const HEADER: &str =
+        "| Option | Description | Selected |\n|--------|-------------|----------|\n";
+
+    fn write_log(root: &Path, relative: &str, text: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn log_entries(report: &MiningReport) -> Vec<&CorpusEntry> {
+        report
+            .entries
+            .iter()
+            .filter(|entry| entry.source == CorpusSource::DiscussionLog)
+            .collect()
+    }
+
+    /// One `## <area>` question whose table has `rows`, then `after`.
+    fn area(name: &str, rows: &[(&str, &str)], after: &str) -> String {
+        let mut text = format!("## {name}\n\n{HEADER}");
+        for (label, selected) in rows {
+            text.push_str(&format!("| {label} | what it means | {selected} |\n"));
+        }
+        text.push('\n');
+        text.push_str(after);
+        text.push('\n');
+        text
+    }
+
+    fn log_file(body: &[String]) -> String {
+        format!(
+            "# Phase 60: X - Discussion Log\n\n**Date:** 2026-01-01\n\n---\n\n{}",
+            body.concat()
+        )
+    }
+
+    #[test]
+    fn auto_picks_are_not_labels() {
+        let (_dir, root) = project();
+        let auto = format!(
+            "# Phase 60: X - Discussion Log\n\n**Mode:** `--auto`\n\n{}{}",
+            area("First", &[("Fast", "✓"), ("Slow", "")], ""),
+            area("Second", &[("Fast", ""), ("Slow", "✓")], ""),
+        );
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &auto);
+        let mixed = log_file(&[
+            area(
+                "First",
+                &[("Fast", "✓"), ("Slow", "")],
+                "**Choice:** [auto] Fast",
+            ),
+            area("Second", &[("Fast", ""), ("Slow", "✓")], ""),
+            area("Third", &[("Fast", "✓"), ("Slow", "")], ""),
+        ]);
+        write_log(&root, ".planning/phases/61-y/61-DISCUSSION-LOG.md", &mixed);
+
+        let report = mine_project(&root, "p", &[]);
+        let questions: Vec<&str> = log_entries(&report)
+            .iter()
+            .map(|e| e.question.as_str())
+            .collect();
+        assert_eq!(questions, ["Second", "Third"]);
+        assert!(log_entries(&report).iter().all(|e| e.phase == "61"));
+        assert_eq!(report.excluded.auto, 3);
+    }
+
+    #[test]
+    fn a_delegation_pick_is_not_a_label() {
+        let (_dir, root) = project();
+        let text = log_file(&[
+            area("Delegated", &[("Keep it", ""), ("You decide", "✓")], ""),
+            area("Chosen", &[("Keep it", "✓"), ("You decide", "")], ""),
+        ]);
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &text);
+
+        let report = mine_project(&root, "p", &[]);
+        let questions: Vec<&str> = log_entries(&report)
+            .iter()
+            .map(|e| e.question.as_str())
+            .collect();
+        assert_eq!(questions, ["Chosen"]);
+        assert_eq!(report.excluded.delegation, 1);
+    }
+
+    #[test]
+    fn a_multi_select_question_is_excluded_and_counted() {
+        let (_dir, root) = project();
+        let text = log_file(&[area(
+            "Both",
+            &[("Red", "✓"), ("Blue", "✓"), ("Green", "")],
+            "",
+        )]);
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &text);
+
+        let report = mine_project(&root, "p", &[]);
+        assert!(log_entries(&report).is_empty());
+        assert_eq!(report.excluded.multi_select, 1);
+    }
+
+    #[test]
+    fn a_phase_whose_discuss_ran_through_the_channel_skips_its_log() {
+        let (_dir, root) = project();
+        write_events(
+            &root,
+            &lines(&[
+                asked("q54", json!(54), "discuss", "Pick a budget", 1),
+                answered("q54", json!(54), json!({"option_id": "a"}), "op", 2),
+                asked("q53", json!(53), "discuss", "Pick a budget", 3),
+                asked("q52", json!(52), "decision", "Pick a budget", 4),
+                answered("q52", json!(52), json!({"option_id": "a"}), "op", 5),
+            ]),
+        );
+        for phase in ["52", "53", "54"] {
+            let text = log_file(&[area("Budget", &[("Thirty", "✓"), ("Sixty", "")], "")]);
+            write_log(
+                &root,
+                &format!(".planning/phases/{phase}-x/{phase}-DISCUSSION-LOG.md"),
+                &text,
+            );
+        }
+
+        let report = mine_project(&root, "p", &[]);
+        let phases: Vec<&str> = log_entries(&report)
+            .iter()
+            .map(|e| e.phase.as_str())
+            .collect();
+        assert_eq!(phases, ["52", "53"]);
+        assert_eq!(report.excluded.duplicate_log, 1);
+    }
+
+    #[test]
+    fn tables_under_an_area_heading_are_separate_questions() {
+        let (_dir, root) = project();
+        let text = format!(
+            "## Area\n\n{HEADER}| One | first | ✓ |\n| Two | second | |\n\n**User's choice:** One\n\n\
+             {HEADER}| Red | | |\n| Blue | | ✓ |\n\n**User's choice:** Blue\n"
+        );
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &text);
+
+        let report = mine_project(&root, "p", &[]);
+        let entries = log_entries(&report);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.question == "Area" && e.context.is_none())
+        );
+        assert_ne!(entries[0].id, entries[1].id);
+        assert_eq!(entries[0].answer, option("a"));
+        assert_eq!(entries[1].answer, option("b"));
+        assert_eq!(entries[1].options[1].label, "Blue");
+    }
+
+    #[test]
+    fn a_question_heading_names_the_question_and_its_area_is_context() {
+        let (_dir, root) = project();
+        let text =
+            format!("## Area\n\n### Q1 — Which colour?\n\n{HEADER}| Red | | ✓ |\n| Blue | | |\n");
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &text);
+
+        let report = mine_project(&root, "p", &[]);
+        let entries = log_entries(&report);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].question, "Which colour?");
+        assert_eq!(entries[0].context.as_deref(), Some("Area"));
+        assert_eq!(entries[0].kind, QuestionKind::Discuss);
+    }
+
+    #[test]
+    fn a_multiline_free_text_choice_is_own_words() {
+        let (_dir, root) = project();
+        let text = log_file(&[
+            area(
+                "Free",
+                &[("A", ""), ("B", "")],
+                "**User's choice (free text):** \"first line\nsecond line\"\n\n**Notes:** asked a follow-up",
+            ),
+            area(
+                "Verbatim",
+                &[("A", ""), ("B", "")],
+                "**User's choice (verbatim intent):** keep\nboth",
+            ),
+            area(
+                "Text",
+                &[("A", ""), ("B", "")],
+                "**User's choice (text):** neither\nof them",
+            ),
+        ]);
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &text);
+
+        let report = mine_project(&root, "p", &[]);
+        let answers: Vec<&PrecedentAnswer> =
+            log_entries(&report).iter().map(|e| &e.answer).collect();
+        assert_eq!(
+            answers,
+            [
+                &own_words("\"first line second line\""),
+                &own_words("keep both"),
+                &own_words("neither of them")
+            ]
+        );
+    }
+
+    #[test]
+    fn archived_milestone_logs_are_mined() {
+        let (_dir, root) = project();
+        let relative = ".planning/milestones/v2.0.0-phases/16-x/16-DISCUSSION-LOG.md";
+        write_log(
+            &root,
+            relative,
+            &log_file(&[area("Budget", &[("Thirty", "✓")], "")]),
+        );
+
+        let report = mine_project(&root, "p", &[]);
+        let entries = log_entries(&report);
+        assert_eq!(entries.len(), 1, "{:?}", report.excluded);
+        assert_eq!(entries[0].phase, "16");
+        assert!(
+            entries[0].id.starts_with(&format!("log:{relative}:")),
+            "{}",
+            entries[0].id
+        );
+    }
+
+    #[test]
+    fn a_log_prefix_that_is_not_a_phase_id_is_still_mined() {
+        let (_dir, root) = project();
+        let relative = ".planning/milestones/v1.0-phases/11-r/11r-DISCUSSION-LOG.md";
+        write_log(
+            &root,
+            relative,
+            &log_file(&[area("Budget", &[("Thirty", "✓")], "")]),
+        );
+
+        let report = mine_project(&root, "p", &[]);
+        let phases: Vec<&str> = log_entries(&report)
+            .iter()
+            .map(|e| e.phase.as_str())
+            .collect();
+        assert_eq!(phases, ["11r"]);
+    }
+
+    #[test]
+    fn a_users_choice_that_matches_no_option_is_own_words() {
+        let (_dir, root) = project();
+        let text = log_file(&[
+            area(
+                "Other",
+                &[("Keep it", ""), ("Drop it", "")],
+                "**User's choice:** something else entirely → **D-03**",
+            ),
+            area(
+                "Same",
+                &[("Drop it", ""), ("Keep it", "")],
+                "**User's choice:**   keep   IT ",
+            ),
+        ]);
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &text);
+
+        let report = mine_project(&root, "p", &[]);
+        let answers: Vec<&PrecedentAnswer> =
+            log_entries(&report).iter().map(|e| &e.answer).collect();
+        assert_eq!(
+            answers,
+            [&own_words("something else entirely"), &option("b")]
+        );
+    }
+
+    #[test]
+    fn a_log_recommended_marker_is_stripped_and_kept_for_the_baseline() {
+        let (_dir, root) = project();
+        let text = log_file(&[area(
+            "Keep",
+            &[("Drop it", ""), ("Keep it (Recommended)", "✓")],
+            "",
+        )]);
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &text);
+
+        let report = mine_project(&root, "p", &[]);
+        let entries = log_entries(&report);
+        assert_eq!(entries.len(), 1, "{:?}", report.excluded);
+        assert_eq!(entries[0].options[1].label, "Keep it");
+        assert_eq!(entries[0].recommended.as_deref(), Some("b"));
+        assert_eq!(entries[0].answer, option("b"));
+    }
+
+    #[test]
+    fn an_unrecognised_log_block_is_counted_not_dropped() {
+        let (_dir, root) = project();
+        let text = log_file(&[
+            area(
+                "Unpicked",
+                &[("Keep it", ""), ("Drop it", "")],
+                "**Notes:** left open",
+            ),
+            "### A heading with no table\n\nProse only.\n".to_string(),
+        ]);
+        write_log(&root, ".planning/phases/60-x/60-DISCUSSION-LOG.md", &text);
+
+        let report = mine_project(&root, "p", &[]);
+        assert!(report.entries.is_empty(), "{:?}", report.entries);
+        let expected = ExclusionCounts {
+            unparsed: 1,
+            ..ExclusionCounts::default()
+        };
+        assert_eq!(report.excluded, expected);
+    }
 }
