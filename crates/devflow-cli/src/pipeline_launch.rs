@@ -11196,4 +11196,105 @@ mod tests {
         }
         assert_eq!(launch.overrides, ["o1"]);
     }
+
+    /// An `overrides_delivered` line of run `run` naming `ids`.
+    fn delivered_event(ids: &[&str], run: &str) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": 20, "phase": 54, "event": devflow_core::events::OVERRIDES_DELIVERED,
+            "run_started_at": run, "override_ids": ids,
+        })
+    }
+
+    /// D-17: a delivered override is not carried again.
+    #[test]
+    fn a_launch_after_the_delivery_carries_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = override_launch_state(root);
+        let run = state.started_at.clone();
+        append_events(
+            root,
+            &[
+                override_asked("q1"),
+                override_event("q1", "o1", "b", "a", &run),
+                delivered_event(&["o1"], &run),
+            ],
+        );
+        let launch = prepare_stage_launch(&mut state, "stage prompt".to_string(), None).unwrap();
+        let text = delivered_text(&launch);
+        assert!(
+            !text.contains(devflow_core::prompt::OVERRIDE_INTRODUCTION),
+            "no override section:\n{text}"
+        );
+        assert!(launch.overrides.is_empty(), "{:?}", launch.overrides);
+    }
+
+    /// D-17 (review codex-3): delivery names the ids the prompt carried, so an
+    /// override written after the prompt was built reaches the next launch.
+    #[test]
+    fn an_override_written_after_the_prompt_was_built_stays_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = override_launch_state(root);
+        let run = state.started_at.clone();
+        append_events(
+            root,
+            &[
+                override_asked("q1"),
+                override_event("q1", "o1", "b", "a", &run),
+            ],
+        );
+        let launch = prepare_stage_launch(&mut state, "stage prompt".to_string(), None).unwrap();
+        assert_eq!(launch.overrides, ["o1"]);
+        append_events(
+            root,
+            &[
+                override_asked("q2"),
+                override_event("q2", "o2", "d", "c", &run),
+                delivered_event(&["o1"], &run),
+            ],
+        );
+        let pending = devflow_core::history::pending_overrides(root, PhaseId::new(54), &run);
+        let ids: Vec<&str> = pending.iter().map(|p| p.question_id.as_str()).collect();
+        assert_eq!(ids, ["q2"]);
+    }
+
+    /// D-17: an agent that could not be spawned was given nothing, so its
+    /// overrides stay pending and no `overrides_delivered` line is written.
+    #[test]
+    fn a_failed_spawn_delivers_nothing() {
+        const NAME: &str = "pipeline_launch::tests::a_failed_spawn_delivers_nothing";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = override_launch_state(root);
+        // The failed start aborts at the infra ceiling instead of opening a gate.
+        state.infra_failures = devflow_core::mode::MAX_INFRA_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+        let run = state.started_at.clone();
+        append_events(
+            root,
+            &[
+                override_asked("q1"),
+                override_event("q1", "o1", "b", "a", &run),
+            ],
+        );
+        let mut launch =
+            prepare_stage_launch(&mut state, "stage prompt".to_string(), None).unwrap();
+        assert_eq!(launch.overrides, ["o1"]);
+        launch.program = root.join("no-such-agent").display().to_string();
+        let phase = PhaseId::new(54);
+        let _ = run_one_stage(root, phase, launch, &StopToken::for_run())
+            .expect("the runner reports the failed start");
+        let log = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
+        assert!(log.contains("\"stage_launch_failed\""), "{log}");
+        assert!(
+            !log.contains(devflow_core::events::OVERRIDES_DELIVERED),
+            "{log}"
+        );
+        let pending = devflow_core::history::pending_overrides(root, phase, &run);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].question_id, "q1");
+    }
 }

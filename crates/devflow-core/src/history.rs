@@ -1365,4 +1365,89 @@ mod tests {
         assert!(rendered.contains(&archived_capture.display().to_string()));
         assert!(rendered.contains(&live_review.display().to_string()));
     }
+
+    /// The pending overrides of run `run` of phase 53 from these event lines.
+    fn pending_of(events: &[serde_json::Value], run: &str) -> Vec<PendingOverride> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = events::events_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lines: String = events.iter().map(|event| format!("{event}\n")).collect();
+        std::fs::write(path, lines).unwrap();
+        pending_overrides(dir.path(), PhaseId::new(53), run)
+    }
+
+    fn delivered(ts: u64, ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": ts, "phase": 53, "event": events::OVERRIDES_DELIVERED,
+            "run_started_at": "100", "override_ids": ids,
+        })
+    }
+
+    fn with_override_id(mut event: serde_json::Value, id: &str) -> serde_json::Value {
+        event["override_id"] = serde_json::json!(id);
+        event
+    }
+
+    fn option(id: &str) -> QuestionChoice {
+        QuestionChoice::Option {
+            option_id: id.to_string(),
+        }
+    }
+
+    fn pending_ids(pending: &[PendingOverride]) -> Vec<&str> {
+        pending.iter().map(|p| p.question_id.as_str()).collect()
+    }
+
+    #[test]
+    fn two_overrides_deliver_one_line_with_the_latest_answer() {
+        let pending = pending_of(
+            &[
+                asked(10, "q1", "Which store?"),
+                overridden(11, "q1", "b", "a"),
+                overridden(12, "q1", "c", "b"),
+            ],
+            "100",
+        );
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].question.as_deref(), Some("Which store?"));
+        assert_eq!(pending[0].now, option("c"));
+        assert_eq!(pending[0].was, Some(option("a")));
+        assert_eq!(pending[0].override_ids, ["o-11", "o-12"]);
+    }
+
+    #[test]
+    fn delivery_is_matched_by_override_id() {
+        let overrides = [
+            with_override_id(overridden(11, "q1", "b", "a"), "o1"),
+            with_override_id(overridden(11, "q2", "b", "a"), "o2"),
+        ];
+        let mut events = overrides.to_vec();
+        events.push(delivered(11, &["o1"]));
+        assert_eq!(pending_ids(&pending_of(&events, "100")), ["q2"]);
+
+        let mut control = overrides.to_vec();
+        control.push(delivered(11, &["o3"]));
+        assert_eq!(
+            pending_ids(&pending_of(&control, "100")),
+            ["q1", "q2"],
+            "control: a delivery naming another id delivers neither"
+        );
+    }
+
+    #[test]
+    fn a_discarded_runs_override_does_not_reach_a_new_run() {
+        let events = [
+            overridden(11, "q1", "b", "a"),
+            serde_json::json!({
+                "v": 1, "ts": 12, "phase": 53, "event": events::RUN_DISCARDED,
+                "started_at": "100",
+            }),
+        ];
+        assert!(pending_of(&events, "200").is_empty());
+        assert_eq!(
+            pending_ids(&pending_of(&events, "100")),
+            ["q1"],
+            "control: the override is pending in its own run"
+        );
+    }
 }
