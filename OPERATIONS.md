@@ -36,7 +36,7 @@ Plan → Code → Validate
 |---|---|
 | `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--no-worktree] [--dry-run] [--until plan\|code\|validate] [--reviews] [--fallback-agent <agent>] [--no-triage]` | Begin a phase: launches the run as the phase's systemd user unit and returns once the unit is ready ([Run shape](#run-shape)); the unit's runner owns the agent and auto-advances. It runs only a new phase and removes or replaces nothing (52.1 D-09.1, D-20), refusing in this order: a live run (its runner lock is held), naming `devflow stop --phase N`; a finished run, naming the close-out and `devflow discard --phase N`; an incomplete run, naming `devflow resume --phase N`; a state file that does not load, gate files left with no run, or a leftover phase worktree or branch, each naming `devflow discard --phase N`. A state that only a killed `start` left (it never prepared the run) counts as no run, and `start` proceeds over it. `--dry-run` makes the same checks in the same order, read-only: the user-manager probe, these refusals (with no phase holder, write lock or reservation), the agent-binary check and the base branch's resolution, so it prints the refusal a real `start` would print; it never fetches, fast-forwards, creates a worktree or writes under `.devflow/`. A dry run that passes prints one line naming the start checks it skipped (base currency, phase reachability, and the CONTEXT.md/PLAN.md checks on the base), then the pipeline (52.1 D-26, D-27). `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing; `--until validate` halts nothing, prints a note saying so and records an `until_noop` event: the run ends as one without `--until` does ([How a run ends](#how-a-run-ends)). `--until define` and `--until ship` are rejected by clap as invalid values: there is no Define or Ship stage. Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below). `--reviews` runs Plan as `/gsd-plan-phase N --reviews`, replanning from the phase's review: it is refused, before anything is scaffolded, unless exactly `.planning/phases/NN-<slug>/NN-REVIEWS.md` is on the base the run forks from (a copy only in the primary checkout, or a REVIEWS.md elsewhere under the phase directory, does not count; a base git cannot list, or two `NN-*` phase directories on it, refuse too, naming git's error or both directories; the dry run names this check as one it skips), kept across `resume`, and ended when Plan completes or the run leaves Plan. `--fallback-agent <agent>` names one agent that takes over if the Code stage is rate-limited: one hop per run, at Code only (a rate limit at any other stage waits at the stage's gate), relaunching Code in the same worktree on the same branch. It is saved in `state-NN.json`, and refused when it equals `--agent`, when its binary is missing or its driver unhealthy, and in `--mode auto` unless it is `claude` or `antigravity`. That launch check is best effort: the full preflight runs again at the handoff, a refusal there leaves the run waiting at the Code gate, and a relaunch that fails after the handoff stops at a Code gate (see [Rate-limit failover](#rate-limit-failover)). Without the flag, `start` uses `devflow.toml`'s `fallback_agent` key and prints a note naming it; the flag wins the value, and no environment variable selects a fallback. After every refusal, `start` (a dry run too) warns on stderr, and does not refuse, when git does not ignore GSD's derived files `.planning/state.json`, `.planning/milestone.lock` or `.gsd/`, naming the `.gitignore` lines to add, and names `git rm --cached` for every tracked file under them (every file under `.gsd/`, not only one); a check git could not answer is listed under its own header. A real start reads the ignore rules of the tree the run forks (its worktree, or the primary checkout on the new feature branch with `--no-worktree`), a dry run those of the primary checkout; outside a git work tree it says nothing. `--no-triage` turns decision triage off for this run (`triage_off` in `state-NN.json`): every question goes to the operator; it is refused, a dry run included, when `devflow.toml`'s `[triage] enabled` is not true |
 | `devflow resume --phase N [--agent <agent>] [--fallback-agent <agent>] [--reviews] [--no-triage]` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Plan) and launches it as a new unit, returning once the unit is ready, as `start` does ([Run shape](#run-shape)) — the command a rate-limit gate names for after the reset. A run halted by `--until` resumes at the stage the halted move was going to, with the counters a normal advance resets: a plain `--until plan` halt resumes at Code, and a halt reached through a Plan→Validate move (a Plan gate's answer that runs Validate again) resumes at Validate. A run the operator stopped resumes at its saved stage. A run that finished (its Validate passed) is refused, naming `devflow start`, and nothing is launched. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)). `--agent <agent>` hands the run to another agent (an `agent_handoff` event with reason `resume --agent`); naming the run's saved, unused fallback is refused unless `--fallback-agent` names another. `--fallback-agent <agent>` sets the fallback or re-arms a spent one, checked as on `start`; like any resume it is accepted only on a run that is not live. Without it the saved fallback is kept as it is, spent or not: `resume` does not re-read `devflow.toml`. `--reviews` reruns Plan as a reviews pass (`/gsd-plan-phase N --reviews`) on a run its `--until plan` cap halted after Plan, instead of advancing; the cap still holds, so the run halts again after Plan and a plain `resume` then advances. It is refused, before anything is written, in any other state, naming why, and when the phase's `NN-REVIEWS.md` is missing from the run's checkout, naming the path, or the run's checkout has two `NN-*` phase directories, naming both. `--no-triage` turns decision triage off for the resumed run; it is refused, before anything is written, when `devflow.toml`'s `[triage] enabled` is not true or the run already has triage off. A resume without it keeps the run's setting. |
-| `devflow status` | Every phase with a state: the header lists the active runs and names each other phase's kind (finished, stopped, worktree missing). Per phase: `run: active`, `run: stopped`, `run: finished`, or `run: not active` when its recorded worktree no longer exists (the worktree line is marked `(missing)`); a stopped or finished run's `stop reason:` verbatim; `fallback: armed` (configured, not used), `spent` (already handed off) or `none`; stage, gate state, elapsed, last action. Each phase's first line is its run's liveness answer from the runner lock (`live`, `live (stopping)`, `finished`, `stopped`, `crashed`, …) with the verb that applies; see [Run liveness](#run-liveness). Also shows a held state write lock with its holder, and lists set-aside gate answers |
+| `devflow status` | Every phase with a state: the header lists the active runs and names each other phase's kind (finished, stopped, worktree missing). Per phase: `run: active`, `run: stopped`, `run: finished`, or `run: not active` when its recorded worktree no longer exists (the worktree line is marked `(missing)`); a stopped or finished run's `stop reason:` verbatim; `fallback: armed` (configured, not used), `spent` (already handed off) or `none`; stage, gate state, elapsed, last action; and, when `devflow.toml` has a `[triage]` table, a `triage:` line (see [Decision triage](#decision-triage)). Each phase's first line is its run's liveness answer from the runner lock (`live`, `live (stopping)`, `finished`, `stopped`, `crashed`, …) with the verb that applies; see [Run liveness](#run-liveness). Also shows a held state write lock with its holder, and lists set-aside gate answers |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
 | `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
 | `devflow ledger <phase> [PROJECT] [--json]` | List a phase's questions from `.devflow/events.jsonl` (no other file is read or written) in two sections, in log order. **Decided**: the questions triage answered. **Escalated**: every other question, with its reason: a score below a threshold (`pre_check_below_threshold`, `top_probability_below_threshold`), `blocking_human`, `no_threshold`, a triage fallback reason (such as `timeout` or `ledger_unwritable`), or `not_triaged` when triage did not run. Each entry shows the question id, stage, kind and gate, the question, the options, the triage scores and the thresholds in force, the answer with its policy and `answered_by`, and any overrides in log order with the effective (last) answer. An escalated question has no answer until the operator answers it (`devflow gate answer`); in `--json` it has no `answer` key at all, not an empty one. A phase with no questions prints both sections as `none` (`--json`: `decided: []`, `escalated: []`) |
@@ -133,6 +133,7 @@ usual `v`, `ts`, `phase` and `event` fields, and these:
 |---|---|---|
 | `question_asked` | the question's gate opened | `stage`, `question_id`, `gate_id`, `kind` (`decision`, `blocking-human` or `discuss`), `question`, `options` (each `{id, label, description?}`), `context`, `recommended` |
 | `question_answered` | `gate answer` reached the agent | `stage`, `question_id`, `gate_id`, `answer` (`{option_id}` or `{text}`), `policy` (always `operator_via_gate`), `answered_by` |
+| `triage_fallback` | triage could not score the question, beside its `question_asked` once the gate opened | `stage`, `question_id`, `run_started_at`, `reason`, `detail` |
 | `question_closed` | the question ended without an answer | `stage`, `question_id`, `gate_id`, `reason`, `closed_by` (the responder for `aborted_by_operator`, otherwise null) |
 
 The `question_closed` reasons:
@@ -173,6 +174,64 @@ touches a gate of any other kind.
 **What is stored.** `question_asked` keeps each question's full text, options
 and context in `.devflow/events.jsonl`. That file stays on this machine,
 in the project's `.devflow/` directory. It is also the record Phase 54 reads its question corpus from.
+
+## Decision triage
+
+With triage on (`devflow.toml`'s `[triage]` table; its keys are in
+[the configuration guide](docs/guides/configuration.md#decision-triage-triage)),
+`devflow __ask` sends a `decision` or `discuss` question to TypeSafe's Jev
+model before it opens a gate. A `blocking-human` question is never sent: it
+always goes to you. Jev returns two scores: the probability that you would
+take an offered option at all (checked against `pre_check_threshold`) and the
+probability of the option it picks (checked against `threshold`). When both
+scores are at or above their thresholds, triage answers the question with that
+option and no gate opens; a score equal to its threshold decides. Any other
+result opens the question gate as before. An unset threshold sends every
+question to you without a request.
+
+**Key and endpoint.** The key is read from `TYPESAFE_API_KEY` in the
+environment of the agent's `devflow __ask` server; it is sent only as the
+request's bearer header, never on a command line, and never written to an
+event, `status` or an error. `TYPESAFE_BASE_URL` overrides the endpoint; it may
+only be TypeSafe's API host over https or a loopback address, and anything
+else is refused (the `endpoint_refused` fallback below).
+
+**Your time first.** A Jev call never uses the time you need to answer: it
+gets at most the question's time left less a reserve kept for the gate, and a
+question with too little time left is not sent (`ask_budget_spent`).
+
+**When triage cannot answer.** Every failure sends the question to you, and
+appends a `triage_fallback` event naming the reason, beside the question's
+`question_asked` once its gate opens (a call that times out waiting for the
+stage's ask lock opens no gate and writes neither). The reasons:
+
+| Reason | Meaning |
+|---|---|
+| `no_api_key` | `TYPESAFE_API_KEY` is not set; no request is sent |
+| `endpoint_refused` | `TYPESAFE_BASE_URL` is neither TypeSafe over https nor loopback; no request is sent |
+| `unreachable` | the endpoint could not be reached |
+| `timeout` | no reply within `timeout_secs` |
+| `http_status` | an error status, recorded as `HTTP <code> <reason>` (for example `HTTP 429 rate limited`), never the reply's text |
+| `unparsable` | the reply is not JSON, or lacks a field or a probability it must carry |
+| `model_mismatch` | the reply names a model other than the configured `model` |
+| `ask_budget_spent` | too little of the question's time was left for the call |
+| `ledger_unwritable` | triage's answer could not be appended to the event log, so it was not given |
+
+**In `status`.** A phase whose `devflow.toml` has a `[triage]` table gets one
+`triage:` line; without the table there is none. It reads, by precedence:
+`fell back to the operator N time(s) this run; last: <reason> (<detail>)` when
+this run (the `triage_fallback` events whose `run_started_at` is the run's
+`started_at`) fell back; `off (enabled = false in devflow.toml)`; `off for this
+run (--no-triage)`; `on, escalating every question (no threshold)`; or `on
+(threshold T, pre-check P, model M)`. When `TYPESAFE_BASE_URL` names a host
+other than TypeSafe's, the line ends `via <host>`.
+
+**The record.** A question triage answered has a `question_asked` with no
+`gate_id` and a `question_answered` with policy `triage` and `answered_by`
+`triage:jev`; every `question_asked` triage scored carries a `triage` object
+with its outcome and scores. `devflow ledger <phase>` lists the decided and
+escalated questions, and `devflow ledger override` replaces an answer (see
+[Commands](#commands)).
 
 ## Run shape
 

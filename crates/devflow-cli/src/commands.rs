@@ -3492,20 +3492,10 @@ fn status_triage_config(project_root: &Path) -> Option<TriageConfig> {
         .then(|| config::triage_config(project_root))
 }
 
-/// The host of `base_url` (`scheme://[user@]host[:port]/...`), brackets kept
-/// for an IPv6 literal.
-fn url_host(base_url: &str) -> &str {
-    let rest = base_url
-        .split_once("://")
-        .map_or(base_url, |(_, rest)| rest);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let host_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    match host_port.find(']') {
-        Some(end) if host_port.starts_with('[') => &host_port[..=end],
-        _ => host_port.split(':').next().unwrap_or(host_port),
-    }
+/// The host `base_url` names; `None` when it does not parse as a URL.
+fn url_host(base_url: &str) -> Option<String> {
+    let uri = base_url.parse::<ureq::http::Uri>().ok()?;
+    uri.host().map(str::to_owned)
 }
 
 /// `status`'s line about triage for `state`'s run (TRIAGE-04, D-19): `None`
@@ -3521,8 +3511,8 @@ fn triage_line(
 ) -> Option<String> {
     let config = config?;
     let via = base_url
-        .map(url_host)
-        .filter(|host| *host != crate::triage_client::TYPESAFE_API_HOST)
+        .and_then(url_host)
+        .filter(|host| host != crate::triage_client::TYPESAFE_API_HOST)
         .map_or(String::new(), |host| format!(" via {host}"));
     let line = match tally.filter(|tally| tally.count > 0) {
         Some(tally) => format!(
@@ -17526,5 +17516,50 @@ mod tests {
         assert!(!quiet.contains("fell back"), "{quiet}");
         let only_earlier = fallback_tallies_from(&fallback_event("1699999999", "timeout", "x"));
         assert!(!only_earlier.contains_key(&key), "{only_earlier:?}");
+    }
+
+    #[test]
+    fn status_shows_triage_on_with_its_thresholds() {
+        let state = triage_state("1");
+        let config = TriageConfig::with_thresholds(Some(0.9), Some(0.7));
+        assert_eq!(
+            triage_line(&state, Some(&config), None, None).as_deref(),
+            Some("  triage: on (threshold 0.9, pre-check 0.7, model jev-1.14.0)")
+        );
+    }
+
+    #[test]
+    fn status_shows_triage_off() {
+        let mut state = triage_state("1");
+        let enabled = TriageConfig::with_thresholds(Some(0.9), Some(0.7));
+        assert_eq!(triage_line(&state, None, None, None), None);
+        let off =
+            triage_line(&state, Some(&TriageConfig::default()), None, None).expect("a triage line");
+        assert!(off.contains("enabled = false in devflow.toml"), "{off}");
+        let on = triage_line(&state, Some(&enabled), None, None).expect("a triage line");
+        assert!(!on.contains("off"), "{on}");
+        state.triage_off = true;
+        let for_run = triage_line(&state, Some(&enabled), None, None).expect("a triage line");
+        assert!(for_run.contains("off for this run"), "{for_run}");
+    }
+
+    #[test]
+    fn status_shows_escalate_all() {
+        let state = triage_state("1");
+        let config = TriageConfig::with_thresholds(None, None);
+        let line = triage_line(&state, Some(&config), None, None).expect("a triage line");
+        assert!(line.contains("escalating every question"), "{line}");
+    }
+
+    #[test]
+    fn status_names_a_non_default_endpoint() {
+        let state = triage_state("1");
+        let config = TriageConfig::with_thresholds(Some(0.9), Some(0.7));
+        let local = triage_line(&state, Some(&config), None, Some("http://127.0.0.1:9"))
+            .expect("a triage line");
+        assert!(local.contains("via 127.0.0.1"), "{local}");
+        let typesafe = triage_line(&state, Some(&config), None, Some("https://api.typesafe.ai"))
+            .expect("a triage line");
+        assert!(!typesafe.contains("via"), "{typesafe}");
     }
 }
