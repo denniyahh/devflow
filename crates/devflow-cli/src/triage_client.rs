@@ -1,10 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first production caller is the ask_server triage call, 54-06"
-    )
-)]
 //! Blocking HTTP transport to TypeSafe's Jev endpoint (D-01, D-21): one POST
 //! to `<base_url>/v1/systemone`, one attempt, a whole-call timeout, and a
 //! typed failure for every way it can go wrong.
@@ -106,13 +99,6 @@ pub(crate) fn endpoint_from(
 }
 
 /// [`endpoint_from`] over the process environment.
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "tests pass closures to endpoint_from; first caller is ask_server, 54-06"
-    )
-)]
 pub(crate) fn endpoint_from_env(timeout: Duration) -> Result<JevEndpoint, TransportFailure> {
     endpoint_from(|name| std::env::var(name).ok(), timeout)
 }

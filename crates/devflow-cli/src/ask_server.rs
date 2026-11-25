@@ -18,16 +18,27 @@
 //! that long: at the cap it replies `pending` with its `question_id` and the
 //! question stays open at its gate, and a re-call carrying that id continues
 //! it. The timeout counts from the question's first call, held or not.
+//!
+//! With triage on (`[triage]` in `devflow.toml`, not turned off for the run),
+//! a question's first call is first scored by Jev (Phase 54, TRIAGE-01). A
+//! score at or above both thresholds answers it at once, with no gate, once
+//! both of its event lines are on the log; anything else, including every
+//! failure, sends it down the gate path above unchanged (D-12, D-19).
 
 use crate::pipeline_gate::fire_gate_notify_events;
+use crate::triage_client::{self, TransportFailure};
 use devflow_core::gates::{
     AwaitOutcome, Claim, GateAnswer, GateId, GateKind, Gates, WaiterRegistration,
 };
 use devflow_core::liveness;
 use devflow_core::phase_id::PhaseId;
-use devflow_core::question::{AskAnswer, QuestionChoice, QuestionSpec, render_question_context};
+use devflow_core::question::{
+    AnswererKind, AskAnswer, QuestionChoice, QuestionSpec, answerer_kind, render_question_context,
+};
 use devflow_core::stage::Stage;
-use devflow_core::{events, workflow};
+use devflow_core::state::State;
+use devflow_core::triage::{FallbackReason, TriageConfig, TriageOutcome};
+use devflow_core::{config, corpus, events, triage, workflow};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -50,6 +61,14 @@ const RUN_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often a call retries the stage's ask lock while another question holds it.
 const ASK_LOCK_RETRY: Duration = Duration::from_millis(250);
+
+/// The time a question keeps, after its Jev call, to take the stage's ask
+/// lock and open its gate should triage not decide it.
+const TRIAGE_GATE_RESERVE: Duration = Duration::from_secs(5);
+
+/// The least time a Jev call is given; with less left before the question's
+/// deadline the model is not asked.
+const MIN_TRIAGE_BUDGET: Duration = Duration::from_secs(1);
 
 /// The MCP protocol versions this server speaks, newest first. A client asking
 /// for another gets the first (the spec's rule for an unsupported request).
@@ -607,6 +626,20 @@ struct OpenQuestion {
     deadline: Instant,
     /// `None` while the question waits for the stage's ask lock.
     gate: Option<OpenGate>,
+    /// The `triage` object of `question_asked`, set once on the first call
+    /// and recorded when the gate opens; `None` when triage did not run.
+    triage: Option<Value>,
+}
+
+/// What triage did with a question's first call.
+enum Triaged {
+    /// Triage answered the question and both of its lines are on the log.
+    Answered(AskAnswer),
+    /// The call ended, or was refused, while the model was asked: this is its
+    /// reply, `None` for a call the client cancelled.
+    Ended(Option<Value>),
+    /// The question goes to the operator's gate.
+    ToGate,
 }
 
 /// The `devflow_ask` worker: each call, and the questions left open between
@@ -637,15 +670,34 @@ impl Worker for AskServer {
                 Ok(parsed) => parsed,
                 Err(why) => return Some(tool_error(&why)),
             };
-        if let Err(why) = check_run_binding(&self.args) {
-            return Some(tool_error(&why));
-        }
+        let state = match check_run_binding(&self.args) {
+            Ok(state) => state,
+            Err(why) => return Some(tool_error(&why)),
+        };
         let question = match recall_id {
-            None => OpenQuestion {
-                spec,
-                deadline: control.arrived + Duration::from_secs(self.args.timeout_secs),
-                gate: None,
-            },
+            None => {
+                let mut question = OpenQuestion {
+                    spec,
+                    deadline: control.arrived + Duration::from_secs(self.args.timeout_secs),
+                    gate: None,
+                    triage: None,
+                };
+                let reply = match self.triage(&mut question, &state, control) {
+                    Triaged::ToGate => return self.hold(question, control),
+                    Triaged::Answered(answer) => Some(answered_result(&answer)),
+                    Triaged::Ended(reply) => reply,
+                };
+                self.finished.insert(
+                    question.spec.question_id,
+                    reply.clone().unwrap_or_else(|| {
+                        closed_error(
+                            Ending::CancelledByClient,
+                            Ending::CancelledByClient.sentence(),
+                        )
+                    }),
+                );
+                return reply;
+            }
             Some(id) => match self.open.remove(&id) {
                 Some(question) => question,
                 None => {
@@ -700,6 +752,52 @@ impl AskServer {
             finished: HashMap::new(),
             last_run_check: None,
         }
+    }
+
+    /// Score a first-time question with Jev, when triage is on for this run.
+    /// A decision is returned only after the call is re-checked (ended,
+    /// deadline, run binding) and both of its event lines are appended; every
+    /// other outcome leaves the `triage` object on `question` for its gate.
+    fn triage(
+        &self,
+        question: &mut OpenQuestion,
+        state: &State,
+        control: &CallControl<'_>,
+    ) -> Triaged {
+        let config = config::triage_config(&self.args.project);
+        if !config.enabled || state.triage_off {
+            return Triaged::ToGate;
+        }
+        let mut outcome = score_question(&self.args, &config, &question.spec, question.deadline);
+        if let Some(ending) = control.ending().or_else(|| run_ending(&self.args)) {
+            return Triaged::Ended(ended_reply(Err(Unanswered::NotAsked(ending))));
+        }
+        if Instant::now() < question.deadline {
+            if let Err(why) = check_run_binding(&self.args) {
+                return Triaged::Ended(Some(tool_error(&why)));
+            }
+            if let TriageOutcome::Decided { option_id, .. } = &outcome {
+                let fields = outcome.event_fields(&config);
+                match record_decision(&self.args, &question.spec, option_id, fields) {
+                    Ok(answer) => return Triaged::Answered(answer),
+                    Err(error) => {
+                        eprintln!(
+                            "devflow __ask: could not record triage's answer to question {} \
+                             ({error}); asking the operator",
+                            question.spec.question_id
+                        );
+                        outcome = TriageOutcome::Fallback {
+                            reason: FallbackReason::LedgerUnwritable,
+                            detail: "the event log could not be appended".to_string(),
+                        };
+                    }
+                }
+            }
+        }
+        // Past the deadline the question goes to `hold`, which ends it as
+        // timed out before any gate opens.
+        question.triage = Some(outcome.event_fields(&config));
+        Triaged::ToGate
     }
 
     /// Hold `question` for this call: open its gate if it has none, wait for
@@ -817,13 +915,26 @@ fn closed_error(ending: Ending, detail: &str) -> Value {
     ))
 }
 
-/// The tool result for an answered question.
+/// The tool result for an answered question, naming who answered it.
 fn answered_result(answer: &AskAnswer) -> Value {
-    let text = match &answer.answer {
-        QuestionChoice::Option { option_id } => {
+    let by = &answer.answered_by;
+    let text = match (answerer_kind(by), &answer.answer) {
+        (AnswererKind::Triage, QuestionChoice::Option { option_id }) => format!(
+            "DevFlow triage (Jev) chose option `{option_id}` on the operator's triage policy."
+        ),
+        (AnswererKind::Triage, QuestionChoice::Text { text }) => {
+            format!("DevFlow triage (Jev) answered on the operator's triage policy: {text}")
+        }
+        (AnswererKind::Agent, QuestionChoice::Option { option_id }) => {
+            format!("An agent answering for the operator (`{by}`) chose option `{option_id}`.")
+        }
+        (AnswererKind::Agent, QuestionChoice::Text { text }) => {
+            format!("An agent answering for the operator (`{by}`) answered: {text}")
+        }
+        (_, QuestionChoice::Option { option_id }) => {
             format!("The operator chose option `{option_id}`.")
         }
-        QuestionChoice::Text { text } => format!("The operator answered: {text}"),
+        (_, QuestionChoice::Text { text }) => format!("The operator answered: {text}"),
     };
     json!({
         "content": [{ "type": "text", "text": text }],
@@ -833,8 +944,8 @@ fn answered_result(answer: &AskAnswer) -> Value {
 
 /// Refuse a call unless this server is bound to the live run it names (D-03):
 /// the saved state exists, carries `--run-started-at` and `--stage`, and the
-/// phase's runner lock is held.
-fn check_run_binding(args: &AskArgs) -> Result<(), String> {
+/// phase's runner lock is held. Returns the saved state it read.
+fn check_run_binding(args: &AskArgs) -> Result<State, String> {
     let phase = args.phase;
     let state = workflow::load_state(&args.project, phase)
         .map_err(|error| format!("devflow_ask refused: phase {phase} has no run state: {error}"))?;
@@ -852,7 +963,7 @@ fn check_run_binding(args: &AskArgs) -> Result<(), String> {
         ));
     }
     match liveness::probe(&liveness::runner_lock_path(&args.project, phase)) {
-        Ok(liveness::Held::Live) => Ok(()),
+        Ok(liveness::Held::Live) => Ok(state),
         Ok(liveness::Held::Abandoned | liveness::Held::Missing) => Err(format!(
             "devflow_ask refused: phase {phase}'s runner is not live, so no one would read \
              the question"
@@ -896,7 +1007,7 @@ fn hold_question(args: &AskArgs, question: &mut OpenQuestion, watch: &RunWatch<'
             phase.padded()
         );
         let notifier = Notifier::spawn(args, spec);
-        emit_question_asked(args, spec, &gate_id);
+        emit_question_asked(args, spec, &gate_id, question.triage.as_ref());
         question.gate = Some(OpenGate {
             gate_id,
             registration,
@@ -1118,23 +1229,144 @@ impl Notifier {
     }
 }
 
-/// Record `question_asked` for `spec`'s open gate (D-15).
-fn emit_question_asked(args: &AskArgs, spec: &QuestionSpec, gate_id: &GateId) {
+/// Record `question_asked` for `spec`'s open gate (D-15), with its `triage`
+/// object when triage ran.
+fn emit_question_asked(
+    args: &AskArgs,
+    spec: &QuestionSpec,
+    gate_id: &GateId,
+    triage: Option<&Value>,
+) {
     events::emit(
         &args.project,
         args.phase,
         events::QUESTION_ASKED,
+        question_asked_fields(args, spec, Some(gate_id), triage),
+    );
+}
+
+/// The fields of `question_asked`; `gate_id` is absent for a question triage
+/// decided, which has no gate.
+fn question_asked_fields(
+    args: &AskArgs,
+    spec: &QuestionSpec,
+    gate_id: Option<&GateId>,
+    triage: Option<&Value>,
+) -> Value {
+    let mut fields = json!({
+        "stage": args.stage.to_string(),
+        "question_id": spec.question_id,
+        "kind": spec.kind,
+        "question": spec.question,
+        "options": spec.options,
+        "context": spec.context,
+        "recommended": spec.recommended,
+        "run_started_at": args.run_started_at,
+    });
+    if let Some(gate_id) = gate_id {
+        fields["gate_id"] = json!(gate_id.as_str());
+    }
+    if let Some(triage) = triage {
+        fields["triage"] = triage.clone();
+    }
+    fields
+}
+
+/// Append triage's answer to `spec`, `question_asked` (no gate) then
+/// `question_answered`, and return it; an append error means the decision
+/// must not be returned (D-14: the log is the only ledger).
+fn record_decision(
+    args: &AskArgs,
+    spec: &QuestionSpec,
+    option_id: &str,
+    triage_fields: Value,
+) -> std::io::Result<AskAnswer> {
+    let (root, phase) = (args.project.as_path(), args.phase);
+    events::try_emit(
+        root,
+        phase,
+        events::QUESTION_ASKED,
+        question_asked_fields(args, spec, None, Some(&triage_fields)),
+    )?;
+    let answer = AskAnswer {
+        question_id: spec.question_id.clone(),
+        answer: QuestionChoice::Option {
+            option_id: option_id.to_string(),
+        },
+        answered_by: triage::TRIAGE_ANSWERER.to_string(),
+        answered_at: unix_now(),
+    };
+    events::try_emit(
+        root,
+        phase,
+        events::QUESTION_ANSWERED,
         json!({
             "stage": args.stage.to_string(),
-            "question_id": spec.question_id,
-            "gate_id": gate_id.as_str(),
-            "kind": spec.kind,
-            "question": spec.question,
-            "options": spec.options,
-            "context": spec.context,
-            "recommended": spec.recommended,
+            "question_id": answer.question_id,
+            "answer": answer.answer,
+            "policy": events::ANSWERING_POLICY_TRIAGE,
+            "answered_by": answer.answered_by,
         }),
-    );
+    )?;
+    Ok(answer)
+}
+
+/// Score `spec` with Jev under `config`. A `blocking-human` question, an
+/// unset threshold or too little time left sends no request; every failure
+/// is a fallback, which escalates (D-08, D-07, D-19). The call is given at
+/// most the question's time left less [`TRIAGE_GATE_RESERVE`].
+fn score_question(
+    args: &AskArgs,
+    config: &TriageConfig,
+    spec: &QuestionSpec,
+    deadline: Instant,
+) -> TriageOutcome {
+    if let Some(outcome) = triage::pre_decide(spec.kind, config) {
+        return outcome;
+    }
+    let precedents = corpus::precedents_for(&args.project, config, spec);
+    let request = triage::jev_request(spec, &precedents, &config.model);
+    let left = deadline
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(TRIAGE_GATE_RESERVE);
+    let budget = config.timeout.min(left);
+    if budget < MIN_TRIAGE_BUDGET {
+        return TriageOutcome::Fallback {
+            reason: FallbackReason::AskBudgetSpent,
+            detail: format!(
+                "{} ms left for the model call, under the {} s minimum",
+                budget.as_millis(),
+                MIN_TRIAGE_BUDGET.as_secs()
+            ),
+        };
+    }
+    let body = match triage_client::endpoint_from_env(budget)
+        .and_then(|endpoint| triage_client::post_systemone(&endpoint, &request))
+    {
+        Ok(body) => body,
+        Err(failure) => return transport_fallback(&failure),
+    };
+    match triage::parse_jev_response(&body, spec, &config.model) {
+        Ok(scores) => triage::decide(&scores, config),
+        Err((reason, detail)) => TriageOutcome::Fallback { reason, detail },
+    }
+}
+
+/// A transport failure as its fallback; the failure's text never carries the
+/// key or the endpoint's reply.
+fn transport_fallback(failure: &TransportFailure) -> TriageOutcome {
+    let reason = match failure {
+        TransportFailure::NoApiKey => FallbackReason::NoApiKey,
+        TransportFailure::EndpointRefused => FallbackReason::EndpointRefused,
+        TransportFailure::Unreachable => FallbackReason::Unreachable,
+        TransportFailure::Timeout => FallbackReason::Timeout,
+        TransportFailure::HttpStatus { .. } => FallbackReason::HttpStatus,
+        TransportFailure::NotJson => FallbackReason::Unparsable,
+    };
+    TriageOutcome::Fallback {
+        reason,
+        detail: failure.to_string(),
+    }
 }
 
 /// Record `question_answered` for `answer` (D-15).

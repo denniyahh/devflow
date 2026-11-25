@@ -81,16 +81,6 @@ fn triage_client(fixture: &AskFixture, base_url: &str, overrides: AskOverrides) 
     client
 }
 
-/// A fake Jev reply scoring option `a` at `score`, its pre-check at `score`.
-fn scoring_a(score: f64) -> FakeReply {
-    FakeReply::json(jev_answer(
-        MODEL,
-        score,
-        "a",
-        &[("a", score), ("b", 1.0 - score)],
-    ))
-}
-
 /// The two options every question here offers.
 fn options() -> Value {
     json!([
