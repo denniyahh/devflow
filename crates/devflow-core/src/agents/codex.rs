@@ -95,13 +95,14 @@ impl AgentDriver for CodexDriver {
         Ok(())
     }
 
-    /// D-03: five `-c mcp_servers.devflow.*` overrides before the prompt. The
+    /// D-03: six `-c mcp_servers.devflow.*` overrides before the prompt. The
     /// operator's own servers stay on (as for claude) and the tool is approved
     /// without a prompt. OD-1 (b): the server holds one call at most
     /// [`ASK_HOLD_CAP_SECS`], then replies `pending`, so the tool timeout is
     /// the cap plus the margin (the spike saw codex cancel a held call at its
     /// 300 s default, so its client must outlast the cap). Every string value
-    /// is escaped like the writable roots.
+    /// is escaped like the writable roots. Pitfall 6: `env_vars` forwards the
+    /// triage variables by name only, so the key never appears on argv.
     fn ask_wiring(&self, reg: &AskRegistration) -> Result<AskWiring, String> {
         let (exe, _root) = reg.utf8_paths()?;
         let quoted = |value: &str| format!("\"{}\"", escape_toml_basic_string(value));
@@ -121,6 +122,11 @@ impl AgentDriver for CodexDriver {
             ),
             format!("default_tools_approval_mode={}", quoted("approve")),
             "enabled=true".to_string(),
+            format!(
+                "env_vars=[{},{}]",
+                quoted("TYPESAFE_API_KEY"),
+                quoted("TYPESAFE_BASE_URL")
+            ),
         ];
         let args = overrides
             .into_iter()
@@ -258,8 +264,8 @@ mod tests {
 
     /// D-03: codex gets the server through `-c mcp_servers.devflow.*` overrides
     /// placed before the prompt: the command, its args with the hold cap, a
-    /// tool timeout of the cap plus the margin, approval without a prompt, and
-    /// enabled.
+    /// tool timeout of the cap plus the margin, approval without a prompt,
+    /// enabled, and the `env_vars` names forwarded to the server.
     /// Every value is a TOML string escaped like the writable roots.
     #[test]
     fn launch_args_set_tool_timeout_and_approval_before_the_prompt() {
@@ -269,7 +275,7 @@ mod tests {
         assert_eq!(wiring.placement, crate::agents::ArgPlacement::BeforeLast);
         assert_eq!(wiring.file, None, "codex writes no file");
         let args = &wiring.args;
-        assert_eq!(args.len(), 10, "five -c pairs: {args:?}");
+        assert_eq!(args.len(), 12, "six -c pairs: {args:?}");
         assert_eq!(override_value(args, "command"), "\"/opt/bin/devflow\"");
         assert_eq!(
             override_value(args, "args"),
@@ -292,6 +298,28 @@ mod tests {
             value.contains(r#""/work/a\"b""#),
             "the quote in the project path is escaped: {value}"
         );
+    }
+
+    /// Pitfall 6: codex starts its MCP server with a cleared environment, so the
+    /// triage key reaches `__ask` only when its name is forwarded. The override
+    /// names both variables and never carries a value for either.
+    #[test]
+    fn ask_wiring_forwards_the_typesafe_variable_names() {
+        let wiring = CodexDriver
+            .ask_wiring(&ask_registration("/work/project"))
+            .expect("codex registers the server");
+        assert_eq!(
+            override_value(&wiring.args, "env_vars"),
+            "[\"TYPESAFE_API_KEY\",\"TYPESAFE_BASE_URL\"]"
+        );
+        for name in ["TYPESAFE_API_KEY", "TYPESAFE_BASE_URL"] {
+            let assignment = format!("{name}=");
+            assert!(
+                wiring.args.iter().all(|arg| !arg.contains(&assignment)),
+                "no arg assigns a value to {name}: {:?}",
+                wiring.args
+            );
+        }
     }
 
     /// OD-1 (b), production values: codex is held 900 s at most per call and its
