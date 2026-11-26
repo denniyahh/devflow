@@ -376,7 +376,7 @@ worktree, a feature branch, or `.devflow/` state):
 | Agent binary present | The agent's executable (`claude`/`codex`/`opencode`) is not found on `PATH` | Install the agent, or run `devflow doctor` |
 | Agent can see `devflow_ask` (Phase 53) | `--agent` or `--fallback-agent` is opencode, hermes or antigravity, which have no MCP registration (backlog 999.248) | Use `--agent claude`, `--agent codex` or `--agent pi` |
 | Phase reachable from `develop` (23f) | Phase N's `### Phase N:` ROADMAP heading or its `.planning/phases/NN-*/` directory is missing from `develop` — skipped entirely if `develop` has no `.planning/ROADMAP.md` at all | Merge the branch carrying the phase's planning artifacts into `develop`, then re-run |
-| Codex headless Plan | `--agent codex` and phase N has no `-CONTEXT.md` on `develop` — Codex's `exec` mode cannot run the discuss-phase interview headlessly, so its Plan stage needs CONTEXT.md to exist | Run `/gsd-discuss-phase N` interactively first (any agent), or use `--agent claude` |
+| Codex headless Plan | No longer a refusal (#330): codex runs discuss inside Plan and asks its questions through `devflow_ask`, like claude and pi, so phase N needs no `-CONTEXT.md` on `develop` before `--agent codex` | Answer the `discuss` gates as they open (`devflow gate answer`) |
 
 ## Answering gates
 

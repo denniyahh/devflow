@@ -1695,46 +1695,77 @@ esac
     assert!(!root.join(".worktrees/phase-08").is_dir());
 }
 
-/// 13-06 dogfood regression (Codex leg): a fresh headless Codex run can
-/// never pass Plan, so `start --agent codex` on a phase with no CONTEXT.md
-/// on develop must fail fast in pre-flight — before any worktree, branch, or
-/// monitor is created.
+/// #330 (D-20): codex runs discuss inside Plan through `devflow_ask`, like
+/// claude and pi, so `start --agent codex` on a phase with no CONTEXT.md on
+/// develop is no longer refused for the missing artifact: Plan launches.
+/// A real start, not `--dry-run`: the dry run skips the CONTEXT.md check, so
+/// it would pass with the refusal still in place.
 #[test]
-fn start_codex_without_context_fails_preflight() {
+fn start_codex_without_context_passes_preflight() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    // codex IS installed (the 13-06 dogfood scenario) — the binary preflight
-    // (14-CR-05) passes and the CONTEXT.md artifact check must fire next.
-    let fake_bin = fake_bin_dir(&[("codex", "#!/bin/sh\nexit 0\n")]);
+    let fake_bin = fake_bin_dir(&[(
+        "codex",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+    let phase_42_dirs = fs::read_dir(root.join(".planning/phases"))
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("42-")
+        })
+        .count();
+    assert_eq!(
+        phase_42_dirs, 0,
+        "control: the fixture has no phase 42 CONTEXT.md, so the lifted refusal is what passes"
+    );
 
+    // `supervise --until plan`, as in `start_until_plan_halts_cleanly`: the
+    // CONTEXT.md refusal at `start` is mode-independent, and the capture shape
+    // is refused in `Mode::Auto` for a reason unrelated to this test.
     let output = common::hermetic_devflow(&home)
         .args([
-            "start", "--phase", "42", "--agent", "codex", "--mode", "auto",
+            "start",
+            "--phase",
+            "42",
+            "--agent",
+            "codex",
+            "--mode",
+            "supervise",
+            "--until",
+            "plan",
         ])
         .arg(root)
         .hermetic_path(path_with_fake_bin(&fake_bin.path))
+        .env("DEVFLOW_TEST_ROOT", root)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "60")
         .current_dir(root)
         .output()
         .expect("run devflow");
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(42));
 
-    assert!(
-        !output.status.success(),
-        "codex start on a context-less phase must fail pre-flight"
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("no CONTEXT.md"),
-        "pre-flight error must name the missing artifact\nstderr: {stderr}"
+        !stderr.contains("no CONTEXT.md"),
+        "codex start must not be refused for a missing CONTEXT.md\nstderr: {stderr}"
     );
     assert!(
-        stderr.contains("/gsd-discuss-phase 42"),
-        "pre-flight error must include the remediation command\nstderr: {stderr}"
+        output.status.success(),
+        "codex start on a context-less phase passes pre-flight\nstderr: {stderr}"
     );
+    wait_for_stopped(root, PhaseId::new(42));
+    let events = fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
     assert!(
-        !root.join(".worktrees/phase-42").exists(),
-        "pre-flight failure must not create a worktree"
+        events
+            .lines()
+            .any(|line| line.contains("\"stage_launched\"") && line.contains("\"stage\":\"plan\"")),
+        "codex Plan launched without CONTEXT.md\nevents:\n{events}"
     );
 }
 

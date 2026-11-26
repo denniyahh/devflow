@@ -1305,15 +1305,14 @@ fn run_approving_a_plan_gate(fixture: &RunnerFixture) -> (u32, Output, bool) {
     (runner_pid, output, approved)
 }
 
-/// D-02 (T-52.2-65): a Codex Plan in auto mode with no CONTEXT.md on the recorded base
-/// opens a preflight gate; once a second process approves it, the same runner runs the
-/// Plan agent as its own child and records Plan's verdict.
+/// D-02 (T-52.2-65): a Codex Plan in auto mode opens a preflight gate, because the
+/// unattended-launch check refuses any agent but claude or antigravity at Plan
+/// (`unattended_launch_shape_condition`); once a second process approves it, the same
+/// runner runs the Plan agent as its own child and records Plan's verdict. Since #330 a
+/// missing CONTEXT.md no longer refuses codex, so that refusal is the gate's reason.
 ///
-/// Control: the same run in supervise mode, every other field the same, opens no gate.
-/// Committing the CONTEXT.md does not negate the refusal for Codex in auto mode: the
-/// unattended-launch check also refuses any agent but claude or antigravity at Plan
-/// (`unattended_launch_shape_condition`), and supervise mode is what turns both
-/// refusals into a report.
+/// Control: the same run in supervise mode, every other field the same, opens no gate:
+/// supervise mode turns the refusal into a report.
 #[test]
 fn an_approved_preflight_gate_runs_its_stage_in_the_same_runner() {
     use devflow_core::mode::Mode;
@@ -1331,8 +1330,8 @@ fn an_approved_preflight_gate_runs_its_stage_in_the_same_runner() {
             && fired[0]["gate_kind"] == "preflight"
             && fired[0]["context"]
                 .as_str()
-                .is_some_and(|context| context.contains("has no -CONTEXT.md on `develop`")),
-        "no single Plan preflight gate naming the missing CONTEXT.md: {fired:?}\n{}",
+                .is_some_and(|context| context.contains("Code would launch on the pipe-owning arm")),
+        "no single Plan preflight gate naming the unattended-launch refusal: {fired:?}\n{}",
         shown(&output)
     );
     assert_eq!(

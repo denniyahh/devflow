@@ -139,15 +139,12 @@ impl AgentDriver for CodexDriver {
         })
     }
 
-    fn interactivity_mode(&self, stage: crate::stage::Stage) -> InteractivityMode {
-        use crate::stage::Stage;
-        match stage {
-            // Codex cannot run the interactive discuss-phase interview or the
-            // interactive plan-phase decision headless — its Plan stage needs
-            // the artifact to pre-exist (13-06 dogfood finding).
-            Stage::Plan => InteractivityMode::RequiresExistingArtifact,
-            _ => InteractivityMode::HeadlessSafe,
-        }
+    /// #330 (D-20): every stage is headless-safe. The workflow-style Plan
+    /// prompt carries the discuss branch, and codex asks its questions through
+    /// `devflow_ask` like claude and pi, so Plan no longer needs CONTEXT.md to
+    /// pre-exist (the 13-06 refusal is lifted).
+    fn interactivity_mode(&self, _stage: crate::stage::Stage) -> InteractivityMode {
+        InteractivityMode::HeadlessSafe
     }
 }
 
