@@ -901,4 +901,13 @@ mod tests {
             TriageOutcome::Decided { ref option_id, .. } if option_id == "a"
         ));
     }
+
+    /// The literals are copied from the Phase 54 measurement report
+    /// (54-BAKEOFF.md): model jev-1.14.0, pre-check 0.37, option 0.92.
+    #[test]
+    fn the_shipped_defaults_are_the_measured_ones() {
+        assert_eq!(DEFAULT_MODEL, "jev-1.14.0");
+        assert_eq!(DEFAULT_PRE_CHECK_THRESHOLD, Some(0.37));
+        assert_eq!(DEFAULT_THRESHOLD, Some(0.92));
+    }
 }
