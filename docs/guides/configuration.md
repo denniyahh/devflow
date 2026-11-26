@@ -37,15 +37,15 @@ exclude_label_phases = [51, "52.1"]
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Whether triage runs. No `[triage]` table, or no `enabled` key, means off |
-| `threshold` | unset | A question is decided only when the chosen option's probability is at least this value |
-| `pre_check_threshold` | unset | ...and the probability that you would accept an offered option as offered is at least this value |
+| `threshold` | 0.92 | A question is decided only when the chosen option's probability is at least this value |
+| `pre_check_threshold` | 0.37 | ...and the probability that you would accept an offered option as offered is at least this value |
 | `model` | `jev-1.14.0` | The versioned model id sent; a response from any other model is not used |
 | `timeout_secs` | 10 | How long one triage request may take |
 | `exclude_label_phases` | empty | Phases whose recorded answers are not used as examples of how you answer |
 
-Both comparisons are "at least": a score equal to its threshold decides. An
-unset threshold escalates every question, and both are unset until a measured
-value ships, so turning triage on without thresholds changes nothing.
+Both comparisons are "at least": a score equal to its threshold decides. The
+defaults are the values the Phase 54 measurement on the operator's own answers
+chose (`.planning/phases/54-decision-triage/54-BAKEOFF.md`).
 A `blocking-human` question always goes to you, whatever the thresholds.
 
 Triage fails safe. A threshold that is not a number in [0, 1], a `model` that

@@ -31,13 +31,13 @@ pub const DEFAULT_MODEL: &str = "jev-1.14.0";
 /// per-operation default).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-/// The option threshold when `[triage] threshold` is absent. `None`
-/// escalates every question until a measured value is recorded (D-07).
-pub const DEFAULT_THRESHOLD: Option<f64> = None;
+/// The option threshold when `[triage] threshold` is absent: the value the
+/// Phase 54 measurement chose (54-BAKEOFF.md, D-07).
+pub const DEFAULT_THRESHOLD: Option<f64> = Some(0.92);
 
-/// The pre-check threshold when `[triage] pre_check_threshold` is absent.
-/// `None` escalates every question until a measured value is recorded (D-07).
-pub const DEFAULT_PRE_CHECK_THRESHOLD: Option<f64> = None;
+/// The pre-check threshold when `[triage] pre_check_threshold` is absent:
+/// the value the Phase 54 measurement chose (54-BAKEOFF.md, D-07).
+pub const DEFAULT_PRE_CHECK_THRESHOLD: Option<f64> = Some(0.37);
 
 /// The instructions of the `accept` question.
 const ACCEPT_INSTRUCTIONS: &str = "Would the operator accept one of the offered `options` as \
