@@ -1680,6 +1680,48 @@ mod tests {
         assert_eq!(report.entries[0].answer, option("b"));
     }
 
+    fn closed(qid: &str, phase: Value, reason: &str, ts: u64) -> Value {
+        json!({
+            "v": 1, "ts": ts, "phase": phase, "event": "question_closed",
+            "stage": "plan", "question_id": qid, "gate_id": format!("g-{qid}"),
+            "reason": reason, "closed_by": null,
+        })
+    }
+
+    #[test]
+    fn an_answer_after_a_close_is_not_a_label() {
+        let (_dir, root) = project();
+        write_events(
+            &root,
+            &lines(&[
+                asked("q1", json!(54), "decision", "Pick a budget", 1),
+                closed("q1", json!(54), "run_ended", 2),
+                answered("q1", json!(54), json!({"option_id": "a"}), "op", 3),
+            ]),
+        );
+
+        let report = mine_project(&root, "p", &[]);
+        assert!(report.entries.is_empty(), "{:?}", report.entries);
+        assert_eq!(report.excluded.unanswered, 1);
+    }
+
+    #[test]
+    fn the_first_answer_is_the_label() {
+        let (_dir, root) = project();
+        write_events(
+            &root,
+            &lines(&[
+                asked("q1", json!(54), "decision", "Pick a budget", 1),
+                answered("q1", json!(54), json!({"option_id": "a"}), "op", 2),
+                answered("q1", json!(54), json!({"option_id": "b"}), "op", 3),
+            ]),
+        );
+
+        let report = mine_project(&root, "p", &[]);
+        assert_eq!(report.entries.len(), 1, "{:?}", report.entries);
+        assert_eq!(report.entries[0].answer, option("a"));
+    }
+
     #[test]
     fn a_triage_answer_overridden_by_the_operator_is_a_label() {
         let (_dir, root) = project();
