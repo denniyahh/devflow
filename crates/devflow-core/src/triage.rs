@@ -801,6 +801,34 @@ mod tests {
     }
 
     #[test]
+    fn a_recommendation_line_in_the_context_never_reaches_jev() {
+        let spec = QuestionSpec {
+            context: Some(
+                "planning\nRecommended: b\n  I recommend the nested layout.\nkeep the old path"
+                    .to_string(),
+            ),
+            ..two_options()
+        };
+        let request = jev_request(&spec, &[], MODEL);
+        let serialized = serde_json::to_string(&request).expect("the request serializes");
+        assert!(!serialized.contains("Recommended: b"), "{serialized}");
+        assert!(!serialized.contains("I recommend"), "{serialized}");
+        assert_eq!(request["state"]["context"], "planning\nkeep the old path");
+    }
+
+    #[test]
+    fn a_recommended_marker_in_the_question_never_reaches_jev() {
+        let spec = QuestionSpec {
+            question: "Which layout? (Recommended: b)".to_string(),
+            context: Some("planning [recommended]".to_string()),
+            ..two_options()
+        };
+        let request = jev_request(&spec, &[], MODEL);
+        assert_eq!(request["state"]["question"], "Which layout?");
+        assert_eq!(request["state"]["context"], "planning");
+    }
+
+    #[test]
     fn a_recommended_marker_in_a_label_is_stripped() {
         for (label, stripped) in [
             ("Use X (Recommended)", "Use X"),
