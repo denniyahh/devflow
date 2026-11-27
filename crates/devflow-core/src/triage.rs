@@ -548,7 +548,8 @@ pub fn decide(scores: &JevScores, config: &TriageConfig) -> TriageOutcome {
 
 /// The outcome of a question that is not sent to Jev at all: a
 /// `blocking-human` question (D-08), then any question while a threshold is
-/// unset (D-07). `None` means the question is to be scored.
+/// unset (D-07), then a question with a single option, which Jev could only
+/// pick. `None` means the question is to be scored.
 pub fn pre_decide(spec: &QuestionSpec, config: &TriageConfig) -> Option<TriageOutcome> {
     let skip = |reason| {
         Some(TriageOutcome::Escalated {
@@ -561,6 +562,9 @@ pub fn pre_decide(spec: &QuestionSpec, config: &TriageConfig) -> Option<TriageOu
     }
     if config.threshold.is_none() || config.pre_check_threshold.is_none() {
         return skip(EscalateReason::NoThreshold);
+    }
+    if spec.options.len() == 1 {
+        return skip(EscalateReason::SingleOption);
     }
     None
 }
