@@ -4,8 +4,10 @@
 //!
 //! The key and the precedents go only to TypeSafe or to this host (D-01,
 //! D-03): [`endpoint_from`] refuses any other base URL before a request is
-//! made. No failure carries the key, a request header or any text the
-//! endpoint sent back.
+//! made, and the call connects straight to that address: the proxy
+//! variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) are not read, since a
+//! proxy is a third host. No failure carries the key, a request header or any
+//! text the endpoint sent back.
 
 use std::time::Duration;
 
@@ -146,7 +148,9 @@ fn endpoint_allowed(base_url: &str) -> bool {
 /// The endpoint's timeout budgets the whole call, body included. The body is
 /// sent as bytes, so it carries a `Content-Length`. A non-2xx reply's body is
 /// read to completion and dropped: an endpoint that echoes the key or a
-/// precedent must not reach a log.
+/// precedent must not reach a log. The call connects directly for every base
+/// URL, TypeSafe's included: no proxy variable is read, so a network that
+/// reaches TypeSafe only through a proxy fails it as unreachable (D-19).
 pub(crate) fn post_systemone(
     endpoint: &JevEndpoint,
     body: &serde_json::Value,
@@ -154,6 +158,7 @@ pub(crate) fn post_systemone(
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(endpoint.timeout))
         .http_status_as_error(false)
+        .proxy(None)
         .build()
         .into();
     let mut response = agent
@@ -257,6 +262,33 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body, sent);
+    }
+
+    /// Control for the e2e proxy test: an agent with a proxy configured does
+    /// send its call to the proxy fake, so that test's zero means no proxy was
+    /// used, not a fake that cannot see one.
+    #[test]
+    fn a_configured_proxy_receives_the_call_instead_of_the_target() {
+        let target = FakeJev::serve(vec![FakeReply::json("{}")]);
+        let proxy = FakeJev::serve(vec![FakeReply::json("{}")]);
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .proxy(Some(
+                ureq::Proxy::new(&proxy.url()).expect("the proxy fake's URL is a valid proxy"),
+            ))
+            .build()
+            .into();
+
+        let _ = agent
+            .post(format!("{}{SYSTEMONE_PATH}", target.url()))
+            .send(any_body().to_string().into_bytes());
+
+        let requests = proxy.requests();
+        assert_eq!(requests.len(), 1, "one request at the proxy: {requests:#?}");
+        assert_eq!(requests[0].method, "CONNECT", "{requests:#?}");
+        let target_authority = target.url().trim_start_matches("http://").to_owned();
+        assert_eq!(requests[0].path, target_authority, "{requests:#?}");
+        assert_eq!(target.request_count(), 0, "the target was reached directly");
     }
 
     #[test]
