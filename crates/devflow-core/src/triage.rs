@@ -53,7 +53,8 @@ const PICK_INSTRUCTIONS: &str = "Which offered option would this operator choose
 /// [`crate::question::MAX_OPTIONS`] values.
 pub const PROBABILITY_SUM_TOLERANCE: f64 = 0.01;
 
-/// The longest response-supplied value a fallback detail repeats.
+/// The longest question-side option id or path key a fallback detail
+/// repeats. A detail repeats no value the response supplied.
 const DETAIL_VALUE_MAX_CHARS: usize = 64;
 
 /// How triage is configured for a project (`devflow.toml` `[triage]`).
@@ -386,7 +387,8 @@ fn criterion(option: &QuestionOption) -> String {
 }
 
 /// The scores a Jev response gives `spec`. A missing or malformed field is a
-/// fallback, never a default score.
+/// fallback, never a default score. A failure's detail names the field and
+/// the problem, never a value the response supplied.
 pub fn parse_jev_response(
     body: &Value,
     spec: &QuestionSpec,
@@ -406,7 +408,7 @@ pub fn parse_jev_response(
     if !spec.options.iter().any(|option| option.id == choice) {
         return Err(unparsable(
             &["answers", "pick", "choice"],
-            &format!("`{}` is not an offered option", bounded(choice)),
+            "is not an offered option",
         ));
     }
     let distribution = complete_distribution(body, spec)?;
@@ -433,10 +435,7 @@ fn expect_type(
     if found == expected {
         return Ok(());
     }
-    Err(unparsable(
-        &path,
-        &format!("is `{}`, expected `{expected}`", bounded(found)),
-    ))
+    Err(unparsable(&path, &format!("is not `{expected}`")))
 }
 
 /// `answers.pick.probabilities` as (option id, probability) pairs, checked to
@@ -450,12 +449,11 @@ fn complete_distribution<'a>(
     let probabilities = value_at(body, &path)?
         .as_object()
         .ok_or_else(|| unparsable(&path, "is not an object"))?;
-    if let Some(extra) = probabilities
+    if probabilities
         .keys()
-        .find(|key| !spec.options.iter().any(|option| &option.id == *key))
+        .any(|key| !spec.options.iter().any(|option| &option.id == key))
     {
-        let problem = format!("has `{}`, which was not offered", bounded(extra));
-        return Err(unparsable(&path, &problem));
+        return Err(unparsable(&path, "has an option that was not offered"));
     }
     let mut distribution = Vec::with_capacity(spec.options.len());
     for option in &spec.options {
@@ -471,7 +469,7 @@ fn complete_distribution<'a>(
         .map(|(_, probability)| probability)
         .sum();
     if (sum - 1.0).abs() > PROBABILITY_SUM_TOLERANCE {
-        return Err(unparsable(&path, &format!("sums to {sum}, not 1")));
+        return Err(unparsable(&path, "does not sum to 1"));
     }
     Ok(distribution)
 }
@@ -482,7 +480,7 @@ fn probability_at(body: &Value, path: &[&str]) -> Result<f64, (FallbackReason, S
     if number.is_finite() && (0.0..=1.0).contains(&number) {
         return Ok(number);
     }
-    Err(unparsable(path, &format!("is {number}, not in [0, 1]")))
+    Err(unparsable(path, "is not in [0, 1]"))
 }
 
 /// The value at `path`, or an `Unparsable` naming the missing field.
@@ -515,7 +513,7 @@ fn unparsable(path: &[&str], problem: &str) -> (FallbackReason, String) {
     )
 }
 
-/// A response-supplied value cut to [`DETAIL_VALUE_MAX_CHARS`].
+/// A question-side option id or path key cut to [`DETAIL_VALUE_MAX_CHARS`].
 fn bounded(value: &str) -> String {
     value.chars().take(DETAIL_VALUE_MAX_CHARS).collect()
 }
