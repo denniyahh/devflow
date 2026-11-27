@@ -635,6 +635,8 @@ pub struct FakeReply {
     pub body: String,
     /// Sleep this long after reading the request and before replying.
     pub delay: std::time::Duration,
+    /// A `Location` header to send, as a redirect carries.
+    pub location: Option<String>,
 }
 
 impl FakeReply {
@@ -649,6 +651,15 @@ impl FakeReply {
             status: code,
             body: body.into(),
             delay: std::time::Duration::ZERO,
+            location: None,
+        }
+    }
+
+    /// A redirect with status `code` to `location`, its body empty.
+    pub fn redirect(code: u16, location: impl Into<String>) -> Self {
+        Self {
+            location: Some(location.into()),
+            ..Self::status(code, "")
         }
     }
 
@@ -755,10 +766,15 @@ fn serve_one(stream: std::net::TcpStream, reply: &FakeReply, recorded: &Captured
     } else {
         (500, FAKE_JEV_NO_CONTENT_LENGTH)
     };
+    let location = reply
+        .location
+        .as_ref()
+        .map(|location| format!("Location: {location}\r\n"))
+        .unwrap_or_default();
     let mut out = stream;
     let _ = write!(
         out,
-        "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = out.flush();

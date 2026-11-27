@@ -322,6 +322,26 @@ mod tests {
     }
 
     #[test]
+    fn a_redirect_is_returned_as_its_status_not_followed() {
+        let target = FakeJev::serve(vec![FakeReply::json(jev_answer(
+            "jev-1.14.0",
+            0.93,
+            "a",
+            &[("a", 0.9), ("b", 0.1)],
+        ))]);
+        let origin = FakeJev::serve(vec![FakeReply::redirect(
+            302,
+            format!("{}{SYSTEMONE_PATH}", target.url()),
+        )]);
+
+        assert_eq!(
+            post_systemone(&endpoint_for(&origin), &any_body()),
+            Err(TransportFailure::HttpStatus { status: 302 })
+        );
+        assert_eq!(target.request_count(), 0, "the redirect was followed");
+    }
+
+    #[test]
     fn an_error_body_is_never_retained() {
         let echoed = format!(r#"{{"detail":"{TEST_KEY} {PLANTED_PRECEDENT}"}}"#);
         assert!(
