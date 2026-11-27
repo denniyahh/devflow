@@ -173,6 +173,50 @@ fn an_above_threshold_question_is_answered_without_a_gate() {
 }
 
 #[test]
+fn an_environment_proxy_never_carries_the_jev_call() {
+    let fixture = triage_fixture(&TriageToml::at(0.5));
+    let target = FakeJev::serve(vec![scoring_a(0.9)]);
+    let proxy = FakeJev::serve(vec![FakeReply::json("{}")]);
+    let mut env = jev_env(&target.url());
+    env.push(("HTTP_PROXY".to_string(), proxy.url()));
+    let mut client = AskClient::spawn_with(
+        &fixture,
+        AskOverrides {
+            env,
+            ..AskOverrides::default()
+        },
+    );
+    client.handshake();
+
+    ask(
+        &mut client,
+        CALL_ID,
+        "decision",
+        "How long should the budget be?",
+    );
+
+    // The question is logged once the Jev call has ended, either way, so the
+    // proxy's requests are final here and a gate is never waited on.
+    wait_for_questions_asked(&fixture, 1);
+    let via_proxy = proxy.requests();
+    assert!(
+        via_proxy.is_empty(),
+        "the proxy received the Jev call: {via_proxy:#?}"
+    );
+    assert_eq!(target.request_count(), 1, "one Jev request at the target");
+    let reply = client
+        .reply(CALL_ID, REPLY_WAIT)
+        .expect("triage answers the call");
+    let result = &reply["result"];
+    assert_ne!(result["isError"], true, "{reply}");
+    assert_eq!(
+        result["structuredContent"]["answered_by"], "triage:jev",
+        "{reply}"
+    );
+    assert!(!fixture.gate_path().exists(), "a gate file was written");
+}
+
+#[test]
 fn the_hermetic_command_drops_the_typesafe_environment() {
     let fixture = AskFixture::new(Stage::Code);
     let command = fixture.devflow();
