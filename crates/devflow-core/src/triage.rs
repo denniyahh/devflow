@@ -266,9 +266,12 @@ impl TriageOutcome {
 /// recommended option is never sent (D-10).
 pub fn jev_request(spec: &QuestionSpec, precedents: &[Precedent], model: &str) -> Value {
     let mut state = Map::new();
-    state.insert("question".into(), json!(spec.question));
+    state.insert(
+        "question".into(),
+        json!(strip_recommendation(&spec.question)),
+    );
     if let Some(context) = &spec.context {
-        state.insert("context".into(), json!(context));
+        state.insert("context".into(), json!(strip_recommendation(context)));
     }
     state.insert("options".into(), options_state(&spec.options));
     let precedents: Vec<Value> = precedents.iter().map(precedent_state).collect();
@@ -320,6 +323,43 @@ pub(crate) fn precedent_state(precedent: &Precedent) -> Value {
         "options": options_state(&precedent.options),
         "operator_answer": answer,
     })
+}
+
+/// Line prefixes, compared ignoring ASCII case, that mark a line of free
+/// text as a recommendation (D-10).
+const RECOMMENDATION_LINE_PREFIXES: [&str; 2] = ["Recommended:", "I recommend"];
+
+/// Whether `line`, leading whitespace aside, starts with a recommendation
+/// prefix.
+fn is_recommendation_line(line: &str) -> bool {
+    let line = line.trim_start();
+    RECOMMENDATION_LINE_PREFIXES.iter().any(|prefix| {
+        line.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    })
+}
+
+/// Free text (a question or its context) without the recommendation (D-10):
+/// a recommendation line is dropped and a marker is stripped from every
+/// other line, which keep their order. Work is per line because
+/// [`strip_recommended_marker`] collapses whitespace, newlines included.
+/// Text with no recommendation is returned unchanged.
+fn strip_recommendation(text: &str) -> String {
+    let mut changed = false;
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        if is_recommendation_line(line) {
+            changed = true;
+            continue;
+        }
+        let (stripped, removed) = strip_recommended_marker(line);
+        changed |= removed;
+        kept.push(stripped);
+    }
+    if !changed {
+        return text.to_string();
+    }
+    kept.join("\n")
 }
 
 /// `text` without a recommendation marker, and whether one was removed (D-10).
