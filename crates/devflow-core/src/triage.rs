@@ -871,8 +871,12 @@ mod tests {
         match parse_jev_response(&body, &two_options(), MODEL) {
             Err((FallbackReason::ModelMismatch, detail)) => {
                 assert!(
-                    detail.contains("jev-1.13.0") && detail.contains("jev-1.14.0"),
-                    "the detail names both ids: {detail}"
+                    detail.contains("model") && detail.contains("jev-1.14.0"),
+                    "the detail names the field and the configured id: {detail}"
+                );
+                assert!(
+                    !detail.contains("jev-1.13.0"),
+                    "the detail repeats the response's model: {detail}"
                 );
             }
             other => panic!("expected a model mismatch, got {other:?}"),

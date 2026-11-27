@@ -332,3 +332,72 @@ fn no_fallback_event_carries_the_key() {
         }
     }
 }
+
+/// The test key followed by a terminal clear-screen sequence, as an endpoint
+/// that echoes its request might return it.
+const ECHOED: &str = concat!("test-key-not-secret", "\u{1b}[2J");
+
+/// Assert that neither events.jsonl nor `devflow status` output carries the
+/// key or an escape character, and that `status` still reports one fallback
+/// for `reason`.
+fn assert_log_and_status_hold_no_echo(fixture: &AskFixture, reason: &str) {
+    let log = std::fs::read_to_string(devflow_core::events::events_path(fixture.root()))
+        .expect("read events.jsonl");
+    let status_out = fixture
+        .devflow()
+        .arg("status")
+        .output()
+        .expect("run devflow status");
+    let printed = String::from_utf8_lossy(&status_out.stdout).into_owned()
+        + &String::from_utf8_lossy(&status_out.stderr);
+    assert!(
+        printed.contains("triage: fell back to the operator 1 time(s)"),
+        "status shows the fallback: {printed}"
+    );
+    assert!(printed.contains(reason), "status names {reason}: {printed}");
+    for line in log.lines() {
+        assert!(
+            !line.contains(TEST_KEY),
+            "events.jsonl carries the key: {line}"
+        );
+        assert!(
+            !line.contains("\\u001b[2J"),
+            "events.jsonl carries the escape: {line}"
+        );
+    }
+    for line in printed.lines() {
+        assert!(!line.contains(TEST_KEY), "status carries the key: {line}");
+        assert!(
+            !line.contains('\u{1b}'),
+            "status carries the escape: {line:?}"
+        );
+    }
+}
+
+/// Assert the fallback's `detail` names `field` and holds neither the key
+/// nor an escape character.
+fn assert_detail_names_only(fallback: &Value, field: &str) {
+    let detail = fallback["detail"].as_str().expect("the detail is a string");
+    assert!(detail.contains(field), "the detail names {field}: {detail}");
+    assert!(
+        !detail.contains(TEST_KEY),
+        "the detail carries the key: {detail:?}"
+    );
+    assert!(
+        !detail.contains('\u{1b}'),
+        "the detail carries the escape: {detail:?}"
+    );
+}
+
+#[test]
+fn a_response_model_echoing_the_key_stays_out_of_the_log_and_status() {
+    assert_eq!(ECHOED, format!("{TEST_KEY}\u{1b}[2J"));
+    let reply = answer_as(ECHOED, 0.9);
+    assert!(reply.body.contains(TEST_KEY), "the fake echoes the key");
+    let (fixture, fake, fallback) = fall_back_on(reply, "model_mismatch");
+    assert_eq!(fake.request_count(), 1, "the fake served its body");
+
+    assert_detail_names_only(&fallback, "model");
+    assert_detail_names_only(&fallback, MODEL);
+    assert_log_and_status_hold_no_echo(&fixture, "model_mismatch");
+}
