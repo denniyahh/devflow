@@ -197,8 +197,11 @@ fn event_label<'a>(
     }
 }
 
-/// Pair each `question_asked` with its answer and its last operator override
-/// by `question_id`, keeping operator labels outside `exclude_phases`.
+/// Pair each `question_asked` with its first answer and its last operator
+/// override by `question_id`, keeping operator labels outside
+/// `exclude_phases`. As in the ledger, only a question's first
+/// `question_answered` or `question_closed` counts: a question first closed
+/// is unanswered, whatever answer follows.
 /// Returns the phases holding an operator-answered `discuss` question: their
 /// discuss ran through `devflow_ask`, so their logs restate the events.
 fn mine_events(
@@ -210,7 +213,7 @@ fn mine_events(
     let (log, unreadable) = read_events(project_root);
     report.excluded.unreadable_event_lines += unreadable;
     let mut asked: Vec<&Value> = Vec::new();
-    let mut answers: HashMap<&str, &Value> = HashMap::new();
+    let mut resolutions: HashMap<&str, &Value> = HashMap::new();
     let mut overrides: HashMap<&str, &Value> = HashMap::new();
     for event in &log {
         let Some(qid) = event.get("question_id").and_then(Value::as_str) else {
@@ -218,8 +221,8 @@ fn mine_events(
         };
         match event.get("event").and_then(Value::as_str) {
             Some(events::QUESTION_ASKED) => asked.push(event),
-            Some(events::QUESTION_ANSWERED) => {
-                answers.insert(qid, event);
+            Some(events::QUESTION_ANSWERED | events::QUESTION_CLOSED) => {
+                resolutions.entry(qid).or_insert(event);
             }
             Some(events::QUESTION_OVERRIDDEN) if is_operator(event.get("overridden_by")) => {
                 overrides.insert(qid, event);
@@ -230,7 +233,10 @@ fn mine_events(
     let mut channel_phases = HashSet::new();
     for question in asked {
         let qid = question["question_id"].as_str().unwrap_or_default();
-        let answer = match event_label(answers.get(qid).copied(), overrides.get(qid).copied()) {
+        let answer = resolutions.get(qid).copied().filter(|resolution| {
+            resolution.get("event").and_then(Value::as_str) == Some(events::QUESTION_ANSWERED)
+        });
+        let answer = match event_label(answer, overrides.get(qid).copied()) {
             EventLabel::Operator(answer) => answer,
             EventLabel::NotOperator => {
                 report.excluded.non_operator += 1;
