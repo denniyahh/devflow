@@ -401,3 +401,14 @@ fn a_response_model_echoing_the_key_stays_out_of_the_log_and_status() {
     assert_detail_names_only(&fallback, MODEL);
     assert_log_and_status_hold_no_echo(&fixture, "model_mismatch");
 }
+
+#[test]
+fn a_response_choice_echoing_the_key_stays_out_of_the_log_and_status() {
+    let reply = FakeReply::json(jev_answer(MODEL, 0.9, ECHOED, &[("a", 0.5), ("b", 0.5)]));
+    assert!(reply.body.contains(TEST_KEY), "the fake echoes the key");
+    let (fixture, fake, fallback) = fall_back_on(reply, "unparsable");
+    assert_eq!(fake.request_count(), 1, "the fake served its body");
+
+    assert_detail_names_only(&fallback, "answers.pick.choice");
+    assert_log_and_status_hold_no_echo(&fixture, "unparsable");
+}

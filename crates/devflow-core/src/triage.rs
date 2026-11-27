@@ -847,12 +847,76 @@ mod tests {
             .expect("a sum of 0.995 is inside the tolerance");
     }
 
+    /// A value an endpoint might echo into a response field: a token and a
+    /// terminal clear-screen sequence.
+    const PLANTED: &str = "echoed\u{1b}[2J";
+
+    /// Assert `detail` names `field` and repeats neither [`PLANTED`] nor an
+    /// escape character.
+    fn assert_names_only(detail: &str, field: &str) {
+        assert!(
+            detail.contains(field),
+            "the detail names {field}: {detail:?}"
+        );
+        assert!(
+            !detail.contains("echoed"),
+            "the detail repeats the planted value: {detail:?}"
+        );
+        assert!(
+            !detail.contains('\u{1b}'),
+            "the detail carries the escape: {detail:?}"
+        );
+    }
+
     #[test]
     fn a_choice_that_was_not_offered_is_unparsable() {
-        let detail = unparsable(&response(MODEL, 0.9, "c", json!({"a": 0.5, "b": 0.5})));
+        let detail = unparsable(&response(MODEL, 0.9, PLANTED, json!({"a": 0.5, "b": 0.5})));
+        assert_names_only(&detail, "answers.pick.choice");
+    }
+
+    #[test]
+    fn a_wrong_answer_type_names_the_field_not_the_value() {
+        let mut body = response(MODEL, 0.9, "a", json!({"a": 0.9, "b": 0.1}));
+        body["answers"]["pick"]["type"] = json!(PLANTED);
+        let detail = unparsable(&body);
+        assert_names_only(&detail, "answers.pick.type");
         assert!(
-            detail.contains("`c`"),
-            "the detail names the choice: {detail}"
+            detail.contains("`choice`"),
+            "the detail names the expected type: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_unoffered_probability_key_names_the_field_not_the_key() {
+        let mut probabilities = json!({"a": 0.5, "b": 0.5});
+        probabilities[PLANTED] = json!(0.0);
+        let detail = unparsable(&response(MODEL, 0.9, "a", probabilities));
+        assert_names_only(&detail, "answers.pick.probabilities");
+    }
+
+    #[test]
+    fn an_out_of_range_probability_names_the_field_not_the_value() {
+        let detail = unparsable(&response(MODEL, 1.5, "a", json!({"a": 0.9, "b": 0.1})));
+        assert!(
+            detail.contains("answers.accept.noul"),
+            "the detail names the field: {detail}"
+        );
+        assert!(
+            !detail.contains("1.5"),
+            "the detail repeats the value: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_distribution_off_one_names_the_field_not_the_sum() {
+        let detail = unparsable(&response(MODEL, 0.9, "a", json!({"a": 0.9, "b": 0.5})));
+        assert!(
+            detail.contains("answers.pick.probabilities"),
+            "the detail names the field: {detail}"
+        );
+        assert!(
+            !detail.contains("1.4"),
+            "the detail repeats the sum: {detail}"
         );
     }
 
