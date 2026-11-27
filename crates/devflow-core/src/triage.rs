@@ -150,6 +150,9 @@ pub enum EscalateReason {
     PreCheckBelowThreshold,
     /// `probabilities[choice]` is below the option threshold.
     TopProbabilityBelowThreshold,
+    /// The question has one option: the sum check forces its probability to
+    /// at least 0.99, so only `accept` would decide it.
+    SingleOption,
 }
 
 impl EscalateReason {
@@ -160,6 +163,7 @@ impl EscalateReason {
             EscalateReason::NoThreshold => "no_threshold",
             EscalateReason::PreCheckBelowThreshold => "pre_check_below_threshold",
             EscalateReason::TopProbabilityBelowThreshold => "top_probability_below_threshold",
+            EscalateReason::SingleOption => "single_option",
         }
     }
 }
@@ -545,14 +549,14 @@ pub fn decide(scores: &JevScores, config: &TriageConfig) -> TriageOutcome {
 /// The outcome of a question that is not sent to Jev at all: a
 /// `blocking-human` question (D-08), then any question while a threshold is
 /// unset (D-07). `None` means the question is to be scored.
-pub fn pre_decide(kind: QuestionKind, config: &TriageConfig) -> Option<TriageOutcome> {
+pub fn pre_decide(spec: &QuestionSpec, config: &TriageConfig) -> Option<TriageOutcome> {
     let skip = |reason| {
         Some(TriageOutcome::Escalated {
             reason,
             scores: None,
         })
     };
-    if kind == QuestionKind::BlockingHuman {
+    if spec.kind == QuestionKind::BlockingHuman {
         return skip(EscalateReason::BlockingHuman);
     }
     if config.threshold.is_none() || config.pre_check_threshold.is_none() {
@@ -708,15 +712,19 @@ mod tests {
     #[test]
     fn a_blocking_human_question_is_never_scored() {
         let config = TriageConfig::with_thresholds(Some(0.0), Some(0.0));
+        let of_kind = |kind| QuestionSpec {
+            kind,
+            ..two_options()
+        };
         assert_eq!(
-            pre_decide(QuestionKind::BlockingHuman, &config),
+            pre_decide(&of_kind(QuestionKind::BlockingHuman), &config),
             Some(TriageOutcome::Escalated {
                 reason: EscalateReason::BlockingHuman,
                 scores: None,
             })
         );
-        assert_eq!(pre_decide(QuestionKind::Discuss, &config), None);
-        assert_eq!(pre_decide(QuestionKind::Decision, &config), None);
+        assert_eq!(pre_decide(&of_kind(QuestionKind::Discuss), &config), None);
+        assert_eq!(pre_decide(&of_kind(QuestionKind::Decision), &config), None);
     }
 
     #[test]
@@ -725,16 +733,31 @@ mod tests {
             reason: EscalateReason::NoThreshold,
             scores: None,
         });
+        let decision = QuestionSpec {
+            kind: QuestionKind::Decision,
+            ..two_options()
+        };
         let without_option_threshold = TriageConfig::with_thresholds(None, Some(0.5));
         assert_eq!(
-            pre_decide(QuestionKind::Decision, &without_option_threshold),
+            pre_decide(&decision, &without_option_threshold),
             no_threshold
         );
         let without_pre_check = TriageConfig::with_thresholds(Some(0.5), None);
-        assert_eq!(
-            pre_decide(QuestionKind::Decision, &without_pre_check),
-            no_threshold
+        assert_eq!(pre_decide(&decision, &without_pre_check), no_threshold);
+    }
+
+    #[test]
+    fn a_single_option_question_escalates_whatever_it_scores() {
+        let spec = spec(vec![option("a", "Flat", None)], None);
+        let config = TriageConfig::with_thresholds(Some(0.9), Some(0.5));
+        let body = response(MODEL, 0.5, "a", json!({"a": 1.0}));
+        let scores = parse_jev_response(&body, &spec, MODEL).expect("the fixture parses");
+        assert!(
+            matches!(decide(&scores, &config), TriageOutcome::Decided { .. }),
+            "the scores alone clear both thresholds"
         );
+        let outcome = pre_decide(&spec, &config).unwrap_or_else(|| decide(&scores, &config));
+        assert_eq!(escalation(outcome), EscalateReason::SingleOption);
     }
 
     /// Every object key anywhere in `value`.

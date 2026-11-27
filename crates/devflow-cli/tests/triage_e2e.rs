@@ -383,6 +383,38 @@ fn a_blocking_human_question_is_never_triaged() {
     assert_eq!(fake.request_count(), 0, "Jev was asked");
 }
 
+#[test]
+fn a_single_option_question_is_never_triaged() {
+    let fixture = triage_fixture(&TriageToml::at(0.5));
+    let fake = FakeJev::serve(vec![FakeReply::json(jev_answer(
+        MODEL,
+        0.5,
+        "a",
+        &[("a", 1.0)],
+    ))]);
+    let mut client = triage_client(&fixture, &fake.url(), AskOverrides::default());
+    client.request(
+        CALL_ID,
+        "tools/call",
+        json!({ "name": "devflow_ask", "arguments": {
+            "question": "How long should the poll wait?",
+            "options": [{ "id": "a", "label": "Thirty seconds" }],
+            "kind": "decision" } }),
+    );
+
+    let asked = wait_for_questions_asked(&fixture, 1);
+    assert_eq!(asked.len(), 1, "one question_asked: {asked:#?}");
+    let triage = &asked[0]["triage"];
+    assert_eq!(triage["outcome"], "escalated", "{triage}");
+    assert_eq!(triage["reason"], "single_option", "{triage}");
+    assert!(asked[0]["gate_id"].is_string(), "{asked:#?}");
+    assert!(
+        client.reply(CALL_ID, NO_REPLY_WATCH).is_none(),
+        "the call was answered"
+    );
+    assert_eq!(fake.request_count(), 0, "Jev was asked");
+}
+
 /// Whether `value` has a key `key` at any depth.
 fn has_key(value: &Value, key: &str) -> bool {
     match value {

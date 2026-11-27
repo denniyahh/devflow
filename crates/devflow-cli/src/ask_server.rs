@@ -1350,7 +1350,7 @@ fn score_question(
     spec: &QuestionSpec,
     deadline: Instant,
 ) -> TriageOutcome {
-    if let Some(outcome) = triage::pre_decide(spec.kind, config) {
+    if let Some(outcome) = triage::pre_decide(spec, config) {
         return outcome;
     }
     let precedents = corpus::precedents_for(&args.project, config, spec);
