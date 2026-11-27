@@ -396,10 +396,7 @@ pub fn parse_jev_response(
     if model != expected_model {
         return Err((
             FallbackReason::ModelMismatch,
-            format!(
-                "response model {}, configured {expected_model}",
-                bounded(model)
-            ),
+            format!("the response's `model` is not the configured {expected_model}"),
         ));
     }
     expect_type(body, "accept", "noul")?;
