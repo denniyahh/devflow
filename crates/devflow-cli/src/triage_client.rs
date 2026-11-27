@@ -150,7 +150,9 @@ fn endpoint_allowed(base_url: &str) -> bool {
 /// read to completion and dropped: an endpoint that echoes the key or a
 /// precedent must not reach a log. The call connects directly for every base
 /// URL, TypeSafe's included: no proxy variable is read, so a network that
-/// reaches TypeSafe only through a proxy fails it as unreachable (D-19).
+/// reaches TypeSafe only through a proxy fails it as unreachable (D-19). A
+/// redirect is returned as its status, not followed: the `Location` host is
+/// one the allowlist never checked.
 pub(crate) fn post_systemone(
     endpoint: &JevEndpoint,
     body: &serde_json::Value,
@@ -159,6 +161,7 @@ pub(crate) fn post_systemone(
         .timeout_global(Some(endpoint.timeout))
         .http_status_as_error(false)
         .proxy(None)
+        .max_redirects(0)
         .build()
         .into();
     let mut response = agent

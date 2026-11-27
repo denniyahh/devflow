@@ -207,7 +207,11 @@ environment of the agent's `devflow __ask` server; it is sent only as the
 request's bearer header, never on a command line, and never written to an
 event, `status` or an error. `TYPESAFE_BASE_URL` overrides the endpoint; it may
 only be TypeSafe's API host over https or a loopback address, and anything
-else is refused (the `endpoint_refused` fallback below).
+else is refused (the `endpoint_refused` fallback below). The Jev call connects
+straight to that address: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are not
+used, so where TypeSafe is reachable only through a proxy, every question falls
+back as `unreachable`. A redirect is not followed: it falls back as
+`http_status` (for example `HTTP 302 unexpected status`).
 
 **Your time first.** A Jev call never uses the time you need to answer: it
 gets at most the question's time left less a reserve kept for the gate, and a
