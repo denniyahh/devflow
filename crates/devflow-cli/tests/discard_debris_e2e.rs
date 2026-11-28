@@ -240,3 +240,162 @@ fn discard_refuses_a_gate_whose_waiter_is_live() {
     );
     case.assert_lock_files_remain(&out);
 }
+
+/// A [`Case`] with a saved, stopped run state for `phase` and two answered
+/// questions in the event log: `q-run` of that run and `q-other` of an
+/// earlier one. Returns the run's `started_at`.
+fn case_with_a_run(phase: PhaseId) -> (Case, String) {
+    let case = Case::new(phase);
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        case.root.clone(),
+    );
+    state.stopped = true;
+    devflow_core::workflow::save_state(&state).unwrap();
+    let started_at = state.started_at.clone();
+    let phase_number = phase.to_string().parse::<u64>().unwrap();
+    let options = serde_json::json!([{"id": "a", "label": "A"}, {"id": "b", "label": "B"}]);
+    let mut lines = String::new();
+    for (ts, question_id, run) in [(10, "q-run", started_at.as_str()), (12, "q-other", "1")] {
+        let asked = serde_json::json!({
+            "v": 1, "ts": ts, "phase": phase_number, "event": "question_asked",
+            "stage": "code", "question_id": question_id, "kind": "decision",
+            "question": "Which?", "options": options, "run_started_at": run,
+            "triage": {"outcome": "decided", "top_option": "a"},
+        });
+        let answered = serde_json::json!({
+            "v": 1, "ts": ts + 1, "phase": phase_number, "event": "question_answered",
+            "stage": "code", "question_id": question_id, "answer": {"option_id": "a"},
+            "policy": "triage", "answered_by": "triage:jev",
+        });
+        lines.push_str(&format!("{asked}\n{answered}\n"));
+    }
+    fs::write(devflow_core::events::events_path(&case.root), lines).unwrap();
+    (case, started_at)
+}
+
+impl Case {
+    /// `devflow <args>` on the repository, as the operator.
+    fn devflow(&self, args: &[&str]) -> Output {
+        common::hermetic_devflow(&self.home)
+            .args(args)
+            .env_remove("DEVFLOW_ANSWERED_BY")
+            .current_dir(&self.root)
+            .output()
+            .expect("run devflow")
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(devflow_core::events::events_path(&self.root)).unwrap()
+    }
+
+    /// `devflow ledger override` of `question_id` to option `b`.
+    fn override_to_b(&self, question_id: &str) -> Output {
+        let phase = self.phase.to_string();
+        let root = self.root.display().to_string();
+        let args = ["ledger", "override", &phase, "--question-id", question_id];
+        self.devflow(&[&args[..], &["--option", "b", "--project", &root]].concat())
+    }
+}
+
+/// The `run_discarded` events in `log`.
+fn run_discarded_events(log: &str) -> Vec<serde_json::Value> {
+    log.lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "run_discarded")
+        .collect()
+}
+
+/// D-16: discard keeps the event log, every earlier line unchanged, and adds
+/// one `run_discarded` naming the run; the ledger still lists its questions.
+#[test]
+fn the_ledger_survives_discard() {
+    let (case, started_at) = case_with_a_run(PhaseId::new(81));
+    let before = case.log();
+
+    let out = case.discard();
+    assert!(out.status.success(), "discard refused:\n{}", text(&out));
+    let after = case.log();
+    assert!(
+        after.starts_with(&before),
+        "earlier lines changed:\n{after}"
+    );
+    let discarded = run_discarded_events(&after);
+    assert_eq!(discarded.len(), 1, "{after}");
+    assert_eq!(discarded[0]["started_at"], started_at.as_str(), "{after}");
+
+    let root = case.root.display().to_string();
+    let ledger = case.devflow(&["ledger", "81", &root, "--json"]);
+    assert!(ledger.status.success(), "ledger failed:\n{}", text(&ledger));
+    let json: serde_json::Value = serde_json::from_slice(&ledger.stdout).unwrap();
+    let ids: Vec<&str> = json["decided"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["question_id"].as_str())
+        .collect();
+    assert_eq!(ids, ["q-run", "q-other"], "{json}");
+}
+
+/// T-54-35: a discard whose `run_discarded` record cannot be written removes
+/// nothing. Control: the same fixture with a writable log is removed and
+/// gains the record.
+#[test]
+fn a_discard_whose_record_cannot_be_written_removes_nothing() {
+    let (case, _) = case_with_a_run(PhaseId::new(82));
+    let log = devflow_core::events::events_path(&case.root);
+    fs::remove_file(&log).unwrap();
+    fs::create_dir(&log).unwrap();
+    let state = devflow_core::workflow::state_path(&case.root, case.phase);
+
+    let out = case.discard();
+    assert!(!out.status.success(), "discard succeeded:\n{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("events.jsonl"), "{}", text(&out));
+    assert!(stderr.contains("nothing was removed"), "{}", text(&out));
+    assert!(state.exists(), "the run state was removed:\n{}", text(&out));
+
+    let (control, _) = case_with_a_run(PhaseId::new(82));
+    let out = control.discard();
+    assert!(
+        out.status.success(),
+        "control: discard refused:\n{}",
+        text(&out)
+    );
+    assert!(
+        !devflow_core::workflow::state_path(&control.root, control.phase).exists(),
+        "control: the run state was kept:\n{}",
+        text(&out)
+    );
+    assert_eq!(run_discarded_events(&control.log()).len(), 1);
+}
+
+/// D-16: after discard, an override of a question of the discarded run is
+/// refused naming discard and writes nothing. Control: a question of another
+/// run is accepted.
+#[test]
+fn an_override_from_a_discarded_run_names_discard() {
+    let (case, _) = case_with_a_run(PhaseId::new(83));
+    let out = case.discard();
+    assert!(out.status.success(), "discard refused:\n{}", text(&out));
+    let before = case.log();
+
+    let out = case.override_to_b("q-run");
+    assert!(
+        !out.status.success(),
+        "the override was accepted:\n{}",
+        text(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("devflow discard"), "{}", text(&out));
+    assert_eq!(case.log(), before, "the refused override wrote to the log");
+
+    let out = case.override_to_b("q-other");
+    assert!(
+        out.status.success(),
+        "control: the override was refused:\n{}",
+        text(&out)
+    );
+}

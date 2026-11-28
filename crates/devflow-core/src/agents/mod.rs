@@ -691,11 +691,13 @@ mod tests {
         assert!(!pi_code.contains("$HOME/.codex/gsd-core"));
     }
 
+    /// #330 (D-20): codex runs discuss inside Plan through `devflow_ask`, so
+    /// its Plan is headless-safe like its Code and like claude's Plan.
     #[test]
-    fn codex_plan_requires_an_existing_artifact() {
+    fn codex_plan_takes_the_discuss_route() {
         assert_eq!(
             CodexDriver.interactivity_mode(crate::stage::Stage::Plan),
-            InteractivityMode::RequiresExistingArtifact
+            InteractivityMode::HeadlessSafe
         );
         assert_eq!(
             CodexDriver.interactivity_mode(crate::stage::Stage::Code),

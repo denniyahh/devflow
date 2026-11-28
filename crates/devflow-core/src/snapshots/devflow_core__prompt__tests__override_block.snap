@@ -1,0 +1,10 @@
+---
+source: crates/devflow-core/src/prompt.rs
+expression: block
+---
+The operator overrode answers given through `devflow_ask`. Each answer below is now the answer; revisit any work that depended on the old one.
+
+----- BEGIN OPERATOR NOTE -----
+- question `q1` ("Which store?"): the answer is now option `b`, replacing option `a`.
+- question `q2` ("Name the table."): the answer is now the text "runs_v2", replacing the text "runs".
+----- END OPERATOR NOTE -----

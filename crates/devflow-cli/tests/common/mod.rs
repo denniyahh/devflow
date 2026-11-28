@@ -9,7 +9,8 @@
 //! do, and every target that writes the fake has its own binary.
 //!
 //! The rule it exists for: an e2e child that runs the `devflow` binary gets a
-//! tempdir `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME` and `DEVFLOW_CACHE_DIR`
+//! tempdir `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and
+//! `DEVFLOW_CACHE_DIR`
 //! and has the repo-local `GIT_*` variables removed, so its registry entries
 //! (and, from 50-11, its sockets) never land in the operator's real
 //! `~/.cache/devflow`. Spawn `devflow` through [`hermetic_devflow`] only;
@@ -686,6 +687,7 @@ fn scrubbed(mut command: Command, home: &HermeticHome) -> Command {
         .env("HOME", home.home())
         .env("XDG_CACHE_HOME", home.home().join(".cache"))
         .env("XDG_CONFIG_HOME", home.config_dir())
+        .env("XDG_DATA_HOME", home.home().join(".local").join("share"))
         .env("DEVFLOW_CACHE_DIR", home.cache_dir());
     for name in devflow_core::test_support::REPO_LOCAL_GIT_VARS
         .iter()
@@ -693,8 +695,31 @@ fn scrubbed(mut command: Command, home: &HermeticHome) -> Command {
     {
         command.env_remove(name);
     }
+    // No test reaches TypeSafe with the developer's key, and none sends a
+    // loopback fake's request through the developer's proxy.
+    for name in TYPESAFE_VARS.iter().chain(PROXY_VARS) {
+        command.env_remove(name);
+    }
     command
 }
+
+/// The TypeSafe SDK's variables, which a test sets only to a loopback fake.
+pub const TYPESAFE_VARS: &[&str] = &["TYPESAFE_API_KEY", "TYPESAFE_BASE_URL"];
+
+/// The proxy variables ureq reads from the environment, and the `NO_PROXY`
+/// exemptions: a developer's `NO_PROXY=127.0.0.1` would exempt the loopback
+/// target, and a test proving no proxy is used would then pass without the
+/// fix.
+const PROXY_VARS: &[&str] = &[
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
 
 /// A directory of stub programs to put first on a child's `PATH`. Removed on
 /// drop.

@@ -56,6 +56,7 @@ pub mod agent_result;
 pub mod agents;
 pub mod canary;
 pub mod config;
+pub mod corpus;
 #[cfg(test)]
 mod doc_check;
 pub(crate) mod durable;
@@ -81,6 +82,7 @@ pub mod stop;
 /// `test-support` feature. Never compiled into a normal build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod triage;
 pub mod verify;
 pub mod workflow;
 pub mod worktree;

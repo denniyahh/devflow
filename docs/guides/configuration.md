@@ -17,6 +17,49 @@ it. A key that names no agent, or a `devflow.toml` that does not
 parse, still refuses `devflow start` even when `--fallback-agent` is given. See
 OPERATIONS.md's rate-limit failover section for what the fallback does.
 
+## Decision triage (`[triage]`)
+
+Decision triage asks TypeSafe's Jev model whether a question an agent asks
+can be answered the way you answered earlier ones, and answers it when both
+scores reach their thresholds; every other question waits for you as before.
+It is off unless `devflow.toml` turns it on:
+
+```toml
+[triage]
+enabled = true
+threshold = 0.9            # least probability of the chosen option that decides
+pre_check_threshold = 0.7  # least probability that you would take an offered option at all
+model = "jev-1.14.0"
+timeout_secs = 10
+exclude_label_phases = [51, "52.1"]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Whether triage runs. No `[triage]` table, or no `enabled` key, means off |
+| `threshold` | 0.92 | A question is decided only when the chosen option's probability is at least this value |
+| `pre_check_threshold` | 0.37 | ...and the probability that you would accept an offered option as offered is at least this value |
+| `model` | `jev-1.14.0` | The versioned model id sent; a response from any other model is not used |
+| `timeout_secs` | 10 | How long one triage request may take |
+| `exclude_label_phases` | empty | Phases whose recorded answers are not used as examples of how you answer |
+
+Both comparisons are "at least": a score equal to its threshold decides. The
+defaults are the values the Phase 54 measurement on the operator's own answers
+chose (`.planning/phases/54-decision-triage/54-BAKEOFF.md`).
+A `blocking-human` question always goes to you, whatever the thresholds.
+
+Triage fails safe. A threshold that is not a number in [0, 1], a `model` that
+is not a non-empty string, or an `exclude_label_phases` entry that is not a
+phase id makes triage escalate every question; an `enabled` that is not
+`true` or `false`, or a `devflow.toml` that does not parse, turns triage off;
+a bad `timeout_secs` uses the default. Each case writes a `warning:` line
+naming the key. An unknown key in `[triage]` is ignored with a warning.
+
+Example answers are read only from this file's exclusions. In the edit that
+sets `enabled = true`, also list in `exclude_label_phases` every phase whose
+recorded answers were not yours (answered by an agent or a default), so they
+are never used as evidence of how you answer.
+
 ## `devflow start` flags
 
 | Flag | Description |

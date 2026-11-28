@@ -137,7 +137,7 @@ pub(crate) fn launch_stage_inner(
 /// that either spawn path runs.
 fn prepare_stage_launch(
     state: &mut State,
-    prompt: String,
+    mut prompt: String,
     archived_stage: Option<Stage>,
 ) -> Result<StageLaunch, CliError> {
     let driver = agents::driver_for(state.agent);
@@ -186,6 +186,17 @@ fn prepare_stage_launch(
         canary::run_delivery_canary(canary_launcher.as_ref(), &canary_capture_dir)
     })?;
 
+    // D-17: the operator's overrides no launched agent has been given go last,
+    // since a prompt can begin with a workflow command.
+    let pending = devflow_core::history::pending_overrides(
+        &state.project_root,
+        state.phase,
+        &state.started_at,
+    );
+    if let Some(block) = prompt::override_block(&pending) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
+    }
     let (program, args, launch) = resolve_launch_shape(
         state.agent,
         driver.as_ref(),
@@ -196,14 +207,19 @@ fn prepare_stage_launch(
     );
     let args = wire_ask_registration(state, driver.as_ref(), args)?;
 
-    stage_launch(
+    let mut launch = stage_launch(
         state,
         program,
         &args,
         &driver.environment(),
         archived_stage,
         launch,
-    )
+    )?;
+    launch.overrides = pending
+        .into_iter()
+        .flat_map(|change| change.override_ids)
+        .collect();
+    Ok(launch)
 }
 
 /// The phase's `devflow_ask` registration file, `.devflow/ask-NN.mcp.json`: written
@@ -1414,7 +1430,7 @@ fn record_runner_stop(project_root: &Path, phase: PhaseId, source: Option<StopSo
 fn run_one_stage(
     project_root: &Path,
     phase: PhaseId,
-    launch: StageLaunch,
+    mut launch: StageLaunch,
     token: &StopToken,
 ) -> Result<Result<Option<StageLaunch>, CliError>, CliError> {
     // A stop that arrived during the hand-back starts no stage.
@@ -1427,6 +1443,8 @@ fn run_one_stage(
     let stage = launch.state.stage;
     let agent = launch.state.agent;
     let relaunch = launch.relaunch.clone();
+    let run_started_at = launch.state.started_at.clone();
+    let overrides = std::mem::take(&mut launch.overrides);
     let auto_chain_guard = match launch.launch {
         StageShape::Stream { .. } => Some(AutoChainGuard::engage(
             launch
@@ -1447,6 +1465,16 @@ fn run_one_stage(
     });
     // Before the advance: the flag lives as long as the agent does.
     drop(auto_chain_guard);
+    // D-17: the agent ran with the overrides in its prompt. A lost line makes the
+    // next launch repeat them, which errs toward telling the agent twice.
+    if ran.is_ok() && !overrides.is_empty() {
+        events::emit(
+            project_root,
+            phase,
+            events::OVERRIDES_DELIVERED,
+            serde_json::json!({ "run_started_at": run_started_at, "override_ids": overrides }),
+        );
+    }
     let outcome = match ran {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -1708,6 +1736,9 @@ pub(crate) struct StageLaunch {
     /// The rate-limit handoff this launch relaunches the stage after, set only by
     /// [`fail_over_on_rate_limit`].
     pub(crate) relaunch: Option<HandoffRelaunch>,
+    /// The `override_id`s whose override section this launch's prompt carries
+    /// (D-17), recorded as delivered once the agent ran.
+    pub(crate) overrides: Vec<String>,
 }
 
 /// Commit the state before anything is spawned, as this save always has, so the launch
@@ -1731,6 +1762,7 @@ fn stage_launch(
         archived_stage,
         launch,
         relaunch: None,
+        overrides: Vec::new(),
     })
 }
 
@@ -2134,7 +2166,7 @@ pub(crate) fn resume(
     phase: PhaseId,
     agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
-    resume_with_fallback(project_root, phase, agent, None, false)
+    resume_with_fallback(project_root, phase, agent, None, false, false)
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
@@ -2186,6 +2218,7 @@ pub(crate) fn resume_with_fallback(
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
     reviews: bool,
+    no_triage: bool,
 ) -> Result<(), CliError> {
     // 999.229: said first, so it prints even when the resume then refuses.
     if let Some(warning) = devflow_core::config::external_verify_env_warning_now() {
@@ -2223,6 +2256,7 @@ pub(crate) fn resume_with_fallback(
         agent,
         fallback_agent,
         reviews,
+        no_triage,
     )?;
     // #338 WR-01, F05: the state resume committed (`commit` replaced `state` with it), as
     // start keeps `written`; not reloaded, so a runner's write cannot pass for resume's.
@@ -2601,6 +2635,7 @@ fn resume_loaded(
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
     reviews: bool,
+    no_triage: bool,
 ) -> Result<State, CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
     // D-04, restrictive verbs: `--reviews` is judged before any write, the state first,
@@ -2614,6 +2649,16 @@ fn resume_loaded(
             .clone()
             .unwrap_or_else(|| project_root.to_path_buf());
         require_reviews_file_in_checkout(&launch_root, phase)?;
+    }
+    // D-09, restrictive verbs: `--no-triage` is judged beside `--reviews`, before any write.
+    if no_triage
+        && let Some(refusal) = crate::commands::no_triage_refusal(
+            crate::commands::LaunchVerb::Resume,
+            project_root,
+            state.triage_off,
+        )
+    {
+        return Err(refusal);
     }
     // 999.251 (D-02): a run its own `--until` cap halted resumes at the next stage;
     // any other stop reruns the stage it stopped in.
@@ -2712,6 +2757,10 @@ fn resume_loaded(
         }
         if reviews {
             s.reviews_pass = true;
+        }
+        // D-09: a plain resume keeps the run's triage setting.
+        if no_triage {
+            s.triage_off = true;
         }
         s.gate_pending = false;
         // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
@@ -4113,7 +4162,7 @@ mod tests {
         let state_file = workflow::state_path(root, phase);
         let before = std::fs::read(&state_file).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, None, true);
+        let result = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         let err = result.err().map(|err| err.to_string()).unwrap_or_default();
         assert!(
@@ -4164,7 +4213,7 @@ mod tests {
         let state_file = workflow::state_path(root, phase);
         let before = std::fs::read(&state_file).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, None, true);
+        let result = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         let err = result.err().map(|err| err.to_string()).unwrap_or_default();
         assert!(
@@ -4204,7 +4253,7 @@ mod tests {
         );
         write_reviews_file(root, phase);
         crate::service::double::set_launch_end(crate::service::double::LaunchEnd::Failed);
-        let error = resume_with_fallback(root, phase, None, None, true)
+        let error = resume_with_fallback(root, phase, None, None, true, false)
             .expect_err("a failed launch fails")
             .to_string();
         assert!(
@@ -4220,7 +4269,7 @@ mod tests {
         );
 
         crate::service::double::set_launch_end(crate::service::double::LaunchEnd::Started);
-        let retry = resume_with_fallback(root, phase, None, None, true);
+        let retry = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         retry.expect("the retried resume --reviews launches");
     }
@@ -4259,7 +4308,7 @@ mod tests {
             .expect("the stand-in runner writes the state");
         });
 
-        let result = resume_with_fallback(root, phase, None, None, true);
+        let result = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         let error = result
             .expect_err("a timed-out resume with no live runner fails")
@@ -4361,7 +4410,7 @@ mod tests {
         write_reviews_file(root, phase);
         let saved = workflow::load_state(root, phase).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, None, true);
+        let result = resume_with_fallback(root, phase, None, None, true, false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5700,7 +5749,7 @@ mod tests {
         let phase = PhaseId::new(5144);
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false);
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false, false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5747,7 +5796,7 @@ mod tests {
         let paused = workflow::load_state(root, phase).unwrap();
         assert!(!paused.stopped, "the run is not stopped");
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false);
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex), false, false);
         let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
@@ -5817,7 +5866,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None, false);
+        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None, false, false);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let err = result
             .expect_err("handing the run to its own unused fallback is refused")
@@ -5861,7 +5910,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude), false);
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude), false, false);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let err = result
             .expect_err("a fallback equal to the run's agent is refused")
@@ -9260,7 +9309,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = resume_loaded(root, phase, state, None, None, false);
+        let result = resume_loaded(root, phase, state, None, None, false, false);
         result.unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
@@ -9275,6 +9324,74 @@ mod tests {
         assert!(
             crate::service::double::launched_units().is_empty(),
             "resume_loaded launches nothing: its caller launches the runner unit"
+        );
+    }
+
+    /// A stopped Code run of `phase` under a fresh repo at `root`, saved with
+    /// `triage_off`, and its state file's bytes.
+    fn saved_run_for_no_triage(root: &Path, phase: PhaseId, triage_off: bool) -> (State, Vec<u8>) {
+        init_repo(root);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        state.stopped = true;
+        state.triage_off = triage_off;
+        workflow::save_state(&state).unwrap();
+        let bytes = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        (state, bytes)
+    }
+
+    /// D-09: `resume --no-triage` on a run that already has triage off is refused
+    /// before any write.
+    #[test]
+    fn resume_no_triage_is_refused_when_already_off() {
+        const NAME: &str = "pipeline_launch::tests::resume_no_triage_is_refused_when_already_off";
+        enter_agent_free_child!(NAME, "codex");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5486);
+        let (state, before) = saved_run_for_no_triage(root, phase, true);
+        std::fs::write(root.join("devflow.toml"), "[triage]\nenabled = true\n").unwrap();
+
+        let error = resume_loaded(root, phase, state, None, None, false, true)
+            .expect_err("a run already off refuses --no-triage")
+            .to_string();
+
+        assert!(error.contains("--no-triage"), "{error}");
+        assert!(error.contains("already off"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "a refused resume writes nothing"
+        );
+    }
+
+    /// D-09: `resume --no-triage` on a project whose devflow.toml does not enable
+    /// triage is refused before any write, naming the key.
+    #[test]
+    fn resume_no_triage_is_refused_when_triage_is_not_enabled() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_no_triage_is_refused_when_triage_is_not_enabled";
+        enter_agent_free_child!(NAME, "codex");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5487);
+        let (state, before) = saved_run_for_no_triage(root, phase, false);
+
+        let error = resume_loaded(root, phase, state, None, None, false, true)
+            .expect_err("a project without triage refuses --no-triage")
+            .to_string();
+
+        assert!(error.contains("--no-triage"), "{error}");
+        assert!(error.contains("devflow.toml's [triage] enabled"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "a refused resume writes nothing"
         );
     }
 
@@ -11061,6 +11178,7 @@ mod tests {
                 archived_stage: None,
                 launch: StageShape::Capture,
                 relaunch: None,
+                overrides: Vec::new(),
             });
             assert_eq!(spec.stage, Some(stage), "{stage}");
             assert_eq!(
@@ -11069,5 +11187,199 @@ mod tests {
                 "{stage}: the question hold's bound"
             );
         }
+    }
+
+    /// Append `lines` to the event log under `root`, in order.
+    fn append_events(root: &Path, lines: &[serde_json::Value]) {
+        use std::io::Write as _;
+        let path = devflow_core::events::events_path(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    /// Phase 54's `question_asked` for `question_id`.
+    fn override_asked(question_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": 10, "phase": 54, "event": devflow_core::events::QUESTION_ASKED,
+            "question_id": question_id, "question": "Which store?",
+        })
+    }
+
+    /// The operator's override of `question_id` in run `run`: option `was` to `now`.
+    fn override_event(
+        question_id: &str,
+        override_id: &str,
+        now: &str,
+        was: &str,
+        run: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": 20, "phase": 54, "event": devflow_core::events::QUESTION_OVERRIDDEN,
+            "question_id": question_id, "override_id": override_id,
+            "answer": {"option_id": now}, "was": {"option_id": was},
+            "overridden_by": "operator", "run_started_at": run,
+        })
+    }
+
+    /// A saved claude Code-stage state for phase 54 whose canary is confirmed.
+    fn override_launch_state(root: &Path) -> State {
+        let mut state = State::new(
+            PhaseId::new(54),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// Everything a launch hands the agent: its argv and its stream prompt.
+    fn delivered_text(launch: &StageLaunch) -> String {
+        let mut text = launch.args.join("\n");
+        if let StageShape::Stream { prompt } = &launch.launch {
+            text.push('\n');
+            text.push_str(prompt);
+        }
+        text
+    }
+
+    /// D-17: an override made since the last launch is in the next launch's
+    /// prompt, with its question, both answers and the revisit instruction, and
+    /// the launch records its `override_id`.
+    #[test]
+    fn the_next_launch_carries_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = override_launch_state(root);
+        let run = state.started_at.clone();
+        append_events(
+            root,
+            &[
+                override_asked("q1"),
+                override_event("q1", "o1", "b", "a", &run),
+            ],
+        );
+        let launch = prepare_stage_launch(&mut state, "stage prompt".to_string(), None).unwrap();
+        let text = delivered_text(&launch);
+        for part in [
+            "`q1`",
+            "Which store?",
+            "now option `b`",
+            "replacing option `a`",
+            "revisit any work that depended on the old one",
+        ] {
+            assert!(text.contains(part), "the launch carries {part:?}:\n{text}");
+        }
+        assert_eq!(launch.overrides, ["o1"]);
+    }
+
+    /// An `overrides_delivered` line of run `run` naming `ids`.
+    fn delivered_event(ids: &[&str], run: &str) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": 20, "phase": 54, "event": devflow_core::events::OVERRIDES_DELIVERED,
+            "run_started_at": run, "override_ids": ids,
+        })
+    }
+
+    /// D-17: a delivered override is not carried again.
+    #[test]
+    fn a_launch_after_the_delivery_carries_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = override_launch_state(root);
+        let run = state.started_at.clone();
+        append_events(
+            root,
+            &[
+                override_asked("q1"),
+                override_event("q1", "o1", "b", "a", &run),
+                delivered_event(&["o1"], &run),
+            ],
+        );
+        let launch = prepare_stage_launch(&mut state, "stage prompt".to_string(), None).unwrap();
+        let text = delivered_text(&launch);
+        assert!(
+            !text.contains(devflow_core::prompt::OVERRIDE_INTRODUCTION),
+            "no override section:\n{text}"
+        );
+        assert!(launch.overrides.is_empty(), "{:?}", launch.overrides);
+    }
+
+    /// D-17 (review codex-3): delivery names the ids the prompt carried, so an
+    /// override written after the prompt was built reaches the next launch.
+    #[test]
+    fn an_override_written_after_the_prompt_was_built_stays_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = override_launch_state(root);
+        let run = state.started_at.clone();
+        append_events(
+            root,
+            &[
+                override_asked("q1"),
+                override_event("q1", "o1", "b", "a", &run),
+            ],
+        );
+        let launch = prepare_stage_launch(&mut state, "stage prompt".to_string(), None).unwrap();
+        assert_eq!(launch.overrides, ["o1"]);
+        append_events(
+            root,
+            &[
+                override_asked("q2"),
+                override_event("q2", "o2", "d", "c", &run),
+                delivered_event(&["o1"], &run),
+            ],
+        );
+        let pending = devflow_core::history::pending_overrides(root, PhaseId::new(54), &run);
+        let ids: Vec<&str> = pending.iter().map(|p| p.question_id.as_str()).collect();
+        assert_eq!(ids, ["q2"]);
+    }
+
+    /// D-17: an agent that could not be spawned was given nothing, so its
+    /// overrides stay pending and no `overrides_delivered` line is written.
+    #[test]
+    fn a_failed_spawn_delivers_nothing() {
+        const NAME: &str = "pipeline_launch::tests::a_failed_spawn_delivers_nothing";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = override_launch_state(root);
+        // The failed start aborts at the infra ceiling instead of opening a gate.
+        state.infra_failures = devflow_core::mode::MAX_INFRA_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+        let run = state.started_at.clone();
+        append_events(
+            root,
+            &[
+                override_asked("q1"),
+                override_event("q1", "o1", "b", "a", &run),
+            ],
+        );
+        let mut launch =
+            prepare_stage_launch(&mut state, "stage prompt".to_string(), None).unwrap();
+        assert_eq!(launch.overrides, ["o1"]);
+        launch.program = root.join("no-such-agent").display().to_string();
+        let phase = PhaseId::new(54);
+        let _ = run_one_stage(root, phase, launch, &StopToken::for_run())
+            .expect("the runner reports the failed start");
+        let log = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
+        assert!(log.contains("\"stage_launch_failed\""), "{log}");
+        assert!(
+            !log.contains(devflow_core::events::OVERRIDES_DELIVERED),
+            "{log}"
+        );
+        let pending = devflow_core::history::pending_overrides(root, phase, &run);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].question_id, "q1");
     }
 }

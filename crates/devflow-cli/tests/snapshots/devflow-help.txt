@@ -8,6 +8,7 @@ Commands:
   gate     Inspect and answer human gates (the pause points where the workflow waits for approval)
   logs     Print or follow an agent's captured output for a phase
   history  Show a phase's chronological events and retained attempt evidence
+  ledger   List a phase's questions from the event log: those triage decided, and those escalated to the operator with the reason, answered or not
   cleanup  Remove what is safe to remove: a finished run, a dead start's reservation, or a worktree with no run state, once its branch is merged into the base, its worktree is clean and no run is live. Says why it keeps the rest, and names `devflow discard` (or `devflow resume` for an incomplete run)
   discard  Remove a phase's worktree, its uncommitted changes, its run state, its feature branch, and the gate files and hold temps a killed run left, after listing them. Refuses a live run or a gate something still waits on; refuses an unmerged branch unless `--delete-unmerged-branch` names it
   status   Show current workflow state

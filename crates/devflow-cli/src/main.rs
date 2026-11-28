@@ -20,6 +20,10 @@ mod pipeline_gate;
 
 mod ask_server;
 
+mod triage_client;
+
+mod triage_score;
+
 mod phase_worktree;
 
 mod service;
@@ -91,6 +95,10 @@ enum Command {
         /// given. No environment variable selects it.
         #[arg(long)]
         fallback_agent: Option<AgentKind>,
+        /// Turn decision triage off for this run: every question goes to the
+        /// operator. Refused when devflow.toml does not enable triage.
+        #[arg(long)]
+        no_triage: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -136,6 +144,23 @@ enum Command {
         #[arg(long)]
         hold_cap_secs: Option<u64>,
     },
+    /// Internal: measure Jev on the operator's past answers (D-01, D-04).
+    ///
+    /// Mines every named project, scores each question leave-one-out with the request
+    /// a run sends, and writes the corpus, the scores and a counts-only report under
+    /// the user data dir. Hidden: a one-off measurement, not an operator workflow.
+    #[command(name = "__triage-score", hide = true)]
+    Score {
+        /// A project to mine, as `<name>=<path>`; repeatable.
+        #[arg(long = "project", value_name = "NAME=PATH", required = true)]
+        projects: Vec<triage_score::ProjectArg>,
+        /// A project's phase whose labels are left out, as `<name>:<phase>`; repeatable.
+        #[arg(long = "exclude", value_name = "NAME:PHASE")]
+        excludes: Vec<triage_score::ExcludeArg>,
+        /// The Jev model to score with.
+        #[arg(long, default_value = devflow_core::triage::DEFAULT_MODEL)]
+        model: String,
+    },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
     /// Unlike `start`, this loads the persisted per-phase state and
@@ -168,6 +193,11 @@ enum Command {
         /// NN-REVIEWS.md.
         #[arg(long)]
         reviews: bool,
+        /// Turn decision triage off for the resumed run: every question goes to
+        /// the operator. Refused when devflow.toml does not enable triage, and when
+        /// the run already has triage off; omit it to keep the run's setting.
+        #[arg(long)]
+        no_triage: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -201,6 +231,22 @@ enum Command {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
+    },
+    /// List a phase's questions from the event log: those triage decided, and
+    /// those escalated to the operator with the reason, answered or not.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Ledger {
+        #[command(subcommand)]
+        action: Option<LedgerCmd>,
+        /// Phase to list.
+        #[arg(required = true)]
+        phase: Option<PhaseId>,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove what is safe to remove: a finished run, a dead start's reservation, or
     /// a worktree with no run state, once its branch is merged into the base, its
@@ -257,6 +303,35 @@ enum Command {
         root: Option<PathBuf>,
         /// Project root.
         #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LedgerCmd {
+    /// Replace the answer of one answered question in the phase's ledger. The
+    /// operator's verb: refused for an unknown, open or closed question, a
+    /// discarded run, and an agent-marked caller; nothing is written then.
+    #[command(group(
+        clap::ArgGroup::new("choice")
+            .required(true)
+            .multiple(false)
+            .args(["option", "text"])
+    ))]
+    Override {
+        /// Phase whose ledger holds the question.
+        phase: PhaseId,
+        /// The question id `devflow ledger` showed.
+        #[arg(long = "question-id")]
+        question_id: String,
+        /// The id of the new option, one the question offered.
+        #[arg(long)]
+        option: Option<String>,
+        /// A new free-text answer; an empty text is refused.
+        #[arg(long)]
+        text: Option<String>,
+        /// Project root.
+        #[arg(long, default_value = ".")]
         project: PathBuf,
     },
 }
@@ -485,6 +560,7 @@ fn run() -> Result<(), CliError> {
             until,
             reviews,
             fallback_agent,
+            no_triage,
             project,
         } => {
             // Worktree is the default; `--no-worktree` is the only switch.
@@ -499,6 +575,7 @@ fn run() -> Result<(), CliError> {
                 until,
                 reviews,
                 commands::FallbackSource::FlagOrConfig(fallback_agent),
+                no_triage,
             )
         }
         Command::Runner { project, phase } => {
@@ -531,11 +608,21 @@ fn run() -> Result<(), CliError> {
             let _ = std::io::stdout().flush();
             std::process::exit(code)
         }
+        Command::Score {
+            projects,
+            excludes,
+            model,
+        } => triage_score::run_score(&triage_score::ScoreArgs {
+            projects,
+            excludes,
+            model,
+        }),
         Command::Resume {
             phase,
             agent,
             fallback_agent,
             reviews,
+            no_triage,
             project,
         } => resume_with_fallback(
             &project_root(project)?,
@@ -543,6 +630,7 @@ fn run() -> Result<(), CliError> {
             agent,
             fallback_agent,
             reviews,
+            no_triage,
         ),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
@@ -620,6 +708,35 @@ fn run() -> Result<(), CliError> {
             project,
         } => logs(&project_root(project)?, phase, follow, stderr),
         Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
+        Command::Ledger {
+            action:
+                Some(LedgerCmd::Override {
+                    phase,
+                    question_id,
+                    option,
+                    text,
+                    project,
+                }),
+            ..
+        } => commands::ledger_override_report(
+            &project_root(project)?,
+            phase,
+            &question_id,
+            &answer_choice(option, text)?,
+        )
+        .map(|report| println!("{report}")),
+        Command::Ledger {
+            action: None,
+            phase,
+            project,
+            json,
+        } => {
+            let phase = phase.ok_or_else(|| {
+                CliError::Message("`devflow ledger` needs a phase: devflow ledger <PHASE>".into())
+            })?;
+            commands::ledger_report(&project_root(project)?, phase, json)
+                .map(|report| println!("{report}"))
+        }
         Command::Cleanup { project } => cleanup(&project_root(project)?),
         Command::Discard {
             phase,
@@ -716,6 +833,63 @@ mod tests {
         );
         assert!(parse(&["--option", "a"]).is_ok(), "an option alone parses");
         assert!(parse(&["--text", ""]).is_ok(), "an empty text alone parses");
+    }
+
+    /// Pitfall 8: the list and the override both parse under `ledger`; the
+    /// override takes exactly one of `--option` and `--text`, and a bare
+    /// `devflow ledger` names the missing phase.
+    #[test]
+    fn ledger_and_ledger_override_both_parse() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        match parse(&["devflow", "ledger", "54"]) {
+            Ok(Command::Ledger {
+                action: None,
+                phase: Some(phase),
+                ..
+            }) => assert_eq!(phase, PhaseId::new(54)),
+            other => panic!("`devflow ledger 54` parsed as {other:?}"),
+        }
+        let override_args = [
+            "devflow",
+            "ledger",
+            "override",
+            "54",
+            "--question-id",
+            "q1",
+            "--option",
+            "b",
+        ];
+        match parse(&override_args) {
+            Ok(Command::Ledger {
+                action:
+                    Some(LedgerCmd::Override {
+                        phase,
+                        question_id,
+                        option,
+                        text: None,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(phase, PhaseId::new(54));
+                assert_eq!(question_id, "q1");
+                assert_eq!(option.as_deref(), Some("b"));
+            }
+            other => panic!("`devflow ledger override` parsed as {other:?}"),
+        }
+        let base = ["devflow", "ledger", "override", "54", "--question-id", "q1"];
+        assert_eq!(
+            parse(&base).expect_err("no choice is refused").kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let both = [&base[..], &["--option", "b", "--text", "x"]].concat();
+        assert_eq!(
+            parse(&both).expect_err("both choices are refused").kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        let bare = parse(&["devflow", "ledger"]).expect_err("a bare `devflow ledger` parsed");
+        assert_eq!(bare.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(bare.to_string().contains("<PHASE>"), "{bare}");
     }
 
     #[test]

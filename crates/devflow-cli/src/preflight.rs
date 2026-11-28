@@ -708,13 +708,15 @@ fn ensure_base_ref_current_to(
 /// pre-existing input, since no stage runs the discussion); no PLAN.md is
 /// required, because PLAN.md is an *output* the phase itself produces. `HeadlessSafe` is never refused; `RequiresTypedSubagents`
 /// / `InteractiveOnly` have no headless path at all. Routes the failure
-/// through the preflight gate (D-15) rather than a hard error.
-pub(crate) fn preflight_interactivity_check(
+/// through the preflight gate (D-15) rather than a hard error. The driver is a
+/// parameter so the `RequiresExistingArtifact` gate stays tested now that no
+/// production driver declares it (#330 lifted codex's Plan refusal).
+pub(crate) fn preflight_interactivity_check_with(
     project_root: &Path,
     state: &State,
+    driver: &dyn agents::AgentDriver,
 ) -> Result<(), String> {
     use devflow_core::agents::InteractivityMode;
-    let driver = agents::driver_for(state.agent);
     match driver.interactivity_mode(state.stage) {
         InteractivityMode::HeadlessSafe => Ok(()),
         InteractivityMode::RequiresExistingArtifact => {
@@ -1181,12 +1183,26 @@ fn unattended_launch_check_reporting_to(
 /// `25-VERIFICATION.md`'s gap-closure scope names only the generic checks;
 /// this is a scope boundary, not an oversight.
 pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
+    generic_preflight_checks_with(
+        project_root,
+        state,
+        agents::driver_for(state.agent).as_ref(),
+    )
+}
+
+/// [`generic_preflight_checks`] for an explicit `driver`, so the aggregation
+/// with a `RequiresExistingArtifact` refusal stays tested (#330).
+pub(crate) fn generic_preflight_checks_with(
+    project_root: &Path,
+    state: &State,
+    driver: &dyn agents::AgentDriver,
+) -> Result<(), String> {
     let mut reasons = Vec::new();
     // D-07 (35.1-03) sits FIRST, and the position was chosen rather than
     // defaulted to, so the display cut of the gate context cannot elide it.
     //
-    // The one check it CAN co-occur with is interactivity (Codex, Auto,
-    // Plan), and it outranks that deliberately: interactivity reports a
+    // The one check it CAN co-occur with is interactivity (a
+    // `RequiresExistingArtifact` driver, Auto, Plan), and it outranks that deliberately: interactivity reports a
     // symptom this check's C2 also reports, with more actionable detail and a
     // per-condition breakdown. Losing the shorter, more-redundant reason to
     // truncation costs less than losing this one.
@@ -1196,7 +1212,7 @@ pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Re
     if let Err(reason) = preflight_unattended_launch_check(project_root, state) {
         reasons.push(reason);
     }
-    if let Err(reason) = preflight_interactivity_check(project_root, state) {
+    if let Err(reason) = preflight_interactivity_check_with(project_root, state, driver) {
         reasons.push(reason);
     }
     if reasons.is_empty() {
@@ -1413,12 +1429,40 @@ mod tests {
     // 17c: preflight readiness gate (D-13-D-16, Task 1)
     // -----------------------------------------------------------------
 
-    /// D-14/999.106 interactivity check: the gate is driver-driven — Codex
-    /// declares Plan `RequiresExistingArtifact`, so a headless Auto-mode
-    /// Codex Plan run (the first stage) without CONTEXT.md on develop is
-    /// flagged. Supervise mode, a stage that is not the first one (Code), a
-    /// non-Codex agent (Claude declares HeadlessSafe), and a CONTEXT.md that
-    /// does exist are all unaffected.
+    /// A driver that declares Plan `RequiresExistingArtifact` and every other
+    /// stage `HeadlessSafe`: no production driver does since #330.
+    struct PlanNeedsContext;
+
+    impl agents::AgentDriver for PlanNeedsContext {
+        fn name(&self) -> &'static str {
+            "test-plan-needs-context"
+        }
+        fn build_command(
+            &self,
+            _phase: PhaseId,
+            _prompt: &str,
+            _roots: &[PathBuf],
+        ) -> (&'static str, Vec<String>) {
+            ("true", Vec::new())
+        }
+        fn render_prompt(&self, intent: &devflow_core::prompt::StageIntent) -> String {
+            devflow_core::prompt::render_claude_style(intent)
+        }
+        fn interactivity_mode(&self, stage: Stage) -> agents::InteractivityMode {
+            if stage == Stage::Plan {
+                agents::InteractivityMode::RequiresExistingArtifact
+            } else {
+                agents::InteractivityMode::HeadlessSafe
+            }
+        }
+    }
+
+    /// D-14/999.106 interactivity check: the gate is driver-driven — a driver
+    /// declaring Plan `RequiresExistingArtifact` has a headless Auto-mode Plan
+    /// run (the first stage) without CONTEXT.md on develop flagged. Supervise
+    /// mode, a stage that is not the first one (Code), a driver declaring
+    /// HeadlessSafe (Claude), and a CONTEXT.md that does exist are all
+    /// unaffected.
     #[test]
     fn preflight_interactivity_check_flags_auto_plan_without_context_md() {
         let dir = tempfile::tempdir().unwrap();
@@ -1432,22 +1476,27 @@ mod tests {
             root.to_path_buf(),
         );
         state.stage = Stage::Plan;
-        assert!(preflight_interactivity_check(root, &state).is_err());
+        assert!(preflight_interactivity_check_with(root, &state, &PlanNeedsContext).is_err());
 
         state.mode = Mode::Supervise;
-        assert!(preflight_interactivity_check(root, &state).is_ok());
+        assert!(preflight_interactivity_check_with(root, &state, &PlanNeedsContext).is_ok());
 
         state.mode = Mode::Auto;
         state.stage = Stage::Code;
         assert!(
-            preflight_interactivity_check(root, &state).is_ok(),
+            preflight_interactivity_check_with(root, &state, &PlanNeedsContext).is_ok(),
             "only the first stage, Plan, needs CONTEXT.md on the base"
         );
 
         state.stage = Stage::Plan;
         state.agent = AgentKind::Claude;
         assert!(
-            preflight_interactivity_check(root, &state).is_ok(),
+            preflight_interactivity_check_with(
+                root,
+                &state,
+                agents::driver_for(state.agent).as_ref()
+            )
+            .is_ok(),
             "Claude declares Plan HeadlessSafe — not flagged"
         );
         state.agent = AgentKind::Codex;
@@ -1469,7 +1518,7 @@ mod tests {
         git(&["commit", "-q", "-m", "context"]);
 
         state.stage = Stage::Plan;
-        assert!(preflight_interactivity_check(root, &state).is_ok());
+        assert!(preflight_interactivity_check_with(root, &state, &PlanNeedsContext).is_ok());
     }
 
     /// codex (external review, 2026-09-02, CR-45-01): this check re-resolved
@@ -1533,7 +1582,7 @@ mod tests {
             state.base_branch.is_none(),
             "fixture precondition: no base persisted yet"
         );
-        let refused = preflight_interactivity_check(root, &state)
+        let refused = preflight_interactivity_check_with(root, &state, &PlanNeedsContext)
             .expect_err("develop has no CONTEXT.md — this must still be refused");
         assert!(
             refused.contains("develop"),
@@ -1543,7 +1592,7 @@ mod tests {
         // The run recorded its base at `start`. Nothing else changes.
         state.base_branch = Some("workspace/example".to_string());
         assert!(
-            preflight_interactivity_check(root, &state).is_ok(),
+            preflight_interactivity_check_with(root, &state, &PlanNeedsContext).is_ok(),
             "the run's own base carries CONTEXT.md; the check must probe THAT branch"
         );
 
@@ -1551,8 +1600,37 @@ mod tests {
         // refused — the fix must not have turned the probe into a no-op.
         state.base_branch = Some("main".to_string());
         assert!(
-            preflight_interactivity_check(root, &state).is_err(),
+            preflight_interactivity_check_with(root, &state, &PlanNeedsContext).is_err(),
             "a persisted base without CONTEXT.md must still be refused"
+        );
+    }
+
+    /// #330 (D-20): codex declares Plan HeadlessSafe, so a codex auto run at
+    /// Plan without CONTEXT.md passes. Control: the same state against a
+    /// driver that needs the artifact is flagged, so the fixture lacks it.
+    #[test]
+    fn codex_auto_plan_without_context_md_is_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let mut state = State::new(
+            PhaseId::new(60),
+            AgentKind::Codex,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Plan;
+        assert!(
+            preflight_interactivity_check_with(root, &state, &PlanNeedsContext).is_err(),
+            "control: the fixture has no CONTEXT.md on the base"
+        );
+        assert_eq!(
+            preflight_interactivity_check_with(
+                root,
+                &state,
+                agents::driver_for(state.agent).as_ref()
+            ),
+            Ok(())
         );
     }
 
@@ -1727,8 +1805,9 @@ mod tests {
     // adjudicated check, the retry ceiling must be checked before a gate,
     // and the bound's reset must persist.
     //
-    // These three tests deliberately fail via `preflight_interactivity_check`
-    // (Codex + Auto + Plan + no CONTEXT.md on develop), NOT via
+    // These three tests deliberately fail via the generic checks (Codex +
+    // Auto + Plan, refused by `preflight_unattended_launch_check` since #330
+    // lifted the CONTEXT.md refusal), NOT via
     // `AlwaysFailAdapter`'s adapter hook. `AlwaysFailAdapter` is still
     // passed as the `adapter` argument (defense in depth — it would also
     // fail were it ever reached), but it structurally CANNOT be what
@@ -1746,7 +1825,7 @@ mod tests {
 
     /// D-18f: `GateAction::Advance` must skip the just-adjudicated check
     /// entirely — with the pre-18f code (full `launch_stage` recursion),
-    /// the SAME deterministic `preflight_interactivity_check` failure would
+    /// the SAME deterministic generic-check failure would
     /// fire again on the retry, write a SECOND gate nobody answers (only
     /// one response is ever seeded here), and `run_preflight` would return
     /// `Err` (a bounded gate-timeout error) instead of `Ok(Approved)` — that
@@ -1776,8 +1855,8 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(620);
-        // Codex + Auto + Plan + no `.planning/phases/620-*/620-CONTEXT.md`
-        // on `develop` deterministically fails `preflight_interactivity_check`
+        // Codex + Auto + Plan deterministically fails
+        // `preflight_unattended_launch_check`
         // — see the section doc comment above for why this (not the adapter
         // hook) is what actually reproduces the wedge across a relaunch.
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
@@ -3260,9 +3339,10 @@ mod tests {
     /// safe to skip the re-check — the human approving the gate has already
     /// been shown every applicable reason.
     ///
-    /// The fixture fails BOTH: Codex at Plan with no CONTEXT.md on develop
-    /// trips `preflight_interactivity_check`, and Codex also trips this check's
-    /// C2 (no non-Claude agent can host the chain-flag guard).
+    /// The fixture fails BOTH: a driver declaring Plan `RequiresExistingArtifact`
+    /// with no CONTEXT.md on develop trips `preflight_interactivity_check_with`,
+    /// and the Codex agent trips this check's C2 (no non-Claude agent can host
+    /// the chain-flag guard).
     #[test]
     fn generic_preflight_checks_surfaces_the_unattended_reason_alongside_an_earlier_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -3279,7 +3359,7 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
 
-        let err = generic_preflight_checks(root, &state).unwrap_err();
+        let err = generic_preflight_checks_with(root, &state, &PlanNeedsContext).unwrap_err();
         assert!(
             err.contains("cannot run the plan stage headlessly"),
             "the interactivity reason must survive aggregation: {err}"

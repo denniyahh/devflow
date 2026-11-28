@@ -28,8 +28,8 @@ use devflow_core::agents;
 use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{
-    GateError, GateFile, GateId, GateKind, GateResponse, Gates, OpenGate, QuarantinedAnswer,
-    WaiterStatus, is_gate_id,
+    AnswerRead, GateError, GateFile, GateId, GateKind, GateResponse, Gates, OpenGate,
+    QuarantinedAnswer, WaiterStatus, is_gate_id,
 };
 use devflow_core::git::{GitFlow, git_command};
 use devflow_core::history;
@@ -40,9 +40,10 @@ use devflow_core::question::QuestionChoice;
 use devflow_core::registry;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::triage::TriageConfig;
 use devflow_core::workflow;
 use devflow_core::worktree;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -331,6 +332,7 @@ pub(crate) fn start(
     until: Option<Stage>,
     reviews: bool,
     fallback: FallbackSource,
+    no_triage: bool,
 ) -> Result<(), CliError> {
     // 999.229: said first, before any other output, a refusal or the dry-run
     // return. The detached supervisor that reads the value has no foreground.
@@ -396,6 +398,13 @@ pub(crate) fn start(
             );
         }
     }
+
+    // D-09: judged with the other refusals before `dry_run`, so a dry run prints it too.
+    // D-09: judged with the other refusals before `dry_run`, so a dry run prints it too.
+    if no_triage && let Some(refusal) = no_triage_refusal(LaunchVerb::Start, project_root, false) {
+        return Err(refusal);
+    }
+    state.triage_off = no_triage;
 
     if dry_run {
         return start_dry_run(project_root, &state);
@@ -777,6 +786,27 @@ fn dry_run_not_checked_line(phase: PhaseId, base: &str, reviews: bool) -> String
          reachability (phase {phase} on `{base}`), and the CONTEXT.md/PLAN.md checks on \
          `{base}`{reviews_check}; a real start runs them after these checks"
     )
+}
+
+/// D-09, restrictive verbs: `--no-triage` has one job, turning decision triage off for
+/// this run, so it is refused where it would change nothing: on a project whose
+/// devflow.toml does not enable triage, and on a run that already has triage off.
+pub(crate) fn no_triage_refusal(
+    verb: LaunchVerb,
+    project_root: &Path,
+    already_off: bool,
+) -> Option<CliError> {
+    let verb = verb.label();
+    let reason = if !config::triage_config(project_root).enabled {
+        "devflow.toml's [triage] enabled is not true, so triage does not run for this project"
+    } else if already_off {
+        "triage is already off for this run"
+    } else {
+        return None;
+    };
+    Some(CliError::Message(format!(
+        "{verb}: --no-triage is refused: {reason}; {verb} without --no-triage"
+    )))
 }
 
 /// The refusal of a `--reviews` launch (D-04, #250) whose phase has no REVIEWS.md at
@@ -2222,9 +2252,42 @@ pub(crate) fn discard(
     print_discard_listing(phase, &items, &debris);
     refuse_discard_of_a_checked_out_branch(phase, &items)?;
     refuse_discard_of_branch(phase, &items, delete_unmerged_branch)?;
+    let recorded = record_run_discarded(project_root, phase, &existing)?;
     let removed = remove_discarded(project_root, phase, &git, &items);
     let debris_removed = remove_discarded_debris(project_root, phase, &debris);
-    removed.and(debris_removed)
+    let result = removed.and(debris_removed);
+    if !recorded {
+        return result;
+    }
+    result.map_err(|error| {
+        CliError::Message(format!(
+            "{error}. The discard is recorded in .devflow/events.jsonl; rerun `devflow discard \
+             --phase {phase}` to finish it"
+        ))
+    })
+}
+
+/// Write-ahead for discard (D-16): append `run_discarded` with the saved run's
+/// `started_at` before anything is removed, so a removed run always has its
+/// record. Whether one was written; a failed append refuses the discard. The
+/// event log itself is never removed, so the ledger outlives the run.
+fn record_run_discarded(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+) -> Result<bool, CliError> {
+    let workflow::Existing::Loaded(state) = existing else {
+        return Ok(false);
+    };
+    let fields = serde_json::json!({ "started_at": state.started_at });
+    events::try_emit(project_root, phase, events::RUN_DISCARDED, fields).map_err(|error| {
+        CliError::Message(format!(
+            "discard refused: the run_discarded record could not be written to {} ({error}); \
+             nothing was removed",
+            events::events_path(project_root).display()
+        ))
+    })?;
+    Ok(true)
 }
 
 /// The suffix of a gate's waiter registration, `NN-{stage}.{gate_id}.waiter`: the
@@ -3378,6 +3441,97 @@ fn status_run_lines(state: &State) -> Vec<String> {
     lines
 }
 
+/// One run's triage fallbacks: how many, and the last one's reason and detail.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct FallbackTally {
+    count: usize,
+    last_reason: String,
+    last_detail: String,
+}
+
+/// Every run's triage fallbacks, keyed by phase and the run's `started_at`
+/// (a `triage_fallback` event's `run_started_at`, matched by value), from
+/// one read of events.jsonl. A missing log is no fallbacks.
+fn triage_fallback_tallies(project_root: &Path) -> HashMap<(PhaseId, String), FallbackTally> {
+    std::fs::read_to_string(events::events_path(project_root))
+        .map(|contents| fallback_tallies_from(&contents))
+        .unwrap_or_default()
+}
+
+/// [`triage_fallback_tallies`] over the text of events.jsonl.
+fn fallback_tallies_from(contents: &str) -> HashMap<(PhaseId, String), FallbackTally> {
+    let mut tallies: HashMap<(PhaseId, String), FallbackTally> = HashMap::new();
+    for event in contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == events::TRIAGE_FALLBACK)
+    {
+        let (Some(phase), Some(run)) = (
+            PhaseId::from_json(event.get("phase")),
+            event["run_started_at"].as_str(),
+        ) else {
+            continue;
+        };
+        let text = |key: &str| event[key].as_str().unwrap_or("unknown").to_string();
+        let tally = tallies.entry((phase, run.to_string())).or_default();
+        tally.count += 1;
+        tally.last_reason = text("reason");
+        tally.last_detail = text("detail");
+    }
+    tallies
+}
+
+/// The project's triage configuration for `status`; `None` when
+/// `devflow.toml` has no `[triage]` table (or is missing or unparsable), so
+/// a project that never configured triage gets no triage line.
+fn status_triage_config(project_root: &Path) -> Option<TriageConfig> {
+    let contents = std::fs::read_to_string(project_root.join("devflow.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&contents).ok()?;
+    table
+        .contains_key("triage")
+        .then(|| config::triage_config(project_root))
+}
+
+/// The host `base_url` names; `None` when it does not parse as a URL.
+fn url_host(base_url: &str) -> Option<String> {
+    let uri = base_url.parse::<ureq::http::Uri>().ok()?;
+    uri.host().map(str::to_owned)
+}
+
+/// `status`'s line about triage for `state`'s run (TRIAGE-04, D-19): `None`
+/// without a `[triage]` table; otherwise its fallbacks this run when there
+/// are any, else whether it is off, escalating everything, or on with its
+/// thresholds. `base_url` is `TYPESAFE_BASE_URL`, named when its host is not
+/// TypeSafe's.
+fn triage_line(
+    state: &State,
+    config: Option<&TriageConfig>,
+    tally: Option<&FallbackTally>,
+    base_url: Option<&str>,
+) -> Option<String> {
+    let config = config?;
+    let via = base_url
+        .and_then(url_host)
+        .filter(|host| host != crate::triage_client::TYPESAFE_API_HOST)
+        .map_or(String::new(), |host| format!(" via {host}"));
+    let line = match tally.filter(|tally| tally.count > 0) {
+        Some(tally) => format!(
+            "  triage: fell back to the operator {} time(s) this run; last: {} ({}){via}",
+            tally.count, tally.last_reason, tally.last_detail
+        ),
+        None if !config.enabled => "  triage: off (enabled = false in devflow.toml)".to_string(),
+        None if state.triage_off => "  triage: off for this run (--no-triage)".to_string(),
+        None => match (config.threshold, config.pre_check_threshold) {
+            (Some(threshold), Some(pre_check)) => format!(
+                "  triage: on (threshold {threshold}, pre-check {pre_check}, model {}){via}",
+                config.model
+            ),
+            _ => format!("  triage: on, escalating every question (no threshold){via}"),
+        },
+    };
+    Some(line)
+}
+
 /// D-09 (review codex-8): every phase `status` lists, found by file name only, never
 /// by file contents: `.runner-NN` locks in `.devflow/`, gate request files
 /// `NN-{stage}.json` in [`Gates::dir`] and state files through
@@ -3458,6 +3612,14 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
         // 14-CR-10: one pass over events.jsonl for every phase's last event,
         // instead of a full-file scan per phase.
         let mut last_events = events::last_events_by_phase(project_root);
+        // devflow.toml and the fallback tallies are read once per call, not
+        // per phase; neither is read for a project without `[triage]`.
+        let triage = status_triage_config(project_root);
+        let fallbacks = triage
+            .as_ref()
+            .map(|_| triage_fallback_tallies(project_root))
+            .unwrap_or_default();
+        let base_url = std::env::var("TYPESAFE_BASE_URL").ok();
         println!("project_root: {}", project_root.display());
         println!("{}", active_phases_line(&states));
         for (phase, _, row) in &rows {
@@ -3470,6 +3632,11 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 };
                 for line in
                     status_state_lines(project_root, state, question, last_events.remove(phase))
+                {
+                    println!("{line}");
+                }
+                let tally = fallbacks.get(&(*phase, state.started_at.clone()));
+                if let Some(line) = triage_line(state, triage.as_ref(), tally, base_url.as_deref())
                 {
                     println!("{line}");
                 }
@@ -3824,6 +3991,62 @@ fn resolve_single_open_gate_stage(open: &[OpenGate], phase: PhaseId) -> Result<S
     }
 }
 
+/// The variable a delegated agent session sets so its gate answers are
+/// recorded as the agent's, not the operator's (#343, D-13).
+const ANSWERED_BY_ENV: &str = "DEVFLOW_ANSWERED_BY";
+
+/// The longest agent name `agent:<name>` accepts.
+const AGENT_NAME_MAX: usize = 32;
+
+/// Who is answering a gate: [`answerer_from`] over this process's environment.
+fn answerer() -> Result<String, CliError> {
+    answerer_from(
+        std::env::var_os("DEVFLOW_ANSWERED_BY"),
+        std::env::var("USER").ok(),
+    )
+}
+
+/// Who is answering a gate. With no marker it is the operator: `user` when it
+/// is non-empty, else `devflow-cli`. A marker must be `agent:<name>` (`<name>`
+/// 1-32 of `[a-z0-9_-]`, starting alphanumeric) and is returned unchanged;
+/// every other marker is refused, before anything is written. `triage:*` is
+/// refused on its own terms: only DevFlow's triage records a triage answer.
+fn answerer_from(
+    marker: Option<std::ffi::OsString>,
+    user: Option<String>,
+) -> Result<String, CliError> {
+    let Some(marker) = marker else {
+        return Ok(user
+            .filter(|user| !user.is_empty())
+            .unwrap_or_else(|| "devflow-cli".into()));
+    };
+    let value = marker.to_string_lossy();
+    if value.starts_with("triage:") {
+        return Err(CliError::Message(format!(
+            "{ANSWERED_BY_ENV}={value:?} is refused: only DevFlow's triage records a triage answer, \
+             and no shell verb may claim one; nothing was written"
+        )));
+    }
+    if value.strip_prefix("agent:").is_some_and(is_agent_name) {
+        return Ok(value.into_owned());
+    }
+    Err(CliError::Message(format!(
+        "{ANSWERED_BY_ENV}={value:?} is refused: set it to agent:<name> (lowercase letters, \
+         digits, - or _, up to {AGENT_NAME_MAX}) when an agent answers for the operator, or unset \
+         it to answer as the operator; nothing was written"
+    )))
+}
+
+/// Whether `name` is an agent name `agent:<name>` accepts.
+fn is_agent_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= AGENT_NAME_MAX
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
 /// The three answers an operator can give a gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GateAnswerKind {
@@ -3875,6 +4098,28 @@ pub(crate) fn gate_respond_report(
     note: Option<String>,
     observed_gate_id: Option<String>,
 ) -> Result<String, CliError> {
+    gate_respond_report_by(
+        project_root,
+        phase,
+        stage,
+        kind,
+        note,
+        observed_gate_id,
+        answerer(),
+    )
+}
+
+/// [`gate_respond_report`] answering as `answerer`, the resolver's result: a
+/// refused answerer is returned before anything is written.
+fn gate_respond_report_by(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    kind: GateAnswerKind,
+    note: Option<String>,
+    observed_gate_id: Option<String>,
+    answerer: Result<String, CliError>,
+) -> Result<String, CliError> {
     // A malformed id is refused before anything is read, so it can never name a
     // path (T-50.1-42).
     let given_gate_id = observed_gate_id.as_deref().map(GateId::parse).transpose()?;
@@ -3889,10 +4134,7 @@ pub(crate) fn gate_respond_report(
     };
     require_gate_file_names(project_root, phase, stage, &observed)?;
     refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
-    let responded_by = std::env::var("USER")
-        .ok()
-        .filter(|user| !user.is_empty())
-        .unwrap_or_else(|| "devflow-cli".into());
+    let responded_by = answerer?;
     let response = GateResponse {
         approved: kind == GateAnswerKind::Approve,
         abort: kind == GateAnswerKind::Abort,
@@ -3996,6 +4238,19 @@ pub(crate) fn gate_answer_report(
     gate_id: &str,
     choice: &QuestionChoice,
 ) -> Result<String, CliError> {
+    gate_answer_report_by(project_root, phase, stage, gate_id, choice, answerer())
+}
+
+/// [`gate_answer_report`] answering as `answerer`, the resolver's result: a
+/// refused answerer is returned before anything is written.
+fn gate_answer_report_by(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    gate_id: &str,
+    choice: &QuestionChoice,
+    answerer: Result<String, CliError>,
+) -> Result<String, CliError> {
     let observed = GateId::parse(gate_id)?;
     let open = Gates::list_open(project_root);
     let stage = match stage {
@@ -4004,10 +4259,7 @@ pub(crate) fn gate_answer_report(
     };
     require_gate_file_names(project_root, phase, stage, &observed)?;
     refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
-    let responded_by = std::env::var("USER")
-        .ok()
-        .filter(|user| !user.is_empty())
-        .unwrap_or_else(|| "devflow-cli".into());
+    let responded_by = answerer?;
     let gate =
         crate::pipeline_gate::read_gate_file(project_root, phase, stage).ok_or_else(|| {
             CliError::Message(format!(
@@ -4782,22 +5034,79 @@ pub(crate) fn gate_show(
     phase: PhaseId,
     stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    println!("{}", gate_show_report(project_root, phase, stage)?);
+    Ok(())
+}
+
+/// [`gate_show`]'s work, returning what it prints. A gate whose answer is
+/// written but not yet claimed is hidden by `Gates::list_open`, so it is read
+/// from its gate file and answer slot and shown with who answered it (#343).
+fn gate_show_report(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+) -> Result<String, CliError> {
     let open = Gates::list_open(project_root);
+    let answered = answered_unclaimed_gates(project_root, phase);
     let stage = match stage {
         Some(stage) => stage,
-        None => resolve_single_open_gate_stage(&open, phase)?,
+        None => {
+            let mut shown: Vec<OpenGate> = open.clone();
+            shown.extend(answered.iter().map(|(gate, _)| gate.clone()));
+            resolve_single_open_gate_stage(&shown, phase)?
+        }
     };
-    let gate = open
-        .into_iter()
-        .find(|g| g.phase == phase && g.stage == stage)
-        .ok_or_else(|| {
-            CliError::Message(format!(
-                "no open gate for phase {phase} stage {stage} — see `devflow gate list`"
-            ))
-        })?;
+    let at_stage = |gate: &OpenGate| gate.phase == phase && gate.stage == stage;
+    let (gate, answered_by) = match open.into_iter().find(at_stage) {
+        Some(gate) => (gate, None),
+        None => answered
+            .into_iter()
+            .find(|(gate, _)| at_stage(gate))
+            .map(|(gate, by)| (gate, Some(by)))
+            .ok_or_else(|| {
+                CliError::Message(format!(
+                    "no open gate for phase {phase} stage {stage} — see `devflow gate list`"
+                ))
+            })?,
+    };
     let question = Gates::read_question(project_root, phase, stage)?;
-    println!("{}", render_gate_show(&gate, question.as_ref()));
-    Ok(())
+    let mut report = render_gate_show(&gate, question.as_ref());
+    if let Some(by) = answered_by {
+        report.push_str(&format!(
+            "\nanswered by {} (waiting to be claimed)",
+            render_gate_context(&by, usize::MAX)
+        ));
+    }
+    Ok(report)
+}
+
+/// `phase`'s gates whose slot holds a bound answer not yet claimed, each with
+/// the answer's `responded_by` (`unknown` when the answer names none).
+fn answered_unclaimed_gates(project_root: &Path, phase: PhaseId) -> Vec<(OpenGate, String)> {
+    std::iter::successors(Some(Stage::Plan), |stage| stage.next())
+        .filter_map(|stage| {
+            let file = crate::pipeline_gate::read_gate_file(project_root, phase, stage)?;
+            let gate_id = GateId::parse(&file.gate_id).ok()?;
+            let AnswerRead::Bound(answer) =
+                Gates::read_answer(project_root, phase, stage, &gate_id)
+            else {
+                return None;
+            };
+            let by = answer
+                .response
+                .responded_by
+                .unwrap_or_else(|| "unknown".to_string());
+            let gate = OpenGate {
+                phase: file.phase,
+                stage: file.stage,
+                context: file.context,
+                timestamp: file.timestamp,
+                gate_id: file.gate_id,
+                not_before: file.not_before,
+            };
+            Some((gate, by))
+        })
+        .collect()
 }
 
 /// Pure render for `gate_show`'s output block — the FULL context via
@@ -5033,6 +5342,232 @@ pub(crate) fn history_cmd(project_root: &Path, phase: Option<PhaseId>) -> Result
         history::render_timeline(&history::attempt_timeline(project_root, phase))
     );
     Ok(())
+}
+
+/// `devflow ledger <phase>`: the phase's decided and escalated questions,
+/// as text or, with `json`, as the [`history::Ledger`] JSON.
+pub(crate) fn ledger_report(
+    project_root: &Path,
+    phase: PhaseId,
+    json: bool,
+) -> Result<String, CliError> {
+    let ledger = history::ledger(project_root, phase);
+    if !json {
+        return Ok(history::render_ledger(&ledger));
+    }
+    serde_json::to_string_pretty(&ledger)
+        .map_err(|error| CliError::Message(format!("could not render the ledger as JSON: {error}")))
+}
+
+/// Append a `question_overridden` event with `fields` through `events::try_emit`.
+fn record_override(
+    project_root: &Path,
+    phase: PhaseId,
+    fields: serde_json::Value,
+) -> std::io::Result<()> {
+    events::try_emit(project_root, phase, events::QUESTION_OVERRIDDEN, fields)
+}
+
+/// `devflow ledger override <phase> --question-id <id>`: replace the answer of
+/// one answered question of the phase's ledger (D-15, D-18). It is the
+/// operator's verb, recorded as one `question_overridden` event.
+pub(crate) fn ledger_override_report(
+    project_root: &Path,
+    phase: PhaseId,
+    question_id: &str,
+    choice: &QuestionChoice,
+) -> Result<String, CliError> {
+    ledger_override_report_by(
+        project_root,
+        phase,
+        question_id,
+        choice,
+        answerer(),
+        record_override,
+    )
+}
+
+/// [`ledger_override_report`] as `answerer`, the resolver's result, appending
+/// the override through `record`. Every refusal comes before the append, and
+/// an append that fails acknowledges nothing.
+fn ledger_override_report_by(
+    project_root: &Path,
+    phase: PhaseId,
+    question_id: &str,
+    choice: &QuestionChoice,
+    answerer: Result<String, CliError>,
+    record: impl FnOnce(&Path, PhaseId, serde_json::Value) -> std::io::Result<()>,
+) -> Result<String, CliError> {
+    let overridden_by = answerer?;
+    if overridden_by.starts_with("agent:") {
+        return Err(CliError::Message(format!(
+            "{ANSWERED_BY_ENV}={overridden_by:?} is refused: `ledger override` is the operator's \
+             verb (D-17, D-18): unset {ANSWERED_BY_ENV} to override as the operator; nothing was \
+             written"
+        )));
+    }
+    let ledger = history::ledger(project_root, phase);
+    let entry = ledger
+        .decided
+        .iter()
+        .chain(&ledger.escalated)
+        .find(|entry| entry.question_id == question_id)
+        .ok_or_else(|| {
+            CliError::Message(format!(
+                "phase {phase} has no question `{question_id}` in its ledger; nothing was \
+                 written. `devflow ledger {phase}` lists its questions"
+            ))
+        })?;
+    refuse_an_override_of_a_discarded_run(project_root, phase, entry)?;
+    let previous = overridable_answer(phase, entry)?;
+    refuse_an_unusable_override(phase, entry, choice)?;
+    let answer = serde_json::to_value(choice)
+        .map_err(|error| CliError::Message(format!("could not encode the override: {error}")))?;
+    if answer == previous {
+        return Err(CliError::Message(format!(
+            "{} is already the answer of question {question_id}; nothing was written",
+            choice_text(&answer)
+        )));
+    }
+    let override_id = devflow_core::question::new_question_id();
+    let fields = serde_json::json!({
+        "question_id": question_id,
+        "override_id": override_id,
+        "answer": answer,
+        "was": previous,
+        "overridden_by": overridden_by,
+        "run_started_at": entry.run_started_at,
+    });
+    record(project_root, phase, fields).map_err(|error| {
+        CliError::Message(format!(
+            "the override was not recorded: could not append to {} ({error}); nothing was \
+             acknowledged",
+            events::events_path(project_root).display()
+        ))
+    })?;
+    let current_run = workflow::load_state(project_root, phase)
+        .ok()
+        .map(|state| state.started_at);
+    let delivery = if entry.run_started_at.is_some() && entry.run_started_at == current_run {
+        "the next stage DevFlow launches for this run receives it in its prompt"
+    } else {
+        "it is recorded in the ledger and the corpus; no launch of that run remains to carry it"
+    };
+    Ok(format!(
+        "question {question_id} of phase {phase} overridden by {overridden_by}: {} (was {}); \
+         override {override_id}. {delivery}",
+        choice_text(&answer),
+        choice_text(&previous),
+    ))
+}
+
+/// Refuse an override of a question whose run `devflow discard` removed: its
+/// `run_started_at` is the `started_at` of a `run_discarded` event of the phase.
+/// An entry with no `run_started_at` cannot be matched and is not refused.
+fn refuse_an_override_of_a_discarded_run(
+    project_root: &Path,
+    phase: PhaseId,
+    entry: &history::LedgerEntry,
+) -> Result<(), CliError> {
+    let Some(started_at) = &entry.run_started_at else {
+        return Ok(());
+    };
+    let log = std::fs::read_to_string(events::events_path(project_root)).unwrap_or_default();
+    let discarded = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|event| {
+            event.get("v").and_then(|v| v.as_u64()) == Some(1)
+                && phase.matches_json(event.get("phase"))
+                && event.get("event").and_then(|kind| kind.as_str()) == Some(events::RUN_DISCARDED)
+                && event.get("started_at").and_then(|at| at.as_str()) == Some(started_at)
+        });
+    if !discarded {
+        return Ok(());
+    }
+    Err(CliError::Message(format!(
+        "question {} belongs to the run started at {started_at}, which `devflow discard` \
+         removed; nothing was written",
+        entry.question_id
+    )))
+}
+
+/// The answer an override of `entry` replaces: refused for a question still
+/// open (its gate takes the answer) and for one closed without an answer.
+fn overridable_answer(
+    phase: PhaseId,
+    entry: &history::LedgerEntry,
+) -> Result<serde_json::Value, CliError> {
+    let question_id = &entry.question_id;
+    if let Some(answer) = entry
+        .effective_answer
+        .clone()
+        .filter(|_| entry.answer.is_some())
+    {
+        return Ok(answer);
+    }
+    if let Some(reason) = &entry.closed {
+        return Err(CliError::Message(format!(
+            "question {question_id} was closed without an answer ({reason}), so there is no \
+             answer to override; nothing was written"
+        )));
+    }
+    let answer_with = match &entry.gate_id {
+        Some(gate_id) => format!("`devflow gate answer {phase} --gate-id {gate_id}`"),
+        None => format!("`devflow gate answer {phase}` (see `devflow gate list`)"),
+    };
+    Err(CliError::Message(format!(
+        "question {question_id} is still open, so there is no answer to override; nothing was \
+         written. Answer it with {answer_with}"
+    )))
+}
+
+/// Refuse an option `entry` did not offer, and an empty text answer.
+fn refuse_an_unusable_override(
+    phase: PhaseId,
+    entry: &history::LedgerEntry,
+    choice: &QuestionChoice,
+) -> Result<(), CliError> {
+    let question_id = &entry.question_id;
+    match choice {
+        QuestionChoice::Option { option_id } => {
+            let offered: Vec<&str> = entry
+                .options
+                .as_ref()
+                .and_then(|options| options.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|option| option.get("id").and_then(|id| id.as_str()))
+                .collect();
+            if offered.contains(&option_id.as_str()) {
+                return Ok(());
+            }
+            Err(CliError::Message(format!(
+                "`{option_id}` is not an option of phase {phase} question {question_id}; nothing \
+                 was written. The options offered: {}",
+                if offered.is_empty() {
+                    "(none)".into()
+                } else {
+                    offered.join(", ")
+                }
+            )))
+        }
+        QuestionChoice::Text { text } if text.is_empty() => Err(CliError::Message(format!(
+            "an empty `--text` cannot override question {question_id}; nothing was written"
+        ))),
+        QuestionChoice::Text { .. } => Ok(()),
+    }
+}
+
+/// An answer as the override reply shows it: `option <id>` or the quoted text.
+fn choice_text(answer: &serde_json::Value) -> String {
+    if let Some(option_id) = answer.get("option_id").and_then(|id| id.as_str()) {
+        return format!("option {option_id}");
+    }
+    if let Some(text) = answer.get("text").and_then(|text| text.as_str()) {
+        return format!("the text {text:?}");
+    }
+    answer.to_string()
 }
 
 /// Detect capture-file rollover for `logs --follow` (14-CR-03): a file
@@ -6751,6 +7286,393 @@ mod tests {
     use devflow_core::gates::WaiterRegistration;
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
 
+    /// A phase-54 log with one question triage decided and one it escalated
+    /// that the operator has not answered.
+    fn write_triaged_and_escalated_questions(root: &Path) {
+        let triage = |outcome: &str, reason: Option<&str>| {
+            let mut fields = serde_json::json!({
+                "outcome": outcome, "pre_check": 0.93, "top_option": "keep",
+                "top_probability": 0.91, "threshold": 0.85,
+                "pre_check_threshold": 0.8, "model": "jev-test",
+            });
+            if let Some(reason) = reason {
+                fields["reason"] = serde_json::json!(reason);
+            }
+            fields
+        };
+        let options = serde_json::json!([
+            {"id": "keep", "label": "Keep the cache"},
+            {"id": "drop", "label": "Drop the cache"},
+        ]);
+        let lines = [
+            serde_json::json!({
+                "v": 1, "ts": 10, "phase": 54, "event": "question_asked",
+                "stage": "code", "question_id": "q-decided", "kind": "decision",
+                "question": "Keep the cache?", "options": options,
+                "context": null, "recommended": "keep", "run_started_at": "100",
+                "triage": triage("decided", None),
+            }),
+            serde_json::json!({
+                "v": 1, "ts": 11, "phase": 54, "event": "question_answered",
+                "stage": "code", "question_id": "q-decided",
+                "answer": {"option_id": "keep"}, "policy": "triage",
+                "answered_by": "triage:jev",
+            }),
+            serde_json::json!({
+                "v": 1, "ts": 12, "phase": 54, "event": "question_asked",
+                "stage": "code", "question_id": "q-escalated", "gate_id": "g-2",
+                "kind": "decision", "question": "Drop the index?", "options": options,
+                "context": null, "recommended": null, "run_started_at": "100",
+                "triage": triage("escalated", Some("top_probability_below_threshold")),
+            }),
+        ];
+        let path = devflow_core::events::events_path(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn ledger_prints_decided_and_escalated_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+
+        let text = ledger_report(dir.path(), PhaseId::new(54), false).unwrap();
+        let (decided, escalated) = text
+            .split_once("Escalated (1)")
+            .unwrap_or_else(|| panic!("no `Escalated (1)` section in {text}"));
+        assert!(decided.contains("Decided (1)"), "{text}");
+        assert!(decided.contains("q-decided"), "{text}");
+        assert!(decided.contains("option keep"), "{text}");
+        assert!(decided.contains("triage:jev"), "{text}");
+        assert!(!decided.contains("q-escalated"), "{text}");
+        assert!(escalated.contains("q-escalated"), "{text}");
+        assert!(
+            escalated.contains("top_probability_below_threshold"),
+            "{text}"
+        );
+        assert!(escalated.contains("no answer yet"), "{text}");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&ledger_report(dir.path(), PhaseId::new(54), true).unwrap())
+                .unwrap_or_else(|error| panic!("ledger --json is not JSON: {error}"));
+        assert_eq!(json["decided"].as_array().map(Vec::len), Some(1), "{json}");
+        assert_eq!(
+            json["escalated"].as_array().map(Vec::len),
+            Some(1),
+            "{json}"
+        );
+    }
+
+    /// The phase-54 events in the fixture's log of kind `kind`, in log order.
+    fn logged_events_of(root: &Path, kind: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == kind)
+            .collect()
+    }
+
+    fn option(option_id: &str) -> QuestionChoice {
+        QuestionChoice::Option {
+            option_id: option_id.into(),
+        }
+    }
+
+    /// [`ledger_override_report_by`] as the operator `op`, recording through
+    /// `events::try_emit`.
+    fn override_as_op(
+        root: &Path,
+        question_id: &str,
+        choice: &QuestionChoice,
+    ) -> Result<String, CliError> {
+        ledger_override_report_by(
+            root,
+            PhaseId::new(54),
+            question_id,
+            choice,
+            Ok("op".into()),
+            record_override,
+        )
+    }
+
+    /// Criterion 3 / D-15: an override of a triage-decided question is one
+    /// `question_overridden` event, and the ledger lists it beside the
+    /// original answer.
+    #[test]
+    fn an_override_is_listed_beside_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+
+        let reply = override_as_op(dir.path(), "q-decided", &option("drop"))
+            .unwrap_or_else(|error| panic!("the override was refused: {error}"));
+        assert!(reply.contains("q-decided"), "{reply}");
+
+        let overrides = logged_events_of(dir.path(), events::QUESTION_OVERRIDDEN);
+        assert_eq!(overrides.len(), 1, "{overrides:?}");
+        let event = &overrides[0];
+        assert_eq!(event["question_id"], "q-decided", "{event}");
+        assert_eq!(
+            event["answer"],
+            serde_json::json!({"option_id": "drop"}),
+            "{event}"
+        );
+        assert_eq!(
+            event["was"],
+            serde_json::json!({"option_id": "keep"}),
+            "{event}"
+        );
+        assert_eq!(event["overridden_by"], "op", "{event}");
+        assert_eq!(event["run_started_at"], "100", "{event}");
+        assert!(
+            event["override_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{event}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&ledger_report(dir.path(), PhaseId::new(54), true).unwrap())
+                .unwrap();
+        let entry = &json["decided"][0];
+        assert_eq!(
+            entry["answer"],
+            serde_json::json!({"option_id": "keep"}),
+            "{json}"
+        );
+        assert_eq!(
+            entry["overrides"].as_array().map(Vec::len),
+            Some(1),
+            "{json}"
+        );
+        assert_eq!(
+            entry["effective_answer"],
+            serde_json::json!({"option_id": "drop"}),
+            "{json}"
+        );
+    }
+
+    /// Append `lines` to the fixture's event log.
+    fn append_events(root: &Path, lines: &[serde_json::Value]) {
+        use std::io::Write as _;
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(devflow_core::events::events_path(root))
+            .unwrap();
+        for line in lines {
+            writeln!(log, "{line}").unwrap();
+        }
+    }
+
+    fn log_bytes(root: &Path) -> Vec<u8> {
+        std::fs::read(devflow_core::events::events_path(root)).unwrap()
+    }
+
+    /// Run `refused` on a fresh fixture and assert it is refused with every
+    /// `expected` text and the log is byte-identical after it.
+    fn assert_refused_unwritten(
+        refused: impl FnOnce(&Path) -> Result<String, CliError>,
+        setup: impl FnOnce(&Path),
+        expected: &[&str],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        setup(dir.path());
+        let before = log_bytes(dir.path());
+        let error = refused(dir.path())
+            .expect_err("the override was accepted")
+            .to_string();
+        for text in expected {
+            assert!(error.contains(text), "`{text}` missing from: {error}");
+        }
+        assert!(error.contains("nothing was written"), "{error}");
+        assert_eq!(
+            log_bytes(dir.path()),
+            before,
+            "the refusal wrote to the log"
+        );
+    }
+
+    /// Criterion 3 control: an id the ledger does not hold is refused and the
+    /// log is unchanged. Control: a known id in the same fixture is accepted.
+    #[test]
+    fn an_override_of_an_unknown_question_changes_nothing() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "nope", &option("drop")),
+            |_| {},
+            &["no question", "devflow ledger 54"],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        override_as_op(dir.path(), "q-decided", &option("drop"))
+            .unwrap_or_else(|error| panic!("control: a known id was refused: {error}"));
+    }
+
+    /// D-18: an escalated question still open is answered through its gate.
+    #[test]
+    fn an_override_of_an_open_question_names_gate_answer() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "q-escalated", &option("drop")),
+            |_| {},
+            &["still open", "devflow gate answer 54 --gate-id g-2"],
+        );
+    }
+
+    /// D-18: a question closed without an answer has nothing to override.
+    #[test]
+    fn an_override_of_a_closed_question_is_refused() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "q-escalated", &option("drop")),
+            |root| {
+                append_events(
+                    root,
+                    &[serde_json::json!({
+                        "v": 1, "ts": 13, "phase": 54, "event": "question_closed",
+                        "stage": "code", "question_id": "q-escalated", "reason": "run_stopped",
+                    })],
+                )
+            },
+            &["closed without an answer", "run_stopped"],
+        );
+    }
+
+    #[test]
+    fn an_override_with_an_unoffered_option_is_refused() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "q-decided", &option("z")),
+            |_| {},
+            &["`z` is not an option", "keep, drop"],
+        );
+    }
+
+    #[test]
+    fn an_override_equal_to_the_answer_is_refused() {
+        assert_refused_unwritten(
+            |root| override_as_op(root, "q-decided", &option("keep")),
+            |_| {},
+            &["already the answer"],
+        );
+    }
+
+    #[test]
+    fn an_empty_override_text_is_refused() {
+        assert_refused_unwritten(
+            |root| {
+                override_as_op(
+                    root,
+                    "q-decided",
+                    &QuestionChoice::Text {
+                        text: String::new(),
+                    },
+                )
+            },
+            |_| {},
+            &["empty `--text`"],
+        );
+    }
+
+    /// Adjacency: a second override is accepted, both stay listed, and the
+    /// second is the effective answer, replacing the first.
+    #[test]
+    fn a_second_override_becomes_the_effective_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        override_as_op(dir.path(), "q-decided", &option("drop")).unwrap();
+        let second = QuestionChoice::Text {
+            text: "neither".into(),
+        };
+        override_as_op(dir.path(), "q-decided", &second)
+            .unwrap_or_else(|error| panic!("the second override was refused: {error}"));
+
+        let overrides = logged_events_of(dir.path(), events::QUESTION_OVERRIDDEN);
+        assert_eq!(overrides.len(), 2, "{overrides:?}");
+        assert_eq!(
+            overrides[1]["was"],
+            serde_json::json!({"option_id": "drop"})
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&ledger_report(dir.path(), PhaseId::new(54), true).unwrap())
+                .unwrap();
+        let entry = &json["decided"][0];
+        assert_eq!(
+            entry["overrides"].as_array().map(Vec::len),
+            Some(2),
+            "{json}"
+        );
+        assert_eq!(
+            entry["effective_answer"],
+            serde_json::json!({"text": "neither"}),
+            "{json}"
+        );
+    }
+
+    /// D-17 / D-18: an agent-marked caller cannot override. Control: an
+    /// unmarked call is the operator's and is recorded under the user name.
+    #[test]
+    fn an_agent_marked_override_is_refused() {
+        let by = |marker: Option<&str>| answerer_from(marker.map(Into::into), Some("op".into()));
+        assert_refused_unwritten(
+            |root| {
+                ledger_override_report_by(
+                    root,
+                    PhaseId::new(54),
+                    "q-decided",
+                    &option("drop"),
+                    by(Some("agent:claude")),
+                    record_override,
+                )
+            },
+            |_| {},
+            &["DEVFLOW_ANSWERED_BY", "operator"],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        ledger_override_report_by(
+            dir.path(),
+            PhaseId::new(54),
+            "q-decided",
+            &option("drop"),
+            by(None),
+            record_override,
+        )
+        .unwrap_or_else(|error| panic!("control: the operator's override was refused: {error}"));
+        let overrides = logged_events_of(dir.path(), events::QUESTION_OVERRIDDEN);
+        assert_eq!(overrides[0]["overridden_by"], "op", "{overrides:?}");
+    }
+
+    /// T-54-35: when the append fails the override is refused and nothing is
+    /// acknowledged. The log becomes a directory once the ledger was read.
+    /// Control: the same override on a writable log is acknowledged.
+    #[test]
+    fn an_override_that_cannot_be_recorded_acknowledges_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(dir.path());
+        let log = devflow_core::events::events_path(dir.path());
+        let error = ledger_override_report_by(
+            dir.path(),
+            PhaseId::new(54),
+            "q-decided",
+            &option("drop"),
+            Ok("op".into()),
+            |root, phase, fields| {
+                std::fs::remove_file(&log).unwrap();
+                std::fs::create_dir(&log).unwrap();
+                record_override(root, phase, fields)
+            },
+        )
+        .expect_err("an override the log could not take was acknowledged");
+        let error = error.to_string();
+        assert!(error.contains("the override was not recorded"), "{error}");
+        assert!(error.contains("nothing was acknowledged"), "{error}");
+
+        let control = tempfile::tempdir().unwrap();
+        write_triaged_and_escalated_questions(control.path());
+        let reply = override_as_op(control.path(), "q-decided", &option("drop"))
+            .unwrap_or_else(|error| panic!("control: the override was refused: {error}"));
+        assert!(reply.contains("overridden"), "{reply}");
+    }
+
     /// #285: outside a git work tree the ignore check says nothing, so no
     /// `could not check … exit status: 128` lines reach the operator.
     #[test]
@@ -8370,6 +9292,7 @@ mod tests {
                 None,
                 false,
                 FallbackSource::FlagOrConfig(None),
+                false,
             )
             .map_err(|err| err.to_string())
         };
@@ -9126,6 +10049,138 @@ mod tests {
             ),
             "the abort is written for the question gate's id"
         );
+        registration.finish();
+    }
+
+    /// #343: no shell verb may record an answer as triage's, and a refused
+    /// answerer writes no answer.
+    #[test]
+    fn the_cli_cannot_claim_triage() {
+        let refused = answerer_from(Some("triage:jev".into()), Some("op".into()))
+            .expect_err("a triage marker is refused")
+            .to_string();
+        assert!(refused.contains("only DevFlow's triage"), "{refused}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(54), Stage::Plan);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+        let err = gate_answer_report_by(
+            root,
+            phase,
+            Some(stage),
+            opened.gate_id.as_str(),
+            &QuestionChoice::Option {
+                option_id: "budget-30".into(),
+            },
+            answerer_from(Some("triage:jev".into()), Some("op".into())),
+        )
+        .expect_err("an answer given as triage is refused")
+        .to_string();
+
+        assert!(err.contains("only DevFlow's triage"), "{err}");
+        assert_eq!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::None
+        );
+        registration.finish();
+    }
+
+    #[test]
+    fn an_empty_answerer_marker_is_refused() {
+        let err = answerer_from(Some("".into()), Some("op".into()))
+            .expect_err("an empty marker is refused")
+            .to_string();
+        assert!(err.contains("DEVFLOW_ANSWERED_BY"), "{err}");
+        assert!(err.contains("agent:<name>"), "{err}");
+    }
+
+    #[test]
+    fn an_agent_marker_must_name_the_agent() {
+        for refused in ["agent:", "agent:Claude"] {
+            let err = answerer_from(Some(refused.into()), Some("op".into()))
+                .expect_err("a malformed agent marker is refused")
+                .to_string();
+            assert!(err.contains("agent:<name>"), "{refused:?}: {err}");
+        }
+        assert_eq!(
+            answerer_from(Some("agent:claude-2".into()), Some("op".into())).unwrap(),
+            "agent:claude-2"
+        );
+    }
+
+    /// #343: `gate show` names who answered a gate whose answer is written
+    /// but not yet claimed, which `Gates::list_open` hides.
+    #[test]
+    fn gate_show_names_who_answered_an_unclaimed_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(54), Stage::Plan);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+        let unanswered = gate_show_report(root, phase, Some(stage)).unwrap();
+        assert!(!unanswered.contains("answered by"), "{unanswered}");
+
+        gate_answer_report_by(
+            root,
+            phase,
+            Some(stage),
+            opened.gate_id.as_str(),
+            &QuestionChoice::Option {
+                option_id: "budget-30".into(),
+            },
+            Ok("agent:claude".into()),
+        )
+        .unwrap();
+
+        for given in [Some(stage), None] {
+            let shown = gate_show_report(root, phase, given).unwrap();
+            assert!(
+                shown
+                    .lines()
+                    .any(|line| line.contains("answered by agent:claude")),
+                "{given:?}: {shown}"
+            );
+        }
+        registration.finish();
+
+        let empty = tempfile::tempdir().unwrap();
+        let err = gate_show_report(empty.path(), phase, None)
+            .expect_err("a phase with no gate is refused")
+            .to_string();
+        assert!(err.contains("no open gate for phase 54"), "{err}");
+    }
+
+    /// #343: the stage-gate verbs record the resolved answerer too.
+    #[test]
+    fn an_agent_marked_approval_records_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(54), Stage::Plan);
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
+
+        gate_respond_report_by(
+            root,
+            phase,
+            Some(stage),
+            GateAnswerKind::Approve,
+            None,
+            Some(opened.gate_id.to_string()),
+            answerer_from(Some("agent:pi".into()), Some("op".into())),
+        )
+        .unwrap();
+
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &opened.gate_id)
+        else {
+            panic!("the approval is written for the gate's id");
+        };
+        assert_eq!(answer.response.responded_by.as_deref(), Some("agent:pi"));
         registration.finish();
     }
 
@@ -14250,6 +15305,7 @@ mod tests {
             None,
             false,
             FallbackSource::FlagOrConfig(None),
+            false,
         )
         .map_err(|err| err.to_string())
     }
@@ -14286,6 +15342,7 @@ mod tests {
             None,
             false,
             FallbackSource::FlagOrConfig(fallback),
+            false,
         )
     }
 
@@ -15309,6 +16366,7 @@ mod tests {
             None,
             false,
             FallbackSource::FlagOrConfig(None),
+            false,
         )
         .map_err(|err| err.to_string())
     }
@@ -16407,5 +17465,101 @@ mod tests {
             return;
         }
         assert_eq!(local_utc_offset_secs(TZ_TEST_INSTANT), Some(-18_000));
+    }
+
+    /// A run state for the triage line, started at `started_at`.
+    fn triage_state(started_at: &str) -> State {
+        let mut state = State::new(
+            PhaseId::from(54),
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/nonexistent"),
+        );
+        state.started_at = started_at.to_string();
+        state
+    }
+
+    /// A `triage_fallback` line for phase 54 and the run `run_started_at`,
+    /// all at the same `ts` second.
+    fn fallback_event(run_started_at: &str, reason: &str, detail: &str) -> String {
+        serde_json::json!({
+            "v": 1, "ts": 1_700_000_000u64, "phase": 54, "event": events::TRIAGE_FALLBACK,
+            "question_id": "q-1", "run_started_at": run_started_at,
+            "reason": reason, "detail": detail,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn status_says_triage_fell_back() {
+        let state = triage_state("1700000000");
+        let config = TriageConfig::with_thresholds(Some(0.5), Some(0.5));
+        let log = [
+            fallback_event("1699999999", "timeout", "earlier run"),
+            fallback_event("1700000000", "unreachable", "connection refused"),
+        ]
+        .join("\n");
+        let tallies = fallback_tallies_from(&log);
+        let key = (state.phase, state.started_at.clone());
+        let line =
+            triage_line(&state, Some(&config), tallies.get(&key), None).expect("a triage line");
+        assert!(line.starts_with("  triage:"), "{line}");
+        assert!(line.contains("fell back"), "{line}");
+        assert!(line.contains("unreachable"), "{line}");
+        assert!(
+            line.contains(" 1 time(s) "),
+            "the earlier run's fallback is not counted: {line}"
+        );
+        assert!(!line.contains("earlier run"), "{line}");
+
+        let quiet = triage_line(&state, Some(&config), None, None).expect("a triage line");
+        assert!(!quiet.contains("fell back"), "{quiet}");
+        let only_earlier = fallback_tallies_from(&fallback_event("1699999999", "timeout", "x"));
+        assert!(!only_earlier.contains_key(&key), "{only_earlier:?}");
+    }
+
+    #[test]
+    fn status_shows_triage_on_with_its_thresholds() {
+        let state = triage_state("1");
+        let config = TriageConfig::with_thresholds(Some(0.9), Some(0.7));
+        assert_eq!(
+            triage_line(&state, Some(&config), None, None).as_deref(),
+            Some("  triage: on (threshold 0.9, pre-check 0.7, model jev-1.14.0)")
+        );
+    }
+
+    #[test]
+    fn status_shows_triage_off() {
+        let mut state = triage_state("1");
+        let enabled = TriageConfig::with_thresholds(Some(0.9), Some(0.7));
+        assert_eq!(triage_line(&state, None, None, None), None);
+        let off =
+            triage_line(&state, Some(&TriageConfig::default()), None, None).expect("a triage line");
+        assert!(off.contains("enabled = false in devflow.toml"), "{off}");
+        let on = triage_line(&state, Some(&enabled), None, None).expect("a triage line");
+        assert!(!on.contains("off"), "{on}");
+        state.triage_off = true;
+        let for_run = triage_line(&state, Some(&enabled), None, None).expect("a triage line");
+        assert!(for_run.contains("off for this run"), "{for_run}");
+    }
+
+    #[test]
+    fn status_shows_escalate_all() {
+        let state = triage_state("1");
+        let config = TriageConfig::with_thresholds(None, None);
+        let line = triage_line(&state, Some(&config), None, None).expect("a triage line");
+        assert!(line.contains("escalating every question"), "{line}");
+    }
+
+    #[test]
+    fn status_names_a_non_default_endpoint() {
+        let state = triage_state("1");
+        let config = TriageConfig::with_thresholds(Some(0.9), Some(0.7));
+        let local = triage_line(&state, Some(&config), None, Some("http://127.0.0.1:9"))
+            .expect("a triage line");
+        assert!(local.contains("via 127.0.0.1"), "{local}");
+        let typesafe = triage_line(&state, Some(&config), None, Some("https://api.typesafe.ai"))
+            .expect("a triage line");
+        assert!(!typesafe.contains("via"), "{typesafe}");
     }
 }

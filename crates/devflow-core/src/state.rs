@@ -321,6 +321,13 @@ pub struct State {
     /// identically.
     #[serde(default)]
     pub rate_limit_auto_relaunch_used: bool,
+    /// Whether decision triage is turned off for this run (Phase 54).
+    ///
+    /// `false` means EITHER "triage was not turned off for this run" OR "the
+    /// state was written by a binary predating this field" — both behave
+    /// identically.
+    #[serde(default)]
+    pub triage_off: bool,
     /// The fix type of the Code pass in flight (Phase 51 D-09).
     ///
     /// Set by a loop-back to Code in the same write that enters Code, and
@@ -503,6 +510,7 @@ impl State {
             fallback_agent: None,
             fallback_consumed: false,
             rate_limit_auto_relaunch_used: false,
+            triage_off: false,
             code_fix: None,
             code_fix_note: None,
             code_fix_report: None,
@@ -1431,5 +1439,25 @@ mod tests {
             crate::agents::driver_for(AgentKind::Hermes).name(),
             "Hermes"
         );
+    }
+
+    /// A state written before `triage_off` existed loads with triage on.
+    #[test]
+    fn a_state_without_triage_off_loads_as_on() {
+        let predating = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(predating).unwrap();
+        assert!(!loaded.triage_off);
+        let mut off = loaded;
+        off.triage_off = true;
+        let json = serde_json::to_string(&off).unwrap();
+        let reloaded: State = serde_json::from_str(&json).unwrap();
+        assert!(reloaded.triage_off, "a set flag survives a save: {json}");
     }
 }

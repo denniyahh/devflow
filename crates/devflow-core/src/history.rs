@@ -1,7 +1,9 @@
 //! Read-only per-phase attempt history assembled from existing DevFlow stores.
 
 use crate::phase_id::PhaseId;
+use crate::question::{AnswererKind, QuestionChoice, answerer_kind};
 use crate::{agent_result, events, gates};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -26,21 +28,7 @@ pub struct AttemptTimeline {
 /// Correlate schema-v1 events, retained capture generations, and review
 /// artifacts without creating a second history store.
 pub fn attempt_timeline(project_root: &Path, phase: PhaseId) -> AttemptTimeline {
-    let mut indexed_events = std::fs::read_to_string(events::events_path(project_root))
-        .unwrap_or_default()
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let event = serde_json::from_str::<serde_json::Value>(line).ok()?;
-            (event.get("v").and_then(|v| v.as_u64()) == Some(1)
-                && phase.matches_json(event.get("phase")))
-            .then(|| {
-                let timestamp = event.get("ts").and_then(|ts| ts.as_u64()).unwrap_or(0);
-                (timestamp, index, event)
-            })
-        })
-        .collect::<Vec<_>>();
-    indexed_events.sort_by_key(|(timestamp, index, _)| (*timestamp, *index));
+    let indexed_events = phase_events(project_root, phase);
 
     let mut entries = indexed_events
         .into_iter()
@@ -87,6 +75,27 @@ pub fn attempt_timeline(project_root: &Path, phase: PhaseId) -> AttemptTimeline 
     entries.sort_by_key(|entry| entry.timestamp);
 
     AttemptTimeline { phase, entries }
+}
+
+/// The phase's schema-v1 events from `.devflow/events.jsonl` with their
+/// line index, in `(ts, line index)` order.
+fn phase_events(project_root: &Path, phase: PhaseId) -> Vec<(u64, usize, serde_json::Value)> {
+    let mut indexed_events = std::fs::read_to_string(events::events_path(project_root))
+        .unwrap_or_default()
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let event = serde_json::from_str::<serde_json::Value>(line).ok()?;
+            (event.get("v").and_then(|v| v.as_u64()) == Some(1)
+                && phase.matches_json(event.get("phase")))
+            .then(|| {
+                let timestamp = event.get("ts").and_then(|ts| ts.as_u64()).unwrap_or(0);
+                (timestamp, index, event)
+            })
+        })
+        .collect::<Vec<_>>();
+    indexed_events.sort_by_key(|(timestamp, index, _)| (*timestamp, *index));
+    indexed_events
 }
 
 /// Human-readable history output; event summaries deliberately reuse the
@@ -139,8 +148,8 @@ fn resolved_question_ids(timeline: &AttemptTimeline) -> HashSet<&str> {
         .collect()
 }
 
-/// The indented sub-lines for a question event (D-16); empty for any other
-/// event. Only the first answer or close recorded for a `question_id` is
+/// The indented sub-lines for a question, override, triage fallback,
+/// override delivery or run discard event (D-16); empty for any other event. Only the first answer or close recorded for a `question_id` is
 /// applied; a later one is shown as ignored.
 fn question_rows<'a>(
     event: &'a serde_json::Value,
@@ -153,6 +162,9 @@ fn question_rows<'a>(
         Some(events::QUESTION_ASKED) => {
             let mut rows = format!("  question {id}: {}\n", text_field(event, "question"));
             rows.push_str(&format!("  options: {}\n", options_line(event)));
+            if let Some(triage) = event.get("triage").filter(|triage| triage.is_object()) {
+                rows.push_str(&format!("  {}\n", triage_line(triage)));
+            }
             if event.get("recommended").is_none() {
                 rows.push_str(&format!("  recommended: {MISSING_FIELD}\n"));
             }
@@ -174,6 +186,31 @@ fn question_rows<'a>(
         ),
         Some(events::QUESTION_CLOSED) => {
             format!("  closed {id}: {}\n", text_field(event, "reason"))
+        }
+        Some(events::QUESTION_OVERRIDDEN) => format!(
+            "  override {id}: {} (was {}) by {}\n",
+            answer_text(event),
+            event
+                .get("was")
+                .map_or(MISSING_FIELD.into(), answer_value_text),
+            text_field(event, "overridden_by")
+        ),
+        Some(events::TRIAGE_FALLBACK) => {
+            format!(
+                "  triage fell back for {id}: {}\n",
+                text_field(event, "reason")
+            )
+        }
+        Some(events::OVERRIDES_DELIVERED) => {
+            let count = event.get("override_ids").and_then(|ids| ids.as_array());
+            let count = count.map_or(MISSING_FIELD.into(), |ids| ids.len().to_string());
+            format!("  overrides delivered to the launch: {count}\n")
+        }
+        Some(events::RUN_DISCARDED) => {
+            format!(
+                "  run discarded: started at {}\n",
+                text_field(event, "started_at")
+            )
         }
         _ => String::new(),
     }
@@ -227,6 +264,463 @@ fn text_field(value: &serde_json::Value, key: &str) -> String {
         None => return MISSING_FIELD.into(),
     };
     gates::render_gate_context(&raw, usize::MAX)
+}
+
+/// The decision ledger of one phase (D-14): a fold over the event log, with
+/// no store of its own. Questions triage decided are in `decided`; every
+/// other question, answered by the operator or not, is in `escalated`.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct Ledger {
+    pub phase: PhaseId,
+    pub decided: Vec<LedgerEntry>,
+    pub escalated: Vec<LedgerEntry>,
+}
+
+/// One question in a [`Ledger`]. An optional field the log did not record
+/// is absent from the JSON, never empty: an escalated question the operator
+/// has not answered has no `answer` key.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct LedgerEntry {
+    pub question_id: String,
+    /// `ts` of the `question_asked` event.
+    pub asked_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// The options array as recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Absent for a question triage decided: no gate was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_started_at: Option<String>,
+    /// The `triage` object of the question: scores and thresholds in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triage: Option<serde_json::Value>,
+    /// Why the question went to the operator; absent for a decided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<LedgerFallback>,
+    /// The first recorded answer; absent until one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// The close reason when the question ended without an answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
+    /// Operator overrides of the answer, in log order.
+    pub overrides: Vec<LedgerOverride>,
+    /// The last override's answer, else `answer`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_answer: Option<serde_json::Value>,
+}
+
+/// An operator's replacement of a triage answer, in log order.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct LedgerOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_id: Option<String>,
+    pub answer: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub was: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overridden_by: Option<String>,
+    /// `ts` of the `question_overridden` event.
+    pub at: u64,
+}
+
+/// Why triage could not score a question, from its `triage_fallback` event.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct LedgerFallback {
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// The `reason` of a question that was not triaged at all.
+const NOT_TRIAGED: &str = "not_triaged";
+
+/// Fold the phase's question events from `.devflow/events.jsonl` into its
+/// ledger. Only the first answer or close of a question applies, as in
+/// `devflow history`; overrides apply in log order. The last `question_asked`
+/// of a question sets its triage outcome and gate; it keeps the first one's
+/// place.
+pub fn ledger(project_root: &Path, phase: PhaseId) -> Ledger {
+    let events = phase_events(project_root, phase);
+    let mut entries: Vec<LedgerEntry> = Vec::new();
+    let mut positions: std::collections::HashMap<String, usize> = Default::default();
+    for (timestamp, _, event) in &events {
+        if event_kind(event) != Some(events::QUESTION_ASKED) {
+            continue;
+        }
+        let Some(id) = string_field(event, "question_id") else {
+            continue;
+        };
+        // A later ask of the same question (an escalation of a decision whose
+        // answer could not be recorded) replaces it in the first one's place.
+        if let Some(&index) = positions.get(&id) {
+            let first_asked_at = entries[index].asked_at;
+            entries[index] = asked_entry(id, first_asked_at, event);
+            continue;
+        }
+        positions.insert(id.clone(), entries.len());
+        entries.push(asked_entry(id, *timestamp, event));
+    }
+
+    let mut resolved = HashSet::new();
+    for (timestamp, _, event) in &events {
+        let Some(&index) = event
+            .get("question_id")
+            .and_then(|id| id.as_str())
+            .and_then(|id| positions.get(id))
+        else {
+            continue;
+        };
+        apply_event(&mut entries[index], *timestamp, event, &mut resolved, index);
+    }
+
+    let (mut decided, mut escalated) = (Vec::new(), Vec::new());
+    for mut entry in entries {
+        entry.effective_answer = entry
+            .overrides
+            .last()
+            .map(|last| last.answer.clone())
+            .or_else(|| entry.answer.clone());
+        entry.reason = escalation_reason(entry.triage.as_ref());
+        if entry.reason.is_none() {
+            decided.push(entry);
+        } else {
+            escalated.push(entry);
+        }
+    }
+    Ledger {
+        phase,
+        decided,
+        escalated,
+    }
+}
+
+/// A ledger entry from a `question_asked` event, with no answer yet.
+fn asked_entry(question_id: String, asked_at: u64, event: &serde_json::Value) -> LedgerEntry {
+    LedgerEntry {
+        question_id,
+        asked_at,
+        stage: string_field(event, "stage"),
+        kind: string_field(event, "kind"),
+        question: string_field(event, "question"),
+        options: event.get("options").cloned(),
+        recommended: string_field(event, "recommended"),
+        context: string_field(event, "context"),
+        gate_id: string_field(event, "gate_id"),
+        run_started_at: string_field(event, "run_started_at"),
+        triage: event.get("triage").filter(|t| t.is_object()).cloned(),
+        reason: None,
+        fallback: None,
+        answer: None,
+        answered_by: None,
+        policy: None,
+        closed: None,
+        overrides: Vec::new(),
+        effective_answer: None,
+    }
+}
+
+/// Apply an answer, close, override or triage fallback to its entry.
+fn apply_event(
+    entry: &mut LedgerEntry,
+    timestamp: u64,
+    event: &serde_json::Value,
+    resolved: &mut HashSet<usize>,
+    index: usize,
+) {
+    match event_kind(event) {
+        Some(events::QUESTION_ANSWERED) if resolved.insert(index) => {
+            entry.answer = Some(event.get("answer").cloned().unwrap_or_default());
+            entry.answered_by = string_field(event, "answered_by");
+            entry.policy = string_field(event, "policy");
+        }
+        Some(events::QUESTION_CLOSED) if resolved.insert(index) => {
+            entry.closed = Some(string_field(event, "reason").unwrap_or(MISSING_FIELD.into()));
+        }
+        Some(events::QUESTION_OVERRIDDEN) => entry.overrides.push(LedgerOverride {
+            override_id: string_field(event, "override_id"),
+            answer: event.get("answer").cloned().unwrap_or_default(),
+            was: event.get("was").cloned(),
+            overridden_by: string_field(event, "overridden_by"),
+            at: timestamp,
+        }),
+        Some(events::TRIAGE_FALLBACK) => {
+            entry.fallback = Some(LedgerFallback {
+                reason: string_field(event, "reason").unwrap_or(MISSING_FIELD.into()),
+                detail: string_field(event, "detail"),
+            });
+        }
+        _ => {}
+    }
+}
+
+/// `None` for a question triage decided; otherwise why it was escalated.
+fn escalation_reason(triage: Option<&serde_json::Value>) -> Option<String> {
+    let Some(triage) = triage else {
+        return Some(NOT_TRIAGED.into());
+    };
+    let outcome = triage.get("outcome").and_then(|outcome| outcome.as_str());
+    if outcome == Some("decided") {
+        return None;
+    }
+    let reason = triage.get("reason").and_then(|reason| reason.as_str());
+    Some(reason.or(outcome).unwrap_or(MISSING_FIELD).into())
+}
+
+fn event_kind(event: &serde_json::Value) -> Option<&str> {
+    event.get("event").and_then(|kind| kind.as_str())
+}
+
+fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|v| v.as_str()).map(String::from)
+}
+
+/// One question the operator overrode that no launched agent has been given
+/// yet (D-17), merged across its pending overrides: `now` is the latest
+/// answer, `was` the answer the first of them replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingOverride {
+    pub question_id: String,
+    /// The text of the question's last `question_asked`, when one is logged.
+    pub question: Option<String>,
+    pub now: QuestionChoice,
+    pub was: Option<QuestionChoice>,
+    /// Every merged override's `override_id`, in log line order.
+    pub override_ids: Vec<String>,
+}
+
+/// The operator's overrides in `run_started_at`'s run of `phase` that no
+/// `overrides_delivered` line of that run names, one per question in the order
+/// of each question's first pending override, by events.jsonl line order.
+/// Delivery is matched by `override_id`, never by `ts`. An override whose
+/// `overridden_by` is not an operator, or that lacks an `override_id` or a
+/// readable `answer`, is not pending: it cannot be truthfully delivered.
+pub fn pending_overrides(
+    project_root: &Path,
+    phase: PhaseId,
+    run_started_at: &str,
+) -> Vec<PendingOverride> {
+    let mut events = phase_events(project_root, phase);
+    events.sort_by_key(|(_, line, _)| *line);
+    let in_run = |event: &serde_json::Value| {
+        string_field(event, "run_started_at").as_deref() == Some(run_started_at)
+    };
+    let delivered: HashSet<String> = events
+        .iter()
+        .filter(|(_, _, event)| {
+            event_kind(event) == Some(events::OVERRIDES_DELIVERED) && in_run(event)
+        })
+        .filter_map(|(_, _, event)| event.get("override_ids")?.as_array().cloned())
+        .flatten()
+        .filter_map(|id| id.as_str().map(String::from))
+        .collect();
+    let mut pending: Vec<PendingOverride> = Vec::new();
+    for (_, _, event) in &events {
+        if event_kind(event) != Some(events::QUESTION_OVERRIDDEN) || !in_run(event) {
+            continue;
+        }
+        let by_operator = string_field(event, "overridden_by")
+            .is_some_and(|by| answerer_kind(&by) == AnswererKind::Operator);
+        let (Some(question_id), Some(override_id), Some(now)) = (
+            string_field(event, "question_id"),
+            string_field(event, "override_id"),
+            choice_field(event, "answer"),
+        ) else {
+            continue;
+        };
+        if !by_operator || delivered.contains(&override_id) {
+            continue;
+        }
+        match pending.iter_mut().find(|p| p.question_id == question_id) {
+            Some(merged) => {
+                merged.now = now;
+                merged.override_ids.push(override_id);
+            }
+            None => pending.push(PendingOverride {
+                question: asked_question_text(&events, &question_id),
+                question_id,
+                now,
+                was: choice_field(event, "was"),
+                override_ids: vec![override_id],
+            }),
+        }
+    }
+    pending
+}
+
+/// The text of the last `question_asked` of `question_id`.
+fn asked_question_text(
+    events: &[(u64, usize, serde_json::Value)],
+    question_id: &str,
+) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .map(|(_, _, event)| event)
+        .filter(|event| event_kind(event) == Some(events::QUESTION_ASKED))
+        .find(|event| string_field(event, "question_id").as_deref() == Some(question_id))
+        .and_then(|event| string_field(event, "question"))
+}
+
+fn choice_field(event: &serde_json::Value, key: &str) -> Option<QuestionChoice> {
+    serde_json::from_value(event.get(key)?.clone()).ok()
+}
+
+/// The ledger as text: a `Decided (N)` section, then `Escalated (N)`.
+pub fn render_ledger(ledger: &Ledger) -> String {
+    let mut rendered = format!("decision ledger for phase {}\n", ledger.phase);
+    for (heading, entries) in [
+        ("Decided", &ledger.decided),
+        ("Escalated", &ledger.escalated),
+    ] {
+        rendered.push_str(&format!("{heading} ({})\n", entries.len()));
+        if entries.is_empty() {
+            rendered.push_str("  none\n");
+        }
+        for entry in entries {
+            rendered.push_str(&ledger_entry_block(entry));
+        }
+    }
+    rendered.trim_end().to_string()
+}
+
+/// Optional text as terminal-safe text, an absent value as [`MISSING_FIELD`].
+fn safe_text(text: Option<&str>) -> String {
+    text.map_or(MISSING_FIELD.into(), |text| {
+        gates::render_gate_context(text, usize::MAX)
+    })
+}
+
+/// One entry: header, options, triage, answer and overrides.
+fn ledger_entry_block(entry: &LedgerEntry) -> String {
+    let gate = entry
+        .gate_id
+        .as_deref()
+        .map(|gate| format!(", gate {}", safe_text(Some(gate))))
+        .unwrap_or_default();
+    let mut block = format!(
+        "  {} ({}, {}{gate}): {}\n",
+        gates::render_gate_context(&entry.question_id, usize::MAX),
+        safe_text(entry.stage.as_deref()),
+        safe_text(entry.kind.as_deref()),
+        safe_text(entry.question.as_deref())
+    );
+    let options = serde_json::json!({"options": entry.options, "recommended": entry.recommended});
+    block.push_str(&format!("    options: {}\n", options_line(&options)));
+    if let Some(reason) = &entry.reason {
+        block.push_str(&format!("    reason: {}\n", safe_text(Some(reason))));
+    }
+    if let Some(triage) = &entry.triage {
+        block.push_str(&format!("    {}\n", triage_line(triage)));
+    }
+    if let Some(fallback) = &entry.fallback {
+        block.push_str(&format!(
+            "    fallback: {} {}\n",
+            safe_text(Some(&fallback.reason)),
+            safe_text(fallback.detail.as_deref())
+        ));
+    }
+    block.push_str(&format!("    {}\n", ledger_answer_line(entry)));
+    for change in &entry.overrides {
+        block.push_str(&format!(
+            "    override {}: {} (was {}) by {} at {}\n",
+            safe_text(change.override_id.as_deref()),
+            answer_value_text(&change.answer),
+            change
+                .was
+                .as_ref()
+                .map_or(MISSING_FIELD.into(), answer_value_text),
+            safe_text(change.overridden_by.as_deref()),
+            change.at
+        ));
+    }
+    if let (false, Some(effective)) = (entry.overrides.is_empty(), &entry.effective_answer) {
+        block.push_str(&format!(
+            "    effective answer: {}\n",
+            answer_value_text(effective)
+        ));
+    }
+    block
+}
+
+/// `answer: ...` for an answered, closed or still open question.
+fn ledger_answer_line(entry: &LedgerEntry) -> String {
+    match (&entry.answer, &entry.closed) {
+        (Some(answer), _) => format!(
+            "answer: {} by {} via {}",
+            answer_value_text(answer),
+            safe_text(entry.answered_by.as_deref()),
+            safe_text(entry.policy.as_deref())
+        ),
+        (None, Some(reason)) => format!("answer: none, closed ({})", safe_text(Some(reason))),
+        (None, None) => "answer: no answer yet — answer it with devflow gate answer".into(),
+    }
+}
+
+/// [`answer_text`] for a bare answer value.
+fn answer_value_text(answer: &serde_json::Value) -> String {
+    answer_text(&serde_json::json!({ "answer": answer }))
+}
+
+/// `triage: <outcome>, pre-check .., top probability .., model ..`.
+fn triage_line(triage: &serde_json::Value) -> String {
+    let outcome = text_field(triage, "outcome");
+    let head = if outcome == "decided" {
+        format!("decided {}", text_field(triage, "top_option"))
+    } else if triage.get("reason").is_some() {
+        format!("{outcome} {}", text_field(triage, "reason"))
+    } else {
+        outcome
+    };
+    let pre_check = match triage.get("pre_check") {
+        Some(_) => format!(
+            "pre-check {} (threshold {})",
+            text_field(triage, "pre_check"),
+            text_field(triage, "pre_check_threshold")
+        ),
+        None => format!(
+            "pre-check threshold {}",
+            text_field(triage, "pre_check_threshold")
+        ),
+    };
+    let top = match triage.get("top_probability") {
+        Some(_) => format!(
+            "top probability {} for {} (threshold {})",
+            text_field(triage, "top_probability"),
+            text_field(triage, "top_option"),
+            text_field(triage, "threshold")
+        ),
+        None => format!(
+            "top probability threshold {}",
+            text_field(triage, "threshold")
+        ),
+    };
+    format!(
+        "triage: {head}, {pre_check}, {top}, model {}",
+        text_field(triage, "model")
+    )
 }
 
 struct CaptureGeneration {
@@ -430,6 +924,251 @@ mod tests {
         })
     }
 
+    /// `asked` with a `triage` object of this outcome; a decided question
+    /// has no gate.
+    fn triaged(
+        ts: u64,
+        question_id: &str,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> serde_json::Value {
+        let mut event = asked(ts, question_id, "Keep the cache?");
+        let mut triage = serde_json::json!({
+            "outcome": outcome, "pre_check": 0.93, "top_option": "keep",
+            "top_probability": 0.91, "threshold": 0.85,
+            "pre_check_threshold": 0.8, "model": "jev-test",
+        });
+        if let Some(reason) = reason {
+            triage["reason"] = serde_json::json!(reason);
+        }
+        event["triage"] = triage;
+        if outcome == "decided" {
+            event.as_object_mut().unwrap().remove("gate_id");
+        }
+        event
+    }
+
+    fn triage_answered(ts: u64, question_id: &str) -> serde_json::Value {
+        let mut event = answered(ts, question_id, serde_json::json!({"option_id": "keep"}));
+        event["policy"] = serde_json::json!(events::ANSWERING_POLICY_TRIAGE);
+        event["answered_by"] = serde_json::json!("triage:jev");
+        event.as_object_mut().unwrap().remove("gate_id");
+        event
+    }
+
+    fn overridden(ts: u64, question_id: &str, answer: &str, was: &str) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": ts, "phase": 53, "event": events::QUESTION_OVERRIDDEN,
+            "question_id": question_id, "override_id": format!("o-{ts}"),
+            "answer": {"option_id": answer}, "was": {"option_id": was},
+            "overridden_by": "operator", "run_started_at": "100",
+        })
+    }
+
+    /// The ledger of phase 53 from these event lines, in order.
+    fn ledger_of(events: &[serde_json::Value]) -> Ledger {
+        let dir = tempfile::tempdir().unwrap();
+        let path = events::events_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lines: String = events.iter().map(|event| format!("{event}\n")).collect();
+        std::fs::write(path, lines).unwrap();
+        ledger(dir.path(), PhaseId::new(53))
+    }
+
+    fn ids(entries: &[LedgerEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|entry| entry.question_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_escalated_entry_has_no_answer_field() {
+        let mut events = vec![
+            triaged(10, "q-decided", "decided", None),
+            triage_answered(11, "q-decided"),
+            triaged(
+                12,
+                "q-escalated",
+                "escalated",
+                Some("top_probability_below_threshold"),
+            ),
+        ];
+        let json = serde_json::to_value(ledger_of(&events)).unwrap();
+        assert!(json["escalated"][0].get("answer").is_none(), "{json}");
+        assert!(json["decided"][0].get("answer").is_some(), "{json}");
+
+        events.push(answered(
+            13,
+            "q-escalated",
+            serde_json::json!({"option_id": "drop"}),
+        ));
+        let json = serde_json::to_value(ledger_of(&events)).unwrap();
+        assert_eq!(
+            json["escalated"][0].get("answer"),
+            Some(&serde_json::json!({"option_id": "drop"})),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn an_empty_phase_lists_two_empty_sections() {
+        let ledger = ledger_of(&[]);
+        assert!(ledger.decided.is_empty() && ledger.escalated.is_empty());
+
+        let rendered = render_ledger(&ledger);
+        assert!(rendered.contains("Decided (0)\n  none\n"), "{rendered}");
+        assert!(rendered.ends_with("Escalated (0)\n  none"), "{rendered}");
+        let json = serde_json::to_value(&ledger).unwrap();
+        assert_eq!(json["decided"], serde_json::json!([]), "{json}");
+        assert_eq!(json["escalated"], serde_json::json!([]), "{json}");
+    }
+
+    #[test]
+    fn entries_keep_log_order_within_one_second() {
+        let ledger = ledger_of(&[
+            asked(10, "q-b", "Second id, first line?"),
+            asked(10, "q-a", "First id, second line?"),
+        ]);
+        assert_eq!(ids(&ledger.escalated), ["q-b", "q-a"]);
+    }
+
+    #[test]
+    fn overrides_are_listed_in_order_and_the_last_wins() {
+        let ledger = ledger_of(&[
+            triaged(10, "q-1", "decided", None),
+            triage_answered(11, "q-1"),
+            overridden(12, "q-1", "drop", "keep"),
+            overridden(13, "q-1", "keep", "drop"),
+        ]);
+        let entry = &ledger.decided[0];
+        let answers: Vec<_> = entry.overrides.iter().map(|o| o.answer.clone()).collect();
+        assert_eq!(
+            answers,
+            [
+                serde_json::json!({"option_id": "drop"}),
+                serde_json::json!({"option_id": "keep"})
+            ]
+        );
+        assert_eq!(
+            entry.effective_answer,
+            Some(serde_json::json!({"option_id": "keep"}))
+        );
+        assert_eq!(entry.answer, Some(serde_json::json!({"option_id": "keep"})));
+
+        let rendered = render_ledger(&ledger);
+        let first = rendered.find("override o-12: option drop (was option keep)");
+        let second = rendered.find("override o-13: option keep (was option drop)");
+        assert!(first.is_some() && second > first, "{rendered}");
+        assert!(
+            rendered.contains("answer: option keep by triage:jev via triage"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("effective answer: option keep"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_question_without_a_triage_object_is_escalated_as_not_triaged() {
+        let ledger = ledger_of(&[asked(10, "q-1", "Keep the cache?")]);
+        assert!(ledger.decided.is_empty());
+        assert_eq!(ids(&ledger.escalated), ["q-1"]);
+        assert_eq!(ledger.escalated[0].reason.as_deref(), Some("not_triaged"));
+    }
+
+    #[test]
+    fn a_later_question_asked_supersedes_a_decided_one() {
+        let mut fallback = triaged(12, "q-1", "fallback", Some("ledger_unwritable"));
+        fallback["triage"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| {
+                [
+                    "outcome",
+                    "reason",
+                    "threshold",
+                    "pre_check_threshold",
+                    "model",
+                ]
+                .contains(&key.as_str())
+            });
+        let ledger = ledger_of(&[
+            asked(9, "q-0", "Earlier question?"),
+            triaged(10, "q-1", "decided", None),
+            asked(11, "q-2", "Later question?"),
+            fallback,
+        ]);
+        assert!(ledger.decided.is_empty(), "{:?}", ids(&ledger.decided));
+        assert_eq!(ids(&ledger.escalated), ["q-0", "q-1", "q-2"]);
+        let entry = &ledger.escalated[1];
+        assert_eq!(entry.reason.as_deref(), Some("ledger_unwritable"));
+        assert_eq!(entry.gate_id.as_deref(), Some("g-1"));
+        let json = serde_json::to_value(entry).unwrap();
+        assert!(json.get("answer").is_none(), "{json}");
+    }
+
+    #[test]
+    fn history_shows_an_override_a_fallback_and_a_discard() {
+        let rendered = render_events(&[
+            serde_json::json!({
+                "v": 1, "ts": 9, "phase": 53, "event": events::TRIAGE_FALLBACK,
+                "question_id": "q-1", "run_started_at": "100",
+                "reason": "timeout", "detail": "no answer in 5s",
+            }),
+            triaged(10, "q-1", "decided", None),
+            triage_answered(11, "q-1"),
+            overridden(12, "q-1", "drop", "keep"),
+            serde_json::json!({
+                "v": 1, "ts": 13, "phase": 53, "event": events::OVERRIDES_DELIVERED,
+                "run_started_at": "100", "override_ids": ["o-12", "o-99"],
+            }),
+            serde_json::json!({
+                "v": 1, "ts": 14, "phase": 53, "event": events::RUN_DISCARDED,
+                "started_at": "100",
+            }),
+        ]);
+
+        assert!(
+            rendered.contains("  override q-1: option drop (was option keep) by operator"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  overrides delivered to the launch: 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  triage fell back for q-1: timeout"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  run discarded: started at 100"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("ignored"), "{rendered}");
+    }
+
+    #[test]
+    fn a_triage_decided_question_shows_its_scores() {
+        let rendered = render_events(&[
+            triaged(10, "q-1", "decided", None),
+            triage_answered(11, "q-1"),
+        ]);
+
+        let triage_row = rendered
+            .lines()
+            .find(|line| line.starts_with("  triage: decided keep"))
+            .unwrap_or_else(|| panic!("no triage row in {rendered}"));
+        assert!(triage_row.contains("pre-check 0.93"), "{triage_row}");
+        assert!(triage_row.contains("top probability 0.91"), "{triage_row}");
+        assert!(
+            rendered.contains("  answer q-1: option keep by triage:jev via triage"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("ignored"), "{rendered}");
+    }
+
     const QUESTION_ROW_PREFIXES: [&str; 7] = [
         "  question ",
         "  options: ",
@@ -473,6 +1212,18 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("not yet answered"), "{rendered}");
+    }
+
+    #[test]
+    fn an_agent_answer_shows_its_agent_in_history() {
+        let mut by_agent = answered(11, "q-1", serde_json::json!({"option_id": "keep"}));
+        by_agent["answered_by"] = serde_json::json!("agent:claude");
+        let rendered = render_events(&[asked(10, "q-1", "Keep the cache?"), by_agent]);
+
+        assert!(
+            rendered.contains("by agent:claude via operator_via_gate"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -613,5 +1364,90 @@ mod tests {
         assert!(rendered.contains("retained artifact"));
         assert!(rendered.contains(&archived_capture.display().to_string()));
         assert!(rendered.contains(&live_review.display().to_string()));
+    }
+
+    /// The pending overrides of run `run` of phase 53 from these event lines.
+    fn pending_of(events: &[serde_json::Value], run: &str) -> Vec<PendingOverride> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = events::events_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lines: String = events.iter().map(|event| format!("{event}\n")).collect();
+        std::fs::write(path, lines).unwrap();
+        pending_overrides(dir.path(), PhaseId::new(53), run)
+    }
+
+    fn delivered(ts: u64, ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": ts, "phase": 53, "event": events::OVERRIDES_DELIVERED,
+            "run_started_at": "100", "override_ids": ids,
+        })
+    }
+
+    fn with_override_id(mut event: serde_json::Value, id: &str) -> serde_json::Value {
+        event["override_id"] = serde_json::json!(id);
+        event
+    }
+
+    fn option(id: &str) -> QuestionChoice {
+        QuestionChoice::Option {
+            option_id: id.to_string(),
+        }
+    }
+
+    fn pending_ids(pending: &[PendingOverride]) -> Vec<&str> {
+        pending.iter().map(|p| p.question_id.as_str()).collect()
+    }
+
+    #[test]
+    fn two_overrides_deliver_one_line_with_the_latest_answer() {
+        let pending = pending_of(
+            &[
+                asked(10, "q1", "Which store?"),
+                overridden(11, "q1", "b", "a"),
+                overridden(12, "q1", "c", "b"),
+            ],
+            "100",
+        );
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].question.as_deref(), Some("Which store?"));
+        assert_eq!(pending[0].now, option("c"));
+        assert_eq!(pending[0].was, Some(option("a")));
+        assert_eq!(pending[0].override_ids, ["o-11", "o-12"]);
+    }
+
+    #[test]
+    fn delivery_is_matched_by_override_id() {
+        let overrides = [
+            with_override_id(overridden(11, "q1", "b", "a"), "o1"),
+            with_override_id(overridden(11, "q2", "b", "a"), "o2"),
+        ];
+        let mut events = overrides.to_vec();
+        events.push(delivered(11, &["o1"]));
+        assert_eq!(pending_ids(&pending_of(&events, "100")), ["q2"]);
+
+        let mut control = overrides.to_vec();
+        control.push(delivered(11, &["o3"]));
+        assert_eq!(
+            pending_ids(&pending_of(&control, "100")),
+            ["q1", "q2"],
+            "control: a delivery naming another id delivers neither"
+        );
+    }
+
+    #[test]
+    fn a_discarded_runs_override_does_not_reach_a_new_run() {
+        let events = [
+            overridden(11, "q1", "b", "a"),
+            serde_json::json!({
+                "v": 1, "ts": 12, "phase": 53, "event": events::RUN_DISCARDED,
+                "started_at": "100",
+            }),
+        ];
+        assert!(pending_of(&events, "200").is_empty());
+        assert_eq!(
+            pending_ids(&pending_of(&events, "100")),
+            ["q1"],
+            "control: the override is pending in its own run"
+        );
     }
 }

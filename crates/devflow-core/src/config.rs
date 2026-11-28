@@ -8,7 +8,11 @@
 
 use std::path::Path;
 
+use crate::phase_id::PhaseId;
 use crate::state::AgentKind;
+use crate::triage::{
+    DEFAULT_PRE_CHECK_THRESHOLD, DEFAULT_THRESHOLD, DEFAULT_TIMEOUT_SECS, TriageConfig,
+};
 
 /// Number of capture generations retained when not otherwise configured.
 ///
@@ -528,6 +532,193 @@ fn fallback_agent_to(
     key.fallback_agent
         .map(|value| value.parse::<AgentKind>().map_err(|error| refusal(&error)))
         .transpose()
+}
+
+/// Resolve `devflow.toml`'s `[triage]` table (D-07, D-09), writing a
+/// `warning:` line to stderr for every value it cannot use.
+pub fn triage_config(project_root: &Path) -> TriageConfig {
+    triage_config_to(project_root, &mut std::io::stderr())
+}
+
+/// [`triage_config`], writing its warning lines to `err`.
+pub fn triage_config_to(project_root: &Path, err: &mut dyn std::io::Write) -> TriageConfig {
+    let path = project_root.join("devflow.toml");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return TriageConfig::default();
+        }
+        Err(error) => {
+            config_warning(err, &format!("could not be read ({error}); triage is off"));
+            return TriageConfig::default();
+        }
+    };
+    let table = match toml::from_str::<toml::Table>(&contents) {
+        Ok(table) => table,
+        Err(error) => {
+            let error = error.message().to_string();
+            config_warning(err, &format!("does not parse ({error}); triage is off"));
+            return TriageConfig::default();
+        }
+    };
+    match table.get("triage") {
+        None => TriageConfig::default(),
+        Some(toml::Value::Table(triage)) => triage_from_table(triage, err),
+        Some(other) => {
+            config_warning(
+                err,
+                &format!("triage = {other} is not a table; triage is off"),
+            );
+            TriageConfig::default()
+        }
+    }
+}
+
+/// The `[triage]` keys [`triage_config`] reads.
+const TRIAGE_KEYS: [&str; 6] = [
+    "enabled",
+    "threshold",
+    "pre_check_threshold",
+    "model",
+    "timeout_secs",
+    "exclude_label_phases",
+];
+
+/// Resolve each `[triage]` key on its own, so one bad key cannot hide the
+/// others. A value that could make triage decide wrongly escalates every
+/// question instead.
+fn triage_from_table(triage: &toml::Table, err: &mut dyn std::io::Write) -> TriageConfig {
+    let mut config = TriageConfig::default();
+    for key in triage
+        .keys()
+        .filter(|key| !TRIAGE_KEYS.contains(&key.as_str()))
+    {
+        triage_warning(err, &format!("{key} is not a known key; it is ignored"));
+    }
+    config.enabled = match triage.get("enabled") {
+        None => false,
+        Some(toml::Value::Boolean(enabled)) => *enabled,
+        Some(other) => {
+            triage_warning(
+                err,
+                &format!("enabled = {other} is not true or false; triage is off"),
+            );
+            false
+        }
+    };
+    config.threshold = triage_probability(triage, "threshold", DEFAULT_THRESHOLD, err);
+    config.pre_check_threshold = triage_probability(
+        triage,
+        "pre_check_threshold",
+        DEFAULT_PRE_CHECK_THRESHOLD,
+        err,
+    );
+    let mut escalate_all = false;
+    match triage.get("model") {
+        None => {}
+        Some(toml::Value::String(model)) if !model.trim().is_empty() => {
+            config.model = model.clone();
+        }
+        Some(other) => {
+            triage_warning(
+                err,
+                &format!("model = {other} is not a model id; {ESCALATE_ALL}"),
+            );
+            escalate_all = true;
+        }
+    }
+    match triage.get("timeout_secs") {
+        None => {}
+        Some(toml::Value::Integer(secs)) if *secs > 0 => {
+            config.timeout = std::time::Duration::from_secs(secs.unsigned_abs());
+        }
+        Some(other) => triage_warning(
+            err,
+            &format!(
+                "timeout_secs = {other} is not a positive whole number of seconds; \
+                 using {DEFAULT_TIMEOUT_SECS}"
+            ),
+        ),
+    }
+    match triage.get("exclude_label_phases").map(phase_ids) {
+        None => {}
+        Some(Ok(phases)) => config.exclude_label_phases = phases,
+        Some(Err(entry)) => {
+            triage_warning(
+                err,
+                &format!("exclude_label_phases entry {entry} is not a phase id; {ESCALATE_ALL}"),
+            );
+            escalate_all = true;
+        }
+    }
+    if escalate_all {
+        config.threshold = None;
+        config.pre_check_threshold = None;
+    }
+    config
+}
+
+/// The end of a warning whose value makes triage escalate every question.
+const ESCALATE_ALL: &str = "escalating every question";
+
+/// A `[triage]` probability key: a finite number in [0, 1] (TOML integers 0
+/// and 1 included), `default` when absent, and `None` with a warning
+/// otherwise.
+fn triage_probability(
+    triage: &toml::Table,
+    key: &str,
+    default: Option<f64>,
+    err: &mut dyn std::io::Write,
+) -> Option<f64> {
+    let Some(value) = triage.get(key) else {
+        return default;
+    };
+    let probability = match value {
+        toml::Value::Float(number) => Some(*number),
+        toml::Value::Integer(0) => Some(0.0),
+        toml::Value::Integer(1) => Some(1.0),
+        _ => None,
+    };
+    match probability {
+        Some(probability) if probability.is_finite() && (0.0..=1.0).contains(&probability) => {
+            Some(probability)
+        }
+        _ => {
+            triage_warning(
+                err,
+                &format!("{key} = {value} is not a probability in [0, 1]; {ESCALATE_ALL}"),
+            );
+            None
+        }
+    }
+}
+
+/// The phase ids of an `exclude_label_phases` array, or the first entry that
+/// is not one.
+fn phase_ids(value: &toml::Value) -> Result<Vec<PhaseId>, String> {
+    let entries = value.as_array().ok_or_else(|| value.to_string())?;
+    entries
+        .iter()
+        .map(|entry| match entry {
+            toml::Value::Integer(number) => u32::try_from(*number)
+                .map(PhaseId::new)
+                .map_err(|_| entry.to_string()),
+            toml::Value::String(text) => text.parse::<PhaseId>().map_err(|_| entry.to_string()),
+            _ => Err(entry.to_string()),
+        })
+        .collect()
+}
+
+/// Write one `warning: devflow.toml [triage] …` line and its tracing event.
+fn triage_warning(err: &mut dyn std::io::Write, message: &str) {
+    config_warning(err, &format!("[triage] {message}"));
+}
+
+/// Write one `warning: devflow.toml …` line about triage and its tracing
+/// event.
+fn config_warning(err: &mut dyn std::io::Write, message: &str) {
+    tracing::warn!(detail = message, "devflow.toml triage setting not used");
+    let _ = writeln!(err, "warning: devflow.toml {message}");
 }
 
 fn env_value(key: &str) -> Option<String> {
@@ -1231,5 +1422,95 @@ mod tests {
             not_a_string.contains("cannot read `fallback_agent`"),
             "the refusal names the key: {not_a_string}"
         );
+    }
+
+    /// The triage config for a project whose `devflow.toml` holds `contents`,
+    /// and the warning lines it wrote.
+    fn triage_for(contents: Option<&str>) -> (TriageConfig, String) {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(contents) = contents {
+            std::fs::write(dir.path().join("devflow.toml"), contents).unwrap();
+        }
+        let mut sink = Vec::new();
+        let config = triage_config_to(dir.path(), &mut sink);
+        (config, String::from_utf8(sink).unwrap())
+    }
+
+    #[test]
+    fn triage_is_off_by_default() {
+        for contents in [None, Some("capture_retention = 3\n")] {
+            let (config, warnings) = triage_for(contents);
+            assert!(!config.enabled, "{contents:?} must leave triage off");
+            assert_eq!(warnings, "", "{contents:?} must not warn");
+        }
+    }
+
+    #[test]
+    fn an_invalid_threshold_escalates_everything() {
+        for key in ["threshold", "pre_check_threshold"] {
+            for value in ["\"high\"", "-0.1", "1.5", "nan", "2"] {
+                let (config, warnings) = triage_for(Some(&format!(
+                    "[triage]\nenabled = true\n{key} = {value}\n"
+                )));
+                let resolved = if key == "threshold" {
+                    config.threshold
+                } else {
+                    config.pre_check_threshold
+                };
+                assert_eq!(resolved, None, "{key} = {value} must escalate everything");
+                assert!(
+                    warnings.contains(&format!("warning: devflow.toml [triage] {key}"))
+                        && warnings.contains("escalating every question"),
+                    "{key} = {value} must warn: {warnings:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_valid_threshold_is_used() {
+        for (value, expected) in [("0.9", 0.9), ("1", 1.0), ("0", 0.0)] {
+            let (config, warnings) = triage_for(Some(&format!(
+                "[triage]\nenabled = true\nthreshold = {value}\npre_check_threshold = {value}\n"
+            )));
+            assert_eq!(config.threshold, Some(expected), "threshold = {value}");
+            assert_eq!(
+                config.pre_check_threshold,
+                Some(expected),
+                "pre_check = {value}"
+            );
+            assert_eq!(warnings, "", "threshold = {value} must not warn");
+        }
+    }
+
+    #[test]
+    fn a_configured_threshold_overrides_the_default() {
+        let (absent, _) = triage_for(Some("[triage]\nenabled = true\n"));
+        assert_eq!(absent.threshold, crate::triage::DEFAULT_THRESHOLD);
+        assert_eq!(
+            absent.pre_check_threshold,
+            crate::triage::DEFAULT_PRE_CHECK_THRESHOLD
+        );
+        for value in [0.25, 0.75] {
+            let (config, warnings) = triage_for(Some(&format!(
+                "[triage]\nenabled = true\nthreshold = {value}\npre_check_threshold = {value}\n"
+            )));
+            assert_eq!(config.threshold, Some(value));
+            assert_eq!(config.pre_check_threshold, Some(value));
+            assert_eq!(warnings, "");
+        }
+    }
+
+    #[test]
+    fn a_non_bool_enabled_turns_triage_off() {
+        let (config, warnings) = triage_for(Some("[triage]\nenabled = \"yes\"\n"));
+        assert!(!config.enabled);
+        assert!(
+            warnings.contains("warning: devflow.toml [triage] enabled"),
+            "a non-bool enabled must warn: {warnings:?}"
+        );
+        let (control, control_warnings) = triage_for(Some("[triage]\nenabled = true\n"));
+        assert!(control.enabled, "a bool enabled turns triage on");
+        assert_eq!(control_warnings, "");
     }
 }
